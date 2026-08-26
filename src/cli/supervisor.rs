@@ -32,7 +32,7 @@ pub(crate) enum Provider {
 }
 
 impl Provider {
-    fn parse(raw: &str) -> Option<Provider> {
+    pub(crate) fn parse(raw: &str) -> Option<Provider> {
         match raw {
             "codex" => Some(Provider::Codex),
             "claude" => Some(Provider::Claude),

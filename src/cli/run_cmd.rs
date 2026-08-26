@@ -1,17 +1,19 @@
 //! The canonical `subagent --id ID [RUN-OPTIONS] -- COMMAND [ARG...]` form.
 //!
 //! This module resolves and validates the run plan described in
-//! `docs/design.md` sections 6.2 and 7, but does not implement the
-//! supervisor/pair/context/child backend. `--dry-run` prints the resolved
+//! `docs/design.md` sections 6.2 and 7. Conversation-scoped pair identity
+//! (`docs/design.md` section 3.4) is ensured and reported for both
+//! `--dry-run` and an ordinary run, since recording that a pair exists is
+//! preparation, not an exchange record. `--dry-run` prints the resolved
 //! plan and exits successfully without spawning anything. An ordinary
 //! (non-dry-run) managed invocation never spawns the child either; it exits
 //! `125` with an explicit "backend not implemented" diagnostic, per this
 //! milestone's requirement to be honest about what is and is not built.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -19,7 +21,10 @@ use serde::Serialize;
 
 use super::id::SubagentId;
 use super::report::{OsStringJson, Report, ReportStatus, write_json_atomic};
-use super::supervisor::{self, DetectionEnv, SupervisorRef};
+use super::state_dir;
+use super::store;
+use super::supervisor::{self, DetectionEnv, Provider, SupervisorRef};
+use super::workspace::WorkspaceRef;
 use super::{handle_clap_error, split_on_double_dash, wrapper_error_exit};
 
 const SUBAGENT_ID_ENV: &str = "SUBAGENT_ID";
@@ -159,6 +164,34 @@ struct RunArgs {
     report: Option<PathBuf>,
 }
 
+/// The subset of an ensured pair (`docs/design.md` section 3.4) reported to
+/// the caller. Never includes the raw supervisor session id string, even
+/// though the process resolving it obviously has it; the pair key already
+/// binds that session id irreversibly, and the plan/report surfaces do not
+/// need to restate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct EnsuredPairReport {
+    pair_key: String,
+    workspace: OsStringJson,
+    subagent_id: String,
+    provider: Provider,
+    created_at_unix: i64,
+    last_seen_unix: i64,
+}
+
+impl From<&store::EnsuredPair> for EnsuredPairReport {
+    fn from(pair: &store::EnsuredPair) -> Self {
+        EnsuredPairReport {
+            pair_key: pair.pair_key.to_hex(),
+            workspace: OsStringJson::from_os_str(pair.workspace.as_os_str()),
+            subagent_id: pair.subagent_id.clone(),
+            provider: pair.provider,
+            created_at_unix: pair.created_at_unix,
+            last_seen_unix: pair.last_seen_unix,
+        }
+    }
+}
+
 /// The fully resolved plan for a managed run: wrapper defaults applied,
 /// `--id` validated, and the child command preserved as `OsString`.
 #[derive(Debug, Clone)]
@@ -176,6 +209,7 @@ struct RunPlan {
     quiet: bool,
     program: OsString,
     args: Vec<OsString>,
+    ensured_pair: Option<store::EnsuredPair>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,6 +227,7 @@ struct RunPlanReport {
     quiet: bool,
     program: OsStringJson,
     args: Vec<OsStringJson>,
+    ensured_pair: Option<EnsuredPairReport>,
 }
 
 impl From<&RunPlan> for RunPlanReport {
@@ -215,6 +250,7 @@ impl From<&RunPlan> for RunPlanReport {
                 .iter()
                 .map(|arg| OsStringJson::from_os_str(arg))
                 .collect(),
+            ensured_pair: plan.ensured_pair.as_ref().map(EnsuredPairReport::from),
         }
     }
 }
@@ -222,19 +258,41 @@ impl From<&RunPlan> for RunPlanReport {
 pub(crate) fn execute(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let subagent_id_env: Option<String> = std::env::var(SUBAGENT_ID_ENV).ok();
     let detection_env: DetectionEnv = DetectionEnv::from_process_env();
-    execute_with_env(args, out, err, subagent_id_env.as_deref(), &detection_env)
+    let state_dir_override: Option<OsString> = std::env::var_os(state_dir::SUBAGENT_STATE_DIR_ENV);
+    let cwd: PathBuf = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(io_error) => {
+            let _ = writeln!(
+                err,
+                "subagent: failed to determine the current working directory: {io_error}"
+            );
+            return wrapper_error_exit();
+        }
+    };
+    execute_with_env(
+        args,
+        out,
+        err,
+        subagent_id_env.as_deref(),
+        &detection_env,
+        &cwd,
+        state_dir_override.as_deref(),
+    )
 }
 
-/// Same as [`execute`], but with the `SUBAGENT_ID` environment lookup and
-/// the supervisor-detection environment injected explicitly so tests never
-/// need to mutate real process environment state (which is unsafe to do
-/// from parallel test threads).
+/// Same as [`execute`], but with the `SUBAGENT_ID` environment lookup, the
+/// supervisor-detection environment, the working directory, and the
+/// `SUBAGENT_STATE_DIR` override all injected explicitly -- each resolved
+/// exactly once, at this process edge -- so tests never need to mutate real
+/// process environment state or touch the real user state root.
 fn execute_with_env(
     args: &[OsString],
     out: &mut dyn Write,
     err: &mut dyn Write,
     subagent_id_env: Option<&str>,
     detection_env: &DetectionEnv,
+    cwd: &Path,
+    state_dir_override: Option<&OsStr>,
 ) -> ExitCode {
     let split = split_on_double_dash(args);
 
@@ -272,6 +330,15 @@ fn execute_with_env(
         );
         return wrapper_error_exit();
     }
+    if memory == MemoryMode::Workspace {
+        let _ = writeln!(
+            err,
+            "subagent: --memory workspace is not implemented in this build (docs/design.md \
+             section 3.4's WorkspaceMemoryKey); re-run with --memory conversation (the default) \
+             or --memory none"
+        );
+        return wrapper_error_exit();
+    }
 
     let supervisor: SupervisorRef =
         match supervisor::resolve(run_args.supervisor.as_deref(), detection_env) {
@@ -281,6 +348,25 @@ fn execute_with_env(
                 return wrapper_error_exit();
             }
         };
+
+    let ensured_pair: Option<store::EnsuredPair> = match memory {
+        MemoryMode::None => None,
+        MemoryMode::Workspace => unreachable!("--memory workspace already handled above"),
+        MemoryMode::Conversation => {
+            // `id` is guaranteed `Some` here: `memory != MemoryMode::None` and
+            // the check above already rejected a missing `--id` in that case.
+            let subagent_id: &SubagentId = id
+                .as_ref()
+                .expect("--memory conversation requires --id, which is enforced before this point");
+            match ensure_conversation_pair(cwd, state_dir_override, &supervisor, subagent_id) {
+                Ok(pair) => Some(pair),
+                Err(message) => {
+                    let _ = writeln!(err, "subagent: {message}");
+                    return wrapper_error_exit();
+                }
+            }
+        }
+    };
 
     let plan = RunPlan {
         id,
@@ -296,6 +382,7 @@ fn execute_with_env(
         quiet: run_args.quiet,
         program: child_tokens[0].clone(),
         args: child_tokens[1..].to_vec(),
+        ensured_pair,
     };
 
     if let Some(report_path) = &run_args.report {
@@ -329,7 +416,7 @@ fn execute_with_env(
     } else {
         let _ = writeln!(
             err,
-            "subagent: backend not implemented: the pair ledger, the context capsule, and child process spawning are not implemented in this build"
+            "subagent: backend not implemented: the pair exchange ledger, the context capsule, and child process spawning are not implemented in this build"
         );
         let _ = writeln!(
             err,
@@ -337,6 +424,45 @@ fn execute_with_env(
         );
         wrapper_error_exit()
     }
+}
+
+/// Resolves the canonical workspace identity and the on-disk pair-identity
+/// store, then idempotently ensures the conversation-scoped pair
+/// (`docs/design.md` section 3.4) for `supervisor`/`subagent_id` exists.
+/// Returns a plain diagnostic message (never a raw supervisor session id;
+/// callers only need to know the operation failed) so it can be printed
+/// with a uniform `subagent: {message}` prefix at the call site.
+fn ensure_conversation_pair(
+    cwd: &Path,
+    state_dir_override: Option<&OsStr>,
+    supervisor: &SupervisorRef,
+    subagent_id: &SubagentId,
+) -> Result<store::EnsuredPair, String> {
+    let workspace_ref: WorkspaceRef = WorkspaceRef::from_dir(cwd).map_err(|io_error| {
+        format!(
+            "failed to resolve the workspace identity for {}: {io_error}",
+            cwd.display()
+        )
+    })?;
+    let state_root: PathBuf = state_dir::resolve_state_root(state_dir_override)
+        .map_err(|resolution_error| resolution_error.to_string())?;
+    let mut pair_store: store::Store =
+        store::Store::open_for_write(&state_root).map_err(|store_error: store::StoreError| {
+            format!(
+                "failed to open the pair-identity state store at {}: {store_error}",
+                state_root.display()
+            )
+        })?;
+    pair_store
+        .ensure_pair(
+            &workspace_ref,
+            supervisor.provider,
+            &supervisor.session_id,
+            subagent_id,
+        )
+        .map_err(|store_error: store::StoreError| {
+            format!("failed to record the pair identity: {store_error}")
+        })
 }
 
 fn resolve_id(
@@ -383,6 +509,11 @@ fn print_human_plan(plan: &RunPlan, dry_run: bool, err: &mut dyn Write) {
     );
     let _ = writeln!(err, "  fresh:             {}", plan.fresh);
     let _ = writeln!(err, "  no-record:         {}", plan.no_record);
+    if let Some(pair) = &plan.ensured_pair {
+        let _ = writeln!(err, "  pair-key:          {}", pair.pair_key);
+        let _ = writeln!(err, "  pair-created-at:   {}", pair.created_at_unix);
+        let _ = writeln!(err, "  pair-last-seen:    {}", pair.last_seen_unix);
+    }
     let _ = writeln!(
         err,
         "  child program:     {}",
@@ -418,14 +549,30 @@ mod tests {
         run_with_detection(args, env_id, &default_detection_env())
     }
 
+    /// Every test in this module gets its own scratch working directory and
+    /// its own scratch state root (both freshly created temporary
+    /// directories, dropped -- and thus deleted -- at the end of the call),
+    /// so a managed run's default conversation-memory pair-ensure step never
+    /// touches the real user state root or interferes with another test.
     fn run_with_detection(
         args: &[OsString],
         env_id: Option<&str>,
         detection_env: &DetectionEnv,
     ) -> (ExitCode, String, String) {
+        let cwd_dir: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let state_dir: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let state_root: PathBuf = state_dir.path().join("state");
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        let code = execute_with_env(args, &mut out, &mut err, env_id, detection_env);
+        let code = execute_with_env(
+            args,
+            &mut out,
+            &mut err,
+            env_id,
+            detection_env,
+            cwd_dir.path(),
+            Some(state_root.as_os_str()),
+        );
         (
             code,
             String::from_utf8(out).unwrap(),
@@ -486,6 +633,102 @@ mod tests {
         let (code, _out, err) = run(&args, None);
         assert_eq!(code, wrapper_error_exit());
         assert!(err.contains("--no-record"));
+    }
+
+    #[test]
+    fn memory_workspace_fails_closed_as_unimplemented() {
+        let args = os(&[
+            "--id",
+            "reviewer",
+            "--memory",
+            "workspace",
+            "--dry-run",
+            "--",
+            "echo",
+            "hi",
+        ]);
+        let (code, _out, err) = run(&args, None);
+        assert_eq!(code, wrapper_error_exit());
+        assert!(err.contains("--memory workspace"));
+        assert!(err.contains("not implemented"));
+    }
+
+    #[test]
+    fn memory_workspace_fails_closed_even_for_an_ordinary_run() {
+        let args = os(&[
+            "--id",
+            "reviewer",
+            "--memory",
+            "workspace",
+            "--",
+            "echo",
+            "hi",
+        ]);
+        let (code, _out, err) = run(&args, None);
+        assert_eq!(code, wrapper_error_exit());
+        assert!(err.contains("--memory workspace"));
+    }
+
+    #[test]
+    fn conversation_memory_ensures_and_reports_a_pair_key_on_dry_run() {
+        let args = os(&["--id", "reviewer", "--dry-run", "--", "echo", "hi"]);
+        let (code, _out, err) = run(&args, None);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.contains("pair-key:"));
+    }
+
+    #[test]
+    fn memory_none_does_not_report_a_pair_key() {
+        let args = os(&[
+            "--id",
+            "reviewer",
+            "--memory",
+            "none",
+            "--dry-run",
+            "--",
+            "echo",
+            "hi",
+        ]);
+        let (code, _out, err) = run(&args, None);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(!err.contains("pair-key:"));
+    }
+
+    #[test]
+    fn dry_run_and_ordinary_run_ensure_the_same_pair_key() {
+        let cwd_dir: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let state_dir: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let state_root: PathBuf = state_dir.path().join("state");
+        let detection_env = default_detection_env();
+
+        let run_once = |args: &[OsString]| -> String {
+            let mut out: Vec<u8> = Vec::new();
+            let mut err: Vec<u8> = Vec::new();
+            execute_with_env(
+                args,
+                &mut out,
+                &mut err,
+                None,
+                &detection_env,
+                cwd_dir.path(),
+                Some(state_root.as_os_str()),
+            );
+            String::from_utf8(err).unwrap()
+        };
+
+        let dry_run_err = run_once(&os(&["--id", "reviewer", "--dry-run", "--", "echo", "hi"]));
+        let ordinary_err = run_once(&os(&["--id", "reviewer", "--", "echo", "hi"]));
+
+        let extract_pair_key = |text: &str| -> String {
+            text.lines()
+                .find(|line| line.contains("pair-key:"))
+                .expect("plan output should include a pair-key line")
+                .to_string()
+        };
+        assert_eq!(
+            extract_pair_key(&dry_run_err),
+            extract_pair_key(&ordinary_err)
+        );
     }
 
     #[test]

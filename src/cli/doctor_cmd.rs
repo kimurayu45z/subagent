@@ -1,8 +1,8 @@
 //! `subagent doctor`: an honest capability report.
 //!
-//! Nothing in this build mutates state, so `doctor` always succeeds; its
-//! job is to report, per capability, whether it is implemented, merely
-//! planned, or structurally unavailable in this build.
+//! `doctor` itself does not mutate state. Its job is to report, per
+//! capability, whether it is implemented, merely planned, or structurally
+//! unavailable in this build.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -91,9 +91,17 @@ fn capabilities() -> Vec<Capability> {
              implemented yet",
         ),
         capability(
-            "pair-ledger",
+            "pair-identity-store",
+            CapabilityState::Implemented,
+            "the SQLite workspace/supervisor-session/pair identity tables (design.md section \
+             10) are implemented: `subagent pairs` lists them read-only for the current \
+             workspace, and a conversation-memory run idempotently ensures one row per scope",
+        ),
+        capability(
+            "pair-exchange-ledger",
             CapabilityState::Planned,
-            "the SQLite pair ledger (design.md section 10) is not implemented yet",
+            "invocation and exchange-message recording (design.md section 10's \
+             invocations/exchange_messages tables) is not implemented yet",
         ),
         capability(
             "context-capsule",

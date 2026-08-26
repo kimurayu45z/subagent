@@ -41,7 +41,7 @@ pub(crate) fn execute(args: &[OsString], out: &mut dyn Write, err: &mut dyn Writ
 
     let body = UnavailableBody {
         component: "pair-ledger".to_string(),
-        reason: "the SQLite pair ledger (design.md section 10) is not implemented in this build"
+        reason: "the SQLite pair exchange ledger (design.md section 10) is not implemented in this build"
             .to_string(),
         requested_pair: log_args.pair,
         requested_count: log_args.count,

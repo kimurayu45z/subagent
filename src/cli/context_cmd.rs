@@ -1,4 +1,4 @@
-//! `subagent context`: reports the pair ledger as unavailable.
+//! `subagent context`: reports pair exchange context as unavailable.
 //!
 //! This is a stateful placeholder. It never touches the filesystem or any
 //! other persistent state; it only reports why it cannot fulfil the
@@ -39,7 +39,7 @@ pub(crate) fn execute(args: &[OsString], out: &mut dyn Write, err: &mut dyn Writ
 
     let body = UnavailableBody {
         component: "pair-ledger".to_string(),
-        reason: "the SQLite pair ledger and context capsule (design.md sections 10-11) are not implemented in this build".to_string(),
+        reason: "the SQLite pair exchange ledger and context capsule (design.md sections 10-11) are not implemented in this build".to_string(),
         requested_pair: context_args.pair,
     };
 

@@ -44,6 +44,13 @@ still reporting managed-parent references and hook-registry detection as
 planned. If both native provider IDs are inherited, pass the immediate
 supervisor explicitly; do not guess from process ancestry.
 
+Treat `pair-identity-store` separately from `pair-exchange-ledger`. The former
+means the build can derive a workspace-scoped pair key, remember that the pair
+exists, and show it with `subagent pairs`; it does not mean prior messages can
+already be recorded, recovered, summarized, or injected. Require the exchange
+ledger and context-capsule capabilities before claiming durable conversational
+memory is active.
+
 If the desired capability is reported as planned or unavailable:
 
 - do not tell the user that memory, history discovery, or summarization occurred;
@@ -99,6 +106,14 @@ For interface inspection without starting the child:
 ```sh
 subagent --id gpt-sol-reviewer --dry-run -- codex exec "Review the current diff"
 ```
+
+In builds with `pair-identity-store`, a conversation-memory dry-run
+idempotently creates or refreshes the pair identity metadata even though it
+does not create an invocation/exchange record or start the child. Use
+`--memory none --no-record` when inspection must perform no persistence. Use
+`subagent pairs --format json` to inspect the identities recorded for the
+canonical current workspace; the listing intentionally omits raw supervisor
+session IDs.
 
 Keep the current assignment self-contained even when prior memory is available.
 Memory should supply decisions and continuity, not replace a clear statement of

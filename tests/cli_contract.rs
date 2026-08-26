@@ -2,8 +2,9 @@
 //! binary as a real subprocess, as opposed to the in-process unit tests in
 //! `src/cli/*`. These specifically cover the guarantees a caller of the
 //! binary relies on: exit codes, stream separation, the mandatory `--`
-//! boundary, and that a managed run never spawns the child process in this
-//! milestone.
+//! boundary, that a managed run never spawns the child process in this
+//! milestone, and that pair-identity persistence is isolated to an explicit
+//! `SUBAGENT_STATE_DIR` so no test ever touches the real user state root.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,23 @@ fn subagent() -> Command {
     Command::cargo_bin("subagent").expect("subagent binary should build")
 }
 
+/// Creates a fresh temporary directory secured to owner-only permissions
+/// (`0700` on Unix). `tempfile::tempdir` alone does not guarantee this: the
+/// directory it creates is subject to the process umask, and this build
+/// deliberately rejects a state root with group- or other-accessible
+/// permissions, so every test that uses a temporary directory as
+/// `SUBAGENT_STATE_DIR` (or as the parent of one) needs this instead of a
+/// bare `tempfile::tempdir()`.
+fn isolated_state_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    dir
+}
+
 /// Every supervisor-detection environment variable this build inspects.
 /// Cleared before setting any of them explicitly so the ambient shell that
 /// runs the test suite (which may itself be a Codex or Claude Code session)
@@ -28,21 +46,23 @@ const SUPERVISOR_ENV_VARS: [&str; 3] = [
 ];
 
 /// A `subagent()` command with every supervisor-detection environment
-/// variable removed, so a test can opt back in only the variables it cares
-/// about.
-fn subagent_with_clean_supervisor_env() -> Command {
+/// variable removed and `SUBAGENT_STATE_DIR` pointed at `state_dir`, so a
+/// test can opt back in only the supervisor variables it cares about and
+/// never persists pair identity outside its own temporary directory.
+fn subagent_with_clean_supervisor_env(state_dir: &Path) -> Command {
     let mut command = subagent();
     for var in SUPERVISOR_ENV_VARS {
         command.env_remove(var);
     }
+    command.env("SUBAGENT_STATE_DIR", state_dir);
     command
 }
 
 /// Same as [`subagent_with_clean_supervisor_env`], but with exactly one
 /// resolvable native `CODEX_THREAD_ID` set, for tests that are not
 /// themselves about supervisor detection.
-fn subagent_with_resolvable_supervisor() -> Command {
-    let mut command = subagent_with_clean_supervisor_env();
+fn subagent_with_resolvable_supervisor(state_dir: &Path) -> Command {
+    let mut command = subagent_with_clean_supervisor_env(state_dir);
     command.env("CODEX_THREAD_ID", "contract-test-thread");
     command
 }
@@ -96,7 +116,8 @@ fn invalid_id_is_rejected_with_a_clear_diagnostic() {
 
 #[test]
 fn ordinary_managed_run_exits_125_with_backend_diagnostic_and_no_child_output() {
-    subagent_with_resolvable_supervisor()
+    let state_dir = isolated_state_dir();
+    subagent_with_resolvable_supervisor(state_dir.path())
         .args(["--id", "reviewer", "--", "echo", "should-not-run"])
         .assert()
         .code(WRAPPER_ERROR_EXIT)
@@ -110,11 +131,12 @@ fn ordinary_managed_run_exits_125_with_backend_diagnostic_and_no_child_output() 
 #[cfg(unix)]
 #[test]
 fn fake_child_is_never_spawned_for_an_ordinary_managed_run() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let state_dir = isolated_state_dir();
+    let temp_dir = isolated_state_dir();
     let canary_path: PathBuf = temp_dir.path().join("canary");
     let script_path: PathBuf = write_canary_script(temp_dir.path(), &canary_path);
 
-    subagent_with_resolvable_supervisor()
+    subagent_with_resolvable_supervisor(state_dir.path())
         .args(["--id", "reviewer", "--", script_path.to_str().unwrap()])
         .assert()
         .code(WRAPPER_ERROR_EXIT);
@@ -128,11 +150,12 @@ fn fake_child_is_never_spawned_for_an_ordinary_managed_run() {
 #[cfg(unix)]
 #[test]
 fn fake_child_is_never_spawned_during_dry_run() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let state_dir = isolated_state_dir();
+    let temp_dir = isolated_state_dir();
     let canary_path: PathBuf = temp_dir.path().join("canary");
     let script_path: PathBuf = write_canary_script(temp_dir.path(), &canary_path);
 
-    subagent_with_resolvable_supervisor()
+    subagent_with_resolvable_supervisor(state_dir.path())
         .args([
             "--id",
             "reviewer",
@@ -167,10 +190,11 @@ fn write_canary_script(dir: &Path, canary_path: &Path) -> PathBuf {
 
 #[test]
 fn dry_run_writes_a_json_plan_report_preserving_child_arguments_verbatim() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let state_dir = isolated_state_dir();
+    let temp_dir = isolated_state_dir();
     let report_path: PathBuf = temp_dir.path().join("plan.json");
 
-    subagent_with_resolvable_supervisor()
+    subagent_with_resolvable_supervisor(state_dir.path())
         .args(["--id", "reviewer", "--dry-run", "--report"])
         .arg(&report_path)
         .args([
@@ -204,6 +228,12 @@ fn dry_run_writes_a_json_plan_report_preserving_child_arguments_verbatim() {
     assert_eq!(report["body"]["supervisor"]["confidence"], "exact");
     assert!(report["body"]["supervisor_override"].is_null());
 
+    let ensured_pair = &report["body"]["ensured_pair"];
+    assert!(!ensured_pair.is_null());
+    assert_eq!(ensured_pair["subagent_id"], "reviewer");
+    assert_eq!(ensured_pair["provider"], "codex");
+    assert_eq!(ensured_pair["pair_key"].as_str().unwrap().len(), 64);
+
     let args = report["body"]["args"].as_array().unwrap();
     let expected = [
         "-p",
@@ -222,10 +252,11 @@ fn dry_run_writes_a_json_plan_report_preserving_child_arguments_verbatim() {
 
 #[test]
 fn dry_run_report_reflects_an_explicit_supervisor_override() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let state_dir = isolated_state_dir();
+    let temp_dir = isolated_state_dir();
     let report_path: PathBuf = temp_dir.path().join("plan.json");
 
-    subagent_with_clean_supervisor_env()
+    subagent_with_clean_supervisor_env(state_dir.path())
         .args(["--id", "reviewer", "--supervisor", "claude:abc123"])
         .args(["--dry-run", "--report"])
         .arg(&report_path)
@@ -246,12 +277,13 @@ fn dry_run_report_reflects_an_explicit_supervisor_override() {
 fn plan_report_is_written_with_owner_only_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
-    let temp_dir = tempfile::tempdir().unwrap();
+    let state_dir = isolated_state_dir();
+    let temp_dir = isolated_state_dir();
     let report_path: PathBuf = temp_dir.path().join("plan.json");
     fs::write(&report_path, "old").unwrap();
     fs::set_permissions(&report_path, fs::Permissions::from_mode(0o644)).unwrap();
 
-    subagent_with_resolvable_supervisor()
+    subagent_with_resolvable_supervisor(state_dir.path())
         .args(["--id", "reviewer", "--dry-run", "--report"])
         .arg(&report_path)
         .args(["--", "claude", "-p", "hello"])
@@ -264,10 +296,11 @@ fn plan_report_is_written_with_owner_only_permissions() {
 
 #[test]
 fn ordinary_run_report_reflects_backend_unavailable_status() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let state_dir = isolated_state_dir();
+    let temp_dir = isolated_state_dir();
     let report_path: PathBuf = temp_dir.path().join("plan.json");
 
-    subagent_with_resolvable_supervisor()
+    subagent_with_resolvable_supervisor(state_dir.path())
         .args(["--id", "reviewer", "--report"])
         .arg(&report_path)
         .args(["--", "claude", "-p", "hello"])
@@ -279,6 +312,7 @@ fn ordinary_run_report_reflects_backend_unavailable_status() {
     assert_eq!(report["kind"], "run_backend_unavailable");
     assert_eq!(report["status"], "error");
     assert_eq!(report["body"]["supervisor"]["provider"], "codex");
+    assert!(!report["body"]["ensured_pair"].is_null());
 }
 
 #[cfg(unix)]
@@ -287,12 +321,13 @@ fn non_utf8_child_arguments_are_preserved_and_reported_without_lossy_replacement
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
-    let temp_dir = tempfile::tempdir().unwrap();
+    let state_dir = isolated_state_dir();
+    let temp_dir = isolated_state_dir();
     let report_path: PathBuf = temp_dir.path().join("plan.json");
     let non_utf8_bytes: [u8; 4] = [0x66, 0x6f, 0xff, 0x6f];
     let non_utf8_arg = OsStr::from_bytes(&non_utf8_bytes);
 
-    subagent_with_resolvable_supervisor()
+    subagent_with_resolvable_supervisor(state_dir.path())
         .args(["--id", "reviewer", "--dry-run", "--report"])
         .arg(&report_path)
         .arg("--")
@@ -326,6 +361,17 @@ fn doctor_text_output_reports_child_spawn_as_unavailable() {
 }
 
 #[test]
+fn doctor_text_output_splits_pair_identity_from_the_exchange_ledger() {
+    subagent()
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[implemented "))
+        .stdout(predicate::str::contains("pair-identity-store"))
+        .stdout(predicate::str::contains("pair-exchange-ledger"));
+}
+
+#[test]
 fn doctor_json_output_is_a_valid_versioned_report() {
     let output = subagent()
         .args(["doctor", "--format", "json"])
@@ -338,22 +384,26 @@ fn doctor_json_output_is_a_valid_versioned_report() {
     assert_eq!(report["schema_version"], 1);
     assert_eq!(report["kind"], "doctor");
     assert_eq!(report["status"], "ok");
-    assert!(
-        !report["body"]["capabilities"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+    let capabilities = report["body"]["capabilities"].as_array().unwrap();
+    assert!(!capabilities.is_empty());
+
+    let find = |name: &str| -> &serde_json::Value {
+        capabilities
+            .iter()
+            .find(|capability| capability["name"] == name)
+            .unwrap_or_else(|| panic!("missing capability {name}"))
+    };
+    assert_eq!(find("pair-identity-store")["state"], "implemented");
+    assert_eq!(find("pair-exchange-ledger")["state"], "planned");
 }
 
 #[test]
 fn stateful_placeholder_commands_report_unavailable_without_creating_files() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = isolated_state_dir();
 
     let cases: Vec<Vec<&str>> = vec![
         vec!["context"],
         vec!["log", "--pair", "p1"],
-        vec!["pairs"],
         vec!["forget", "--pair", "p1"],
         vec!["agent", "list"],
         vec!["agent", "remove", "reviewer"],
@@ -402,7 +452,8 @@ fn child_stdout_is_never_mixed_with_wrapper_diagnostics() {
     // Even in the failure path, wrapper diagnostics must land on stderr
     // only; stdout is reserved for eventual child output and machine
     // reports explicitly requested via `--report`.
-    subagent_with_resolvable_supervisor()
+    let state_dir = isolated_state_dir();
+    subagent_with_resolvable_supervisor(state_dir.path())
         .args(["--id", "reviewer", "--", "echo", "hi"])
         .assert()
         .code(WRAPPER_ERROR_EXIT)
@@ -411,7 +462,8 @@ fn child_stdout_is_never_mixed_with_wrapper_diagnostics() {
 
 #[test]
 fn explicit_supervisor_takes_precedence_over_a_conflicting_native_env() {
-    subagent_with_clean_supervisor_env()
+    let state_dir = isolated_state_dir();
+    subagent_with_clean_supervisor_env(state_dir.path())
         .env("CODEX_THREAD_ID", "thread-from-env")
         .args([
             "--id",
@@ -431,7 +483,8 @@ fn explicit_supervisor_takes_precedence_over_a_conflicting_native_env() {
 
 #[test]
 fn native_codex_thread_id_is_detected_when_unambiguous() {
-    subagent_with_clean_supervisor_env()
+    let state_dir = isolated_state_dir();
+    subagent_with_clean_supervisor_env(state_dir.path())
         .env("CODEX_THREAD_ID", "thread-123")
         .args(["--id", "reviewer", "--dry-run", "--", "echo"])
         .assert()
@@ -443,7 +496,8 @@ fn native_codex_thread_id_is_detected_when_unambiguous() {
 
 #[test]
 fn native_claude_session_id_is_detected_when_unambiguous() {
-    subagent_with_clean_supervisor_env()
+    let state_dir = isolated_state_dir();
+    subagent_with_clean_supervisor_env(state_dir.path())
         .env("CLAUDE_CODE_SESSION_ID", "session-123")
         .args(["--id", "reviewer", "--dry-run", "--", "echo"])
         .assert()
@@ -455,7 +509,8 @@ fn native_claude_session_id_is_detected_when_unambiguous() {
 
 #[test]
 fn both_native_ids_present_is_rejected_as_ambiguous() {
-    subagent_with_clean_supervisor_env()
+    let state_dir = isolated_state_dir();
+    subagent_with_clean_supervisor_env(state_dir.path())
         .env("CODEX_THREAD_ID", "thread-123")
         .env("CLAUDE_CODE_SESSION_ID", "session-123")
         .args(["--id", "reviewer", "--dry-run", "--", "echo"])
@@ -469,7 +524,8 @@ fn both_native_ids_present_is_rejected_as_ambiguous() {
 
 #[test]
 fn missing_supervisor_identity_fails_with_an_actionable_diagnostic() {
-    subagent_with_clean_supervisor_env()
+    let state_dir = isolated_state_dir();
+    subagent_with_clean_supervisor_env(state_dir.path())
         .args(["--id", "reviewer", "--dry-run", "--", "echo"])
         .assert()
         .code(WRAPPER_ERROR_EXIT)
@@ -480,7 +536,8 @@ fn missing_supervisor_identity_fails_with_an_actionable_diagnostic() {
 
 #[test]
 fn present_but_empty_native_id_is_rejected_not_silently_accepted() {
-    subagent_with_clean_supervisor_env()
+    let state_dir = isolated_state_dir();
+    subagent_with_clean_supervisor_env(state_dir.path())
         .env("CODEX_THREAD_ID", "")
         .args(["--id", "reviewer", "--dry-run", "--", "echo"])
         .assert()
@@ -496,8 +553,9 @@ fn non_utf8_native_id_is_rejected_instead_of_ignoring_ambiguity() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
+    let state_dir = isolated_state_dir();
     let non_utf8_id: &OsStr = OsStr::from_bytes(&[0xff]);
-    subagent_with_clean_supervisor_env()
+    subagent_with_clean_supervisor_env(state_dir.path())
         .env("CODEX_THREAD_ID", non_utf8_id)
         .env("CLAUDE_CODE_SESSION_ID", "session-123")
         .args(["--id", "reviewer", "--dry-run", "--", "echo"])
@@ -510,7 +568,8 @@ fn non_utf8_native_id_is_rejected_instead_of_ignoring_ambiguity() {
 
 #[test]
 fn managed_ref_present_fails_closed_instead_of_falling_through_to_native_env() {
-    subagent_with_clean_supervisor_env()
+    let state_dir = isolated_state_dir();
+    subagent_with_clean_supervisor_env(state_dir.path())
         .env("SUBAGENT_SELF_REF", "/tmp/does-not-matter.json")
         .env("CODEX_THREAD_ID", "thread-123")
         .args(["--id", "reviewer", "--dry-run", "--", "echo"])
@@ -519,4 +578,295 @@ fn managed_ref_present_fails_closed_instead_of_falling_through_to_native_env() {
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("SUBAGENT_SELF_REF"))
         .stderr(predicate::str::contains("not implemented"));
+}
+
+#[test]
+fn memory_workspace_fails_closed_as_unimplemented_on_dry_run() {
+    let state_dir = isolated_state_dir();
+    let state_root = state_dir.path().join("state");
+    subagent_with_resolvable_supervisor(&state_root)
+        .args([
+            "--id",
+            "reviewer",
+            "--memory",
+            "workspace",
+            "--dry-run",
+            "--",
+            "echo",
+        ])
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stderr(predicate::str::contains("--memory workspace"))
+        .stderr(predicate::str::contains("not implemented"));
+    assert!(
+        !state_root.exists(),
+        "--memory workspace must fail before creating any state"
+    );
+}
+
+#[test]
+fn memory_none_performs_no_persistence() {
+    let state_dir = isolated_state_dir();
+    let state_root = state_dir.path().join("state");
+    subagent_with_resolvable_supervisor(&state_root)
+        .args([
+            "--id",
+            "reviewer",
+            "--memory",
+            "none",
+            "--dry-run",
+            "--",
+            "echo",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("pair-key:").not());
+    assert!(
+        !state_root.exists(),
+        "--memory none must not create the state root"
+    );
+}
+
+#[test]
+fn dry_run_and_ordinary_run_ensure_and_report_the_same_pair() {
+    let state_dir = isolated_state_dir();
+    let workspace_dir = isolated_state_dir();
+    let temp_dir = isolated_state_dir();
+    let dry_run_report_path = temp_dir.path().join("dry-run.json");
+    let ordinary_report_path = temp_dir.path().join("ordinary.json");
+
+    subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace_dir.path())
+        .args(["--id", "reviewer", "--dry-run", "--report"])
+        .arg(&dry_run_report_path)
+        .args(["--", "echo", "hi"])
+        .assert()
+        .success();
+
+    subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace_dir.path())
+        .args(["--id", "reviewer", "--report"])
+        .arg(&ordinary_report_path)
+        .args(["--", "echo", "hi"])
+        .assert()
+        .code(WRAPPER_ERROR_EXIT);
+
+    let dry_run_report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&dry_run_report_path).unwrap()).unwrap();
+    let ordinary_report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&ordinary_report_path).unwrap()).unwrap();
+
+    assert_eq!(
+        dry_run_report["body"]["ensured_pair"]["pair_key"],
+        ordinary_report["body"]["ensured_pair"]["pair_key"]
+    );
+    let canonical_workspace = fs::canonicalize(workspace_dir.path()).unwrap();
+    assert_eq!(
+        dry_run_report["body"]["ensured_pair"]["workspace"]["encoding"],
+        "utf8"
+    );
+    assert_eq!(
+        dry_run_report["body"]["ensured_pair"]["workspace"]["value"],
+        canonical_workspace.to_str().unwrap()
+    );
+}
+
+#[test]
+fn repeated_runs_are_idempotent_and_pairs_lists_exactly_one_row() {
+    let state_dir = isolated_state_dir();
+    let workspace_dir = isolated_state_dir();
+
+    for _ in 0..3 {
+        subagent_with_resolvable_supervisor(state_dir.path())
+            .current_dir(workspace_dir.path())
+            .args(["--id", "reviewer", "--dry-run", "--", "echo", "hi"])
+            .assert()
+            .success();
+    }
+
+    let output = subagent_with_clean_supervisor_env(state_dir.path())
+        .current_dir(workspace_dir.path())
+        .args(["pairs", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let pairs = report["body"]["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0]["subagent_id"], "reviewer");
+}
+
+#[test]
+fn pairs_reports_an_empty_list_and_creates_nothing_for_a_missing_state_root() {
+    let state_dir = isolated_state_dir();
+    let state_root = state_dir.path().join("state");
+    let workspace_dir = isolated_state_dir();
+
+    subagent_with_clean_supervisor_env(&state_root)
+        .current_dir(workspace_dir.path())
+        .arg("pairs")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no pairs recorded"));
+
+    assert!(
+        !state_root.exists(),
+        "`subagent pairs` must not create the state root when it is missing"
+    );
+}
+
+#[test]
+fn pairs_json_reports_an_empty_array_for_a_missing_state_root() {
+    let state_dir = isolated_state_dir();
+    let state_root = state_dir.path().join("state");
+    let workspace_dir = isolated_state_dir();
+
+    let output = subagent_with_clean_supervisor_env(&state_root)
+        .current_dir(workspace_dir.path())
+        .args(["pairs", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["status"], "ok");
+    assert!(report["body"]["pairs"].as_array().unwrap().is_empty());
+    assert!(!state_root.exists());
+}
+
+#[test]
+fn pairs_lists_the_full_pair_key_without_the_raw_supervisor_session_id() {
+    let state_dir = isolated_state_dir();
+    let workspace_dir = isolated_state_dir();
+
+    subagent_with_clean_supervisor_env(state_dir.path())
+        .current_dir(workspace_dir.path())
+        .env("CODEX_THREAD_ID", "super-secret-thread-id")
+        .args(["--id", "reviewer", "--dry-run", "--", "echo", "hi"])
+        .assert()
+        .success();
+
+    let output = subagent_with_clean_supervisor_env(state_dir.path())
+        .current_dir(workspace_dir.path())
+        .args(["pairs", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        !String::from_utf8_lossy(&output).contains("super-secret-thread-id"),
+        "pairs listing must never include the raw supervisor session id"
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let pairs = report["body"]["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1);
+    let pair = &pairs[0];
+    assert_eq!(pair["pair_key"].as_str().unwrap().len(), 64);
+    assert_eq!(pair["subagent_id"], "reviewer");
+    assert_eq!(pair["provider"], "codex");
+    assert!(pair["created_at_unix"].is_number());
+    assert!(pair["last_seen_unix"].is_number());
+}
+
+#[test]
+fn pairs_are_isolated_between_different_workspaces() {
+    let state_dir = isolated_state_dir();
+    let workspace_a = isolated_state_dir();
+    let workspace_b = isolated_state_dir();
+
+    subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace_a.path())
+        .args(["--id", "reviewer", "--dry-run", "--", "echo", "hi"])
+        .assert()
+        .success();
+
+    let output = subagent_with_clean_supervisor_env(state_dir.path())
+        .current_dir(workspace_b.path())
+        .args(["pairs", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert!(
+        report["body"]["pairs"].as_array().unwrap().is_empty(),
+        "a pair recorded for one workspace must not appear when listing another"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_run_rejects_a_symlinked_state_root() {
+    let root = isolated_state_dir();
+    let real_state_dir = root.path().join("real-state");
+    fs::create_dir(&real_state_dir).unwrap();
+    let symlinked_state_dir = root.path().join("state-link");
+    std::os::unix::fs::symlink(&real_state_dir, &symlinked_state_dir).unwrap();
+
+    subagent_with_resolvable_supervisor(&symlinked_state_dir)
+        .args(["--id", "reviewer", "--dry-run", "--", "echo"])
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stderr(predicate::str::contains("symlink"));
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_run_rejects_a_state_root_with_group_readable_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = isolated_state_dir();
+    let state_root = root.path().join("state");
+    fs::create_dir(&state_root).unwrap();
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o750)).unwrap();
+
+    subagent_with_resolvable_supervisor(&state_root)
+        .args(["--id", "reviewer", "--dry-run", "--", "echo"])
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stderr(predicate::str::contains("group- or other-accessible"));
+}
+
+#[cfg(unix)]
+#[test]
+fn pairs_rejects_a_symlinked_state_root_instead_of_reporting_an_empty_list() {
+    let root = isolated_state_dir();
+    let real_state_dir = root.path().join("real-state");
+    fs::create_dir(&real_state_dir).unwrap();
+    let symlinked_state_dir = root.path().join("state-link");
+    std::os::unix::fs::symlink(&real_state_dir, &symlinked_state_dir).unwrap();
+
+    subagent_with_clean_supervisor_env(&symlinked_state_dir)
+        .arg("pairs")
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stderr(predicate::str::contains("symlink"));
+}
+
+#[cfg(unix)]
+#[test]
+fn state_database_file_is_created_with_owner_only_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir = isolated_state_dir();
+    let state_root = state_dir.path().join("state");
+    subagent_with_resolvable_supervisor(&state_root)
+        .args(["--id", "reviewer", "--dry-run", "--", "echo"])
+        .assert()
+        .success();
+
+    let dir_mode = fs::metadata(&state_root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dir_mode, 0o700);
+    let db_mode = fs::metadata(state_root.join("ledger.sqlite3"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(db_mode, 0o600);
 }

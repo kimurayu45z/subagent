@@ -1,11 +1,11 @@
 //! Top-level CLI dispatch for `subagent`.
 //!
-//! This module implements only the CLI shell described in `docs/design.md`
-//! section 6 ("CLI contract"). It resolves and validates the wrapper
-//! arguments and the explicit `--` child-command boundary, but the
-//! supervisor/pair/context backend described in the rest of the design is
-//! not implemented yet. Every command that would require that backend
-//! reports a clear, honest diagnostic instead of silently succeeding.
+//! This module implements the CLI shell described in `docs/design.md`
+//! section 6 ("CLI contract"), supervisor identity resolution, and the
+//! workspace-scoped pair-identity metadata store. The pair exchange ledger,
+//! context capsule, and managed child-process backend are not implemented
+//! yet. Every command that would require those later milestones reports a
+//! clear, honest diagnostic instead of silently succeeding.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -17,10 +17,14 @@ mod doctor_cmd;
 mod forget_cmd;
 mod id;
 mod log_cmd;
+mod pair_key;
 mod pairs_cmd;
 mod report;
 mod run_cmd;
+mod state_dir;
+mod store;
 mod supervisor;
+mod workspace;
 
 /// Wrapper-level exit code used for every failure that happens before, or in
 /// place of, spawning a managed child process. See `docs/design.md` section
@@ -245,13 +249,15 @@ mod tests {
             let mut out: Vec<u8> = Vec::new();
             let mut err: Vec<u8> = Vec::new();
             let code = dispatch(&args, &mut out, &mut err);
-            // Every subcommand here is a stateful placeholder (or, for
-            // `doctor`, a self-contained report) so none of them should
-            // succeed with an empty diagnostic stream, except `doctor`
-            // which is allowed to succeed while still reporting planned
-            // capabilities.
-            if name == "doctor" {
-                assert_eq!(code, ExitCode::SUCCESS);
+            // `context`, `log`, `forget`, and `agent` are stateful
+            // placeholders that always report unavailable. `doctor` is a
+            // self-contained report. `pairs` is a real, read-only listing
+            // that succeeds even when nothing has been recorded yet; its
+            // own isolated-state-root behavior is covered by
+            // `pairs_cmd`'s unit tests and by the compiled CLI contract
+            // tests, which inject `SUBAGENT_STATE_DIR` explicitly.
+            if name == "doctor" || name == "pairs" {
+                assert_eq!(code, ExitCode::SUCCESS, "subcommand {name}");
             } else {
                 assert_eq!(code, wrapper_error_exit(), "subcommand {name}");
             }

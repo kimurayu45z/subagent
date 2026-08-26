@@ -1,4 +1,4 @@
-//! `subagent forget --pair PAIR`: reports the pair ledger as unavailable.
+//! `subagent forget --pair PAIR`: reports pair deletion as unavailable.
 //!
 //! A stateful placeholder; it never deletes or otherwise mutates any state.
 //! Unlike `context`/`log`/`pairs`/`doctor`, the design grammar (section
@@ -28,7 +28,7 @@ pub(crate) fn execute(args: &[OsString], out: &mut dyn Write, err: &mut dyn Writ
 
     let _ = writeln!(
         err,
-        "subagent: forget is unavailable: the SQLite pair ledger (design.md section 10) is not implemented in this build (requested pair={})",
+        "subagent: forget is unavailable: pair deletion across the SQLite identity and exchange ledger (design.md section 10) is not implemented in this build (requested pair={})",
         forget_args.pair
     );
     wrapper_error_exit()

@@ -2,7 +2,7 @@
 
 Status: Draft, canonical
 
-Implementation milestone: Slice 0 CLI shell
+Implementation milestone: Slice 1 pair-identity metadata increment
 
 This document is the current normative design for `subagent`. Dated discussion,
 alternatives, and decision history belong under `docs/meeting-notes/` and do not
@@ -144,7 +144,7 @@ The default pair scope is the current supervisor conversation:
 
 ```text
 PairKey = hash(
-    schema_version,
+    pair_key_schema_version,
     workspace_identity,
     supervisor_provider,
     supervisor_session_id,
@@ -154,6 +154,25 @@ PairKey = hash(
 
 This prevents memory from one supervisor conversation leaking into another by
 default.
+
+For pair-key schema version 1, `hash` is SHA-256 over this exact byte stream:
+
+```text
+"subagent.pair-key.v1\n" ||
+frame(u32_le(1)) ||
+frame(workspace_identity_bytes) ||
+frame(utf8(supervisor_provider)) ||
+frame(utf8(supervisor_session_id)) ||
+frame(utf8(subagent_id))
+
+frame(value) = u64_le(byte_length(value)) || value
+```
+
+The implemented workspace identity kind is `path`: the canonicalized absolute
+working-directory path, encoded as raw operating-system bytes rather than a
+lossy UTF-8 projection. The pair-key schema version, SQLite ledger schema
+version, and machine-report schema version are independent and must be bumped
+only when their own artifact changes.
 
 An explicit `--memory workspace` mode adds a second, longer-lived role-memory
 layer keyed by:
@@ -287,9 +306,11 @@ Defaults are:
 - deterministic summarization; and
 - recording enabled.
 
-`--dry-run` performs discovery and preparation but does not start the child or
-write a completed exchange record. It prints the resolved plan to stderr or as
-an explicitly requested machine report.
+`--dry-run` performs discovery and idempotent identity preparation but does not
+start the child or write an invocation/exchange record. In a
+conversation-memory run it may create or update the workspace,
+supervisor-session, and pair identity rows. It prints the resolved plan to
+stderr or as an explicitly requested machine report.
 
 ## 7. Invocation lifecycle
 
@@ -400,19 +421,26 @@ The state root is selected with the platform-aware `directories` crate. It uses
 the operating system's state directory when available and a local application
 data directory fallback otherwise.
 
+`SUBAGENT_STATE_DIR` is the supported explicit override. An empty override is
+an error. The application identity passed to the platform resolver is `com` /
+`kimurayu45z` / `subagent`.
+
 Directories are created with owner-only access. Database, manifest, summary,
 and capsule files are owner-readable and owner-writable only. Symlinks and
 unexpected ownership at security-sensitive paths are rejected.
 
-SQLite in WAL mode is the normative metadata and exchange store. Large context
-capsules may be immutable files addressed by their content digest.
+SQLite in WAL mode is the normative metadata and exchange store. The Rust build
+uses bundled SQLite, so building from source requires a working C toolchain.
+Large context capsules may be immutable files addressed by their content
+digest.
 
-Minimum schema:
+Target minimum schema:
 
 ```text
 workspaces(id, canonical_path, identity_kind, created_at)
 supervisor_sessions(id, provider, native_id, workspace_id, first_seen, last_seen)
-pairs(id, workspace_id, supervisor_session_id, subagent_id, created_at)
+pairs(id, pair_key, workspace_id, supervisor_session_id, subagent_id,
+      created_at, last_seen)
 workspace_memories(id, workspace_id, subagent_id, created_at)
 child_sessions(id, pair_id, provider, profile_hash, native_id, status, last_seen)
 invocations(id, pair_id, sequence, status, started_at, completed_at,
@@ -421,6 +449,13 @@ exchange_messages(id, invocation_id, direction, text, redactions, created_at)
 summaries(id, scope_kind, scope_id, source_digest, summary_digest,
           summarizer_id, template_version, redaction_version, created_at)
 ```
+
+The current increment implements only `workspaces`, `supervisor_sessions`, and
+`pairs`, with SQLite `user_version = 1`. It enforces one pair row for each
+workspace/supervisor-session/subagent tuple and stores the 32-byte pair key as
+a unique BLOB. `subagent pairs` opens this store read-only and lists only rows
+for the canonical current workspace; a missing store is an empty result and is
+not created. Raw supervisor session IDs are not returned by this listing.
 
 Command arguments stored for diagnostics are redacted. Full process environments
 are never persisted.
@@ -639,11 +674,14 @@ is to test the vocabulary and workflow before committing to those mechanisms.
 - strict stream, exit, and signal semantics;
 - `context`, `log`, `pairs`, and `doctor` commands.
 
-Implementation status: the first Slice 1 increment implements explicit
-supervisor references and unambiguous native Codex/Claude environment
-detection. Ambiguous, empty, non-UTF-8, missing, or not-yet-supported managed
-parent references fail closed. Managed-parent manifest resolution, hook-registry
-detection, persistence, capsules, and child spawning remain unimplemented.
+Implementation status: the first two Slice 1 increments implement explicit
+supervisor references, unambiguous native Codex/Claude environment detection,
+canonical path-based workspace identity, versioned conversation `PairKey`
+derivation, the SQLite pair-identity metadata subset, and a real read-only
+`pairs` command. Ambiguous, empty, non-UTF-8, missing, or not-yet-supported
+managed parent references fail closed. The pair exchange ledger, deterministic
+summary, context capsule, managed-parent manifest resolution, hook-registry
+detection, and child spawning remain unimplemented.
 
 ### Slice 2: history adapters
 
