@@ -1,6 +1,6 @@
 # subagent
 
-`subagent` is a Rust wrapper that gives repeated Claude Code and Codex
+`subagent` is a Rust wrapper that gives repeated Codex and Claude Code
 delegations a stable logical identity and durable pair history.
 
 ## Install
