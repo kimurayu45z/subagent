@@ -47,7 +47,8 @@ supervisor explicitly; do not guess from process ancestry.
 Treat `pair-identity-store` separately from `pair-exchange-ledger`. Require the
 exchange ledger, context capsule, deterministic summarizer, and the intended
 child adapter to be `implemented` before claiming durable conversational memory
-is active. Require `pair-inheritance` before using an ID handoff.
+is active. Require `pair-inheritance` before using an ID handoff and
+`summarizer-model` before selecting `haiku` or `luna`.
 
 If the desired capability is reported as planned or unavailable:
 
@@ -178,7 +179,7 @@ actions, external messages, broader tool permissions, or unrelated cleanup.
 - Treat common-credential redaction as damage reduction, not proof that stored
   prompts contain no secrets. Use `--no-record` for sensitive work.
 
-## Evaluate before adding model summaries
+## Use model summaries only after measuring
 
 Start with native resume, pair history, and deterministic extraction. During
 repeated use, measure:
@@ -189,8 +190,20 @@ repeated use, measure:
 - stale-memory or wrong-scope incidents; and
 - approximate token or cost reduction after the first invocation.
 
-Add a lightweight model summarizer only when deterministic context is too large
-or misses important relationships often enough to justify the extra latency,
-cost, authentication dependency, and risk of preserving a mistaken summary.
-Any model summary must remain provenance-bearing and replaceable from its source
-records.
+Select a lightweight model summarizer only when deterministic context is too
+large or misses important relationships often enough to justify the extra
+latency, cost, authentication dependency, and risk of preserving a mistaken
+summary:
+
+```sh
+subagent --id gpt-luna-reviewer --summarizer luna -- codex exec "Continue"
+subagent --id claude-haiku-reviewer --summarizer haiku \
+  --summarize-above-bytes 32768 -- claude -p "Continue"
+```
+
+The deterministic default makes no model call. An explicit model alias is still
+threshold-gated (16 KiB by default), is skipped for `--no-record`, and falls
+back to deterministic output on failure. Remember that selecting it sends
+redacted history to that provider; do not treat redaction as proof that the
+history contains no sensitive material. Any model summary must remain
+provenance-bearing and replaceable from its source records.

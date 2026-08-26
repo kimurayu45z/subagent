@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -28,6 +28,7 @@ pub(crate) struct ChildOutcome {
     pub exit: ChildExit,
     pub stdout_capture: Vec<u8>,
     pub stdout_truncated: bool,
+    pub timed_out: bool,
     pub forwarding_errors: Vec<String>,
 }
 
@@ -68,6 +69,7 @@ pub(crate) struct ChildRunRequest<'a> {
     pub env_overrides: Vec<(OsString, OsString)>,
     pub max_capture_bytes: usize,
     pub forward_signals: bool,
+    pub timeout: Option<Duration>,
 }
 
 /// Spawns one child, writes the prepared bootstrap/caller stdin, tees both
@@ -135,6 +137,8 @@ pub(crate) fn run_child(
     let mut stdout_closed: bool = false;
     let mut stderr_closed: bool = false;
     let mut exit_status: Option<ExitStatus> = None;
+    let started: Instant = Instant::now();
+    let mut timed_out: bool = false;
     #[cfg(unix)]
     let mut forwarded_signal: i32 = 0;
 
@@ -177,6 +181,15 @@ pub(crate) fn run_child(
         if exit_status.is_none() {
             exit_status = child.try_wait().map_err(ChildProcessError::Wait)?;
         }
+        if exit_status.is_none()
+            && !timed_out
+            && request
+                .timeout
+                .is_some_and(|timeout: Duration| started.elapsed() >= timeout)
+        {
+            timed_out = true;
+            terminate_child(&mut child, child_pid, &mut forwarding_errors);
+        }
     }
 
     let status: ExitStatus = match exit_status {
@@ -205,8 +218,32 @@ pub(crate) fn run_child(
         exit,
         stdout_capture,
         stdout_truncated,
+        timed_out,
         forwarding_errors,
     })
+}
+
+fn terminate_child(child: &mut Child, child_pid: u32, errors: &mut Vec<String>) {
+    #[cfg(unix)]
+    {
+        let process_group: i32 = -(child_pid as i32);
+        let result: i32 = unsafe { libc::kill(process_group, libc::SIGKILL) };
+        if result != 0
+            && let Err(error) = child.kill()
+        {
+            push_forwarding_error(
+                errors,
+                format!("failed to terminate timed-out child: {error}"),
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = child.kill() {
+        push_forwarding_error(
+            errors,
+            format!("failed to terminate timed-out child: {error}"),
+        );
+    }
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -384,6 +421,7 @@ mod tests {
             env_overrides: Vec::new(),
             max_capture_bytes: 1024,
             forward_signals: false,
+            timeout: None,
         }
     }
 
@@ -415,6 +453,19 @@ mod tests {
         assert!(outcome.stdout_truncated);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_the_child_process_group() {
+        let mut request: ChildRunRequest<'_> = shell_request("sleep 5", Vec::new());
+        request.timeout = Some(Duration::from_millis(50));
+        let started: Instant = Instant::now();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let outcome: ChildOutcome = run_child(request, &mut out, &mut err).unwrap();
+        assert!(outcome.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     #[test]
     fn reports_spawn_failure_without_panicking() {
         let args: Vec<OsString> = Vec::new();
@@ -426,6 +477,7 @@ mod tests {
             env_overrides: Vec::new(),
             max_capture_bytes: 1024,
             forward_signals: false,
+            timeout: None,
         };
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();

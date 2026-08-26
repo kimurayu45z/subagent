@@ -27,6 +27,8 @@ use super::workspace::WorkspaceRef;
 use super::{handle_clap_error, split_on_double_dash, wrapper_error_exit};
 
 const SUBAGENT_ID_ENV: &str = "SUBAGENT_ID";
+const DEFAULT_SUMMARIZE_ABOVE_BYTES: u64 = 16 * 1024;
+const MAX_SUMMARIZE_ABOVE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -145,6 +147,9 @@ struct RunArgs {
     #[arg(long)]
     summarizer: Option<String>,
 
+    #[arg(long = "summarize-above-bytes")]
+    summarize_above_bytes: Option<u64>,
+
     #[arg(long = "max-context-bytes")]
     max_context_bytes: Option<u64>,
 
@@ -208,6 +213,7 @@ struct RunPlan {
     context: ContextScope,
     context_mode: ContextMode,
     summarizer: SummarizerChoice,
+    summarize_above_bytes: u64,
     max_context_bytes: Option<u64>,
     fresh: bool,
     no_record: bool,
@@ -227,6 +233,7 @@ struct RunPlanReport {
     context: ContextScope,
     context_mode: ContextMode,
     summarizer: SummarizerChoice,
+    summarize_above_bytes: u64,
     max_context_bytes: Option<u64>,
     fresh: bool,
     no_record: bool,
@@ -247,6 +254,7 @@ impl From<&RunPlan> for RunPlanReport {
             context: plan.context,
             context_mode: plan.context_mode,
             summarizer: plan.summarizer.clone(),
+            summarize_above_bytes: plan.summarize_above_bytes,
             max_context_bytes: plan.max_context_bytes,
             fresh: plan.fresh,
             no_record: plan.no_record,
@@ -396,6 +404,26 @@ fn execute_with_env(
         );
         return wrapper_error_exit();
     }
+    let summarizer: SummarizerChoice = SummarizerChoice::resolve(run_args.summarizer.as_deref());
+    if let SummarizerChoice::Alias(alias) = &summarizer
+        && !super::summarizer::supports_alias(alias)
+    {
+        let _ = writeln!(
+            err,
+            "subagent: unknown summarizer {alias:?}; supported aliases are deterministic, none, haiku, and luna"
+        );
+        return wrapper_error_exit();
+    }
+    let summarize_above_bytes: u64 = run_args
+        .summarize_above_bytes
+        .unwrap_or(DEFAULT_SUMMARIZE_ABOVE_BYTES);
+    if summarize_above_bytes > MAX_SUMMARIZE_ABOVE_BYTES {
+        let _ = writeln!(
+            err,
+            "subagent: --summarize-above-bytes must be at most {MAX_SUMMARIZE_ABOVE_BYTES}"
+        );
+        return wrapper_error_exit();
+    }
 
     let supervisor_required: bool = memory != MemoryMode::None || !run_args.no_record;
     let supervisor: Option<SupervisorRef> = if supervisor_required || run_args.supervisor.is_some()
@@ -445,7 +473,8 @@ fn execute_with_env(
         memory,
         context,
         context_mode: run_args.context_mode.unwrap_or(ContextMode::Required),
-        summarizer: SummarizerChoice::resolve(run_args.summarizer.as_deref()),
+        summarizer,
+        summarize_above_bytes,
         max_context_bytes: run_args.max_context_bytes,
         fresh: run_args.fresh,
         no_record: run_args.no_record,
@@ -487,8 +516,10 @@ fn execute_with_env(
                 context_scope: plan.context,
                 context_mode: plan.context_mode,
                 summarizer: &plan.summarizer,
+                summarize_above_bytes: plan.summarize_above_bytes,
                 max_context_bytes: plan.max_context_bytes,
                 no_record: plan.no_record,
+                quiet: plan.quiet,
                 forward_signals,
             },
             out,
@@ -614,6 +645,11 @@ fn print_human_plan(plan: &RunPlan, dry_run: bool, err: &mut dyn Write) {
     let _ = writeln!(err, "  context:           {}", plan.context);
     let _ = writeln!(err, "  context-mode:      {}", plan.context_mode);
     let _ = writeln!(err, "  summarizer:        {}", plan.summarizer);
+    let _ = writeln!(
+        err,
+        "  summarize above:   {} bytes",
+        plan.summarize_above_bytes
+    );
     let _ = writeln!(
         err,
         "  max-context-bytes: {}",
@@ -764,6 +800,27 @@ mod tests {
         let (code, _out, err) = run(&args, None);
         assert_eq!(code, wrapper_error_exit());
         assert!(err.contains("requires --memory conversation"));
+    }
+
+    #[test]
+    fn model_summarizer_alias_and_threshold_are_validated_before_state_access() {
+        let unknown: Vec<OsString> =
+            os(&["--id", "reviewer", "--summarizer", "mystery", "--", "echo"]);
+        let (unknown_code, _out, unknown_err) = run(&unknown, None);
+        assert_eq!(unknown_code, wrapper_error_exit());
+        assert!(unknown_err.contains("unknown summarizer"));
+
+        let too_large: Vec<OsString> = os(&[
+            "--id",
+            "reviewer",
+            "--summarize-above-bytes",
+            "16777217",
+            "--",
+            "echo",
+        ]);
+        let (large_code, _out, large_err) = run(&too_large, None);
+        assert_eq!(large_code, wrapper_error_exit());
+        assert!(large_err.contains("must be at most"));
     }
 
     #[test]

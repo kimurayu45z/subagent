@@ -137,8 +137,8 @@ fn capabilities() -> Vec<Capability> {
         ),
         capability(
             "summarizer-model",
-            CapabilityState::Planned,
-            "the optional model summarizer (design.md section 12.2) is not implemented yet",
+            CapabilityState::Implemented,
+            "opt-in haiku and luna summarizers run only above a byte threshold with provider-side tools disabled where supported, bounded I/O, a hard timeout, and deterministic fallback",
         ),
         capability(
             "child-adapter-claude",

@@ -18,6 +18,7 @@ use super::redaction::{self, RedactionResult};
 use super::run_cmd::{ContextMode, ContextScope, SummarizerChoice};
 use super::state_dir;
 use super::store::{self, BegunInvocation, ChildKind, ExchangeBody, ExitOutcome};
+use super::summarizer;
 use super::supervisor::Provider;
 use super::wrapper_error_exit;
 
@@ -41,8 +42,10 @@ pub(crate) struct ManagedRunRequest<'a> {
     pub context_scope: ContextScope,
     pub context_mode: ContextMode,
     pub summarizer: &'a SummarizerChoice,
+    pub summarize_above_bytes: u64,
     pub max_context_bytes: Option<u64>,
     pub no_record: bool,
+    pub quiet: bool,
     pub forward_signals: bool,
 }
 
@@ -72,13 +75,6 @@ pub(crate) fn execute(
             }
         };
 
-    if let SummarizerChoice::Alias(alias) = request.summarizer {
-        let _ = writeln!(
-            err,
-            "subagent: summarizer alias {alias:?} is not implemented; use deterministic or none"
-        );
-        return wrapper_error_exit();
-    }
     if request.context_scope == ContextScope::Supervisor
         && request.context_mode == ContextMode::Required
     {
@@ -111,10 +107,10 @@ pub(crate) fn execute(
         );
         return wrapper_error_exit();
     };
-    let Some(subagent_id) = request.subagent_id else {
+    if request.subagent_id.is_none() {
         let _ = writeln!(err, "subagent: recording requires a subagent id");
         return wrapper_error_exit();
-    };
+    }
     let Some(kind) = child_kind else {
         let _ = writeln!(
             err,
@@ -172,11 +168,11 @@ pub(crate) fn execute(
     let capsule: Option<Capsule> = match prepare_capsule(
         &request,
         &state_root,
-        subagent_id,
         &begun.invocation_id,
         begun.sequence,
         &ledger,
         max_context_bytes,
+        err,
     ) {
         Ok(capsule) => capsule,
         Err(message) => {
@@ -208,6 +204,7 @@ pub(crate) fn execute(
             env_overrides: Vec::new(),
             max_capture_bytes: MAX_RECORDED_RESPONSE_BYTES,
             forward_signals: request.forward_signals,
+            timeout: None,
         },
         out,
         err,
@@ -257,10 +254,10 @@ fn execute_unrecorded(
             );
             return wrapper_error_exit();
         };
-        let Some(subagent_id) = request.subagent_id else {
+        if request.subagent_id.is_none() {
             let _ = writeln!(err, "subagent: context requires a subagent id");
             return wrapper_error_exit();
-        };
+        }
         let state_root: PathBuf = match state_dir::resolve_state_root(request.state_dir_override) {
             Ok(path) => path,
             Err(error) => {
@@ -279,11 +276,11 @@ fn execute_unrecorded(
         capsule = match prepare_capsule(
             &request,
             &state_root,
-            subagent_id,
             &invocation_id,
             i64::MAX,
             &ledger,
             max_context_bytes,
+            err,
         ) {
             Ok(value) => value,
             Err(message) => {
@@ -305,6 +302,7 @@ fn execute_unrecorded(
             env_overrides: Vec::new(),
             max_capture_bytes: 0,
             forward_signals: request.forward_signals,
+            timeout: None,
         },
         out,
         err,
@@ -332,11 +330,11 @@ fn execute_unrecorded(
 fn prepare_capsule(
     request: &ManagedRunRequest<'_>,
     state_root: &Path,
-    subagent_id: &SubagentId,
     invocation_id: &str,
     sequence: i64,
     ledger: &store::Store,
     max_context_bytes: u64,
+    err: &mut dyn Write,
 ) -> Result<Option<Capsule>, String> {
     if request.context_scope == ContextScope::None {
         return Ok(None);
@@ -344,6 +342,9 @@ fn prepare_capsule(
     let pair: &store::EnsuredPair = request
         .pair
         .ok_or_else(|| "context requires a pair identity".to_string())?;
+    let subagent_id: &SubagentId = request
+        .subagent_id
+        .ok_or_else(|| "context requires a subagent id".to_string())?;
     let history: Vec<store::CompletedExchange> = ledger
         .list_completed_exchanges(&pair.pair_key, Some(sequence))
         .map_err(|error| format!("failed to read pair history: {error}"))?;
@@ -361,6 +362,40 @@ fn prepare_capsule(
             })
         })
         .transpose()?;
+    let inherited_for_model: Option<(&str, &[store::CompletedExchange])> = inherited_history
+        .as_ref()
+        .map(|inherited: &InheritedHistory| {
+            (
+                inherited.source_subagent_id.as_str(),
+                inherited.completed_exchanges.as_slice(),
+            )
+        });
+    let inherited_records: Option<&[store::CompletedExchange]> =
+        inherited_for_model.map(|(_source_id, records)| records);
+    let source_bytes: u64 = summarizer::history_source_bytes(&history, inherited_records);
+    let model_summary: Option<summarizer::ModelSummary> = if let SummarizerChoice::Alias(alias) =
+        request.summarizer
+        && !request.no_record
+        && source_bytes >= request.summarize_above_bytes
+        && source_bytes > 0
+    {
+        match summarizer::summarize(alias, &history, inherited_for_model, state_root) {
+            Ok(summary) => Some(summary),
+            Err(error) => {
+                if !request.quiet {
+                    let _ = writeln!(
+                        err,
+                        "subagent: warning: model summarizer failed; using deterministic summary: {error}"
+                    );
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let include_summary_snippets: bool =
+        !matches!(request.summarizer, SummarizerChoice::None) && model_summary.is_none();
     let capsule: Capsule = capsule::create_capsule(
         state_root,
         CapsuleRequest {
@@ -373,10 +408,11 @@ fn prepare_capsule(
                 .supervisor_provider
                 .ok_or_else(|| "context requires a resolved supervisor".to_string())?,
             context_scope: request.context_scope,
-            include_summary_snippets: matches!(request.summarizer, SummarizerChoice::Deterministic),
+            include_summary_snippets,
             max_context_bytes,
             completed_exchanges: history,
             inherited_history,
+            model_summary,
         },
     )
     .map_err(|error| format!("failed to create context capsule: {error}"))?;

@@ -5,6 +5,7 @@
 //! boundary, managed child execution and continuity, and that persistence is isolated to an explicit
 //! `SUBAGENT_STATE_DIR` so no test ever touches the real user state root.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -502,6 +503,74 @@ fn inherit_from_persists_one_way_context_for_a_renamed_subagent() {
         .find(|pair| pair["subagent_id"] == "claude-haiku-architect")
         .unwrap();
     assert_eq!(target["inherited_from"], "gpt-luna-architect");
+}
+
+#[cfg(unix)]
+#[test]
+fn cheap_model_summarizer_runs_only_after_the_configured_threshold() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir = isolated_state_dir();
+    let workspace = isolated_state_dir();
+    let claude_path: PathBuf = workspace.path().join("claude");
+    let canary_path: PathBuf = workspace.path().join("summarizer-ran");
+    let long_source: String = format!("SOURCE_LONG_MARKER_{}", "X".repeat(256));
+    let script: String = format!(
+        "#!/bin/sh\ninput=$(cat)\ncase \"$*\" in\n  *--strict-mcp-config*) : > \"$SUMMARIZER_CANARY\"; printf 'MODEL_SUMMARY_MARKER\\n' ;;\n  *) case \"$input\" in\n       *MODEL_SUMMARY_MARKER*) printf 'MODEL_SUMMARY_SEEN\\n' ;;\n       *SOURCE_LONG_MARKER*) printf 'DETERMINISTIC_ONLY\\n' ;;\n       *) printf '%s\\n' '{}' ;;\n     esac ;;\nesac\n",
+        long_source
+    );
+    fs::write(&claude_path, script).unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&claude_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&claude_path, permissions).unwrap();
+    let inherited_path: OsString = std::env::var_os("PATH").unwrap_or_default();
+    let search_path: OsString = {
+        let mut value: OsString = workspace.path().as_os_str().to_os_string();
+        value.push(":");
+        value.push(inherited_path);
+        value
+    };
+
+    let run = |threshold: &str| -> std::process::Output {
+        subagent_with_resolvable_supervisor(state_dir.path())
+            .current_dir(workspace.path())
+            .env("PATH", &search_path)
+            .env("SUMMARIZER_CANARY", &canary_path)
+            .args([
+                "--id",
+                "claude-haiku-summarizer-test",
+                "--supervisor",
+                "codex:summarizer-threshold-test",
+                "--summarizer",
+                "haiku",
+                "--summarize-above-bytes",
+                threshold,
+                "--quiet",
+                "--",
+            ])
+            .arg(&claude_path)
+            .args(["-p", "continue"])
+            .output()
+            .unwrap()
+    };
+
+    let first: std::process::Output = run("1024");
+    assert!(first.status.success());
+    assert!(
+        String::from_utf8(first.stdout)
+            .unwrap()
+            .contains("SOURCE_LONG_MARKER")
+    );
+
+    let below_threshold: std::process::Output = run("1024");
+    assert!(below_threshold.status.success());
+    assert_eq!(below_threshold.stdout, b"DETERMINISTIC_ONLY\n");
+    assert!(!canary_path.exists());
+
+    let above_threshold: std::process::Output = run("1");
+    assert!(above_threshold.status.success());
+    assert_eq!(above_threshold.stdout, b"MODEL_SUMMARY_SEEN\n");
+    assert!(canary_path.is_file());
 }
 
 #[cfg(unix)]

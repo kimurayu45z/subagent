@@ -46,6 +46,22 @@ Pair history records the task prompt and caller stdin, not provider launch flags
 The exact child command remains correlatable through a digest without repeatedly
 injecting model and sandbox options into later context.
 
+Deterministic summarization remains the offline default. To use a cheap model
+only after history grows beyond the default 16 KiB threshold:
+
+```sh
+subagent --id gpt-luna-reviewer --summarizer luna -- \
+  codex exec --model gpt-5.6-luna "Continue the review"
+
+subagent --id claude-haiku-reviewer --summarizer haiku \
+  --summarize-above-bytes 32768 -- \
+  claude -p --model haiku "Continue the review"
+```
+
+The summarizer receives redacted historical text. Short history never starts a
+summarizer process; timeout, missing CLI, or model failure falls back to the
+deterministic summary.
+
 ## Inspect or remove memory
 
 ```sh

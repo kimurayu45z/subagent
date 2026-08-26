@@ -293,7 +293,8 @@ mode and do not receive managed session behavior.
 --memory conversation|workspace|none
 --context pair|supervisor|all|none
 --context-mode required|best-effort
---summarizer deterministic|COMMAND_ALIAS|none
+--summarizer deterministic|haiku|luna|none
+--summarize-above-bytes BYTES
 --max-context-bytes BYTES
 --fresh
 --no-record
@@ -308,7 +309,9 @@ Defaults are:
 - `--context-mode required` for the pair ledger;
 - best-effort supervisor transcript enrichment, reported as `unavailable` when
   it cannot be read;
-- deterministic summarization; and
+- deterministic summarization;
+- a 16 KiB model-summarization threshold when an opt-in model alias is selected;
+- no model process for history below that threshold; and
 - recording enabled.
 
 `--dry-run` performs discovery and idempotent identity preparation but does not
@@ -557,10 +560,27 @@ A configured inexpensive model command may incrementally summarize:
 previous structured summary + normalized records after previous source cursor
 ```
 
-The summarizer is invoked directly with recursion protection and no tools. The
-history is supplied as untrusted data, not executable instructions. Failure
-falls back to the deterministic summary unless model summarization was
-explicitly required.
+The summarizer is invoked directly with recursion protection and provider-side
+tool use disabled where the provider CLI exposes a reliable switch. The history
+is supplied as untrusted data, not executable instructions. Failure falls back
+to the deterministic summary. A required/no-fallback mode is not implemented.
+
+The current implementation recognizes `haiku` and `luna` aliases. It sums the
+redacted pair and explicitly inherited history bodies and starts the model only
+when that source size reaches `--summarize-above-bytes` (16 KiB by default).
+Input is capped at 64 KiB, output at 16 KiB, and execution at 60 seconds. A
+timeout, missing provider CLI, non-zero exit, malformed output, or recursion
+guard falls back to the deterministic summary.
+
+The Haiku path uses Claude Code with an empty MCP configuration and no session
+persistence. The Luna path starts Codex with user config and rules ignored,
+memories disabled, project instruction bytes set to zero, and an empty temporary
+working directory. This removes ordinary user-config and project-instruction
+sources, but it is not a complete Codex bare mode: host-injected tool, skill, or
+MCP context may remain. Model summarization is skipped under `--no-record`.
+
+Summary caching and incremental deltas are not implemented yet: a thresholded
+model call summarizes the bounded recent input assembled for that invocation.
 
 ### 12.3 Cache validity and provenance
 
@@ -650,6 +670,9 @@ lossy replacement.
   tokens, and common token prefixes. Private-key blocks, JWTs, credential URLs,
   and configured project-specific patterns remain required hardening work and
   are not claimed as covered by the current detector.
+- Model summarization is opt-in because it sends redacted pair history to the
+  selected provider. Redaction is damage reduction, not a guarantee that the
+  history contains no sensitive information.
 - Record the number and classes of redactions without recording removed values.
 - Limit history records, individual record bytes, total capsule bytes, and
   summarizer input bytes.
@@ -725,8 +748,8 @@ owner-only context capsules, raw stream forwarding, signal propagation, and
 actual `claude -p` / `codex exec` child execution. `context`,
 `log`, `pairs`, `forget`, and `doctor` are operational. Managed-parent manifest
 resolution, hook-registry detection, supervisor-history adapters, workspace
-memory, native child-session resume, configured agent aliases, and model-based
-summarization remain deferred and fail explicitly where requested.
+memory, native child-session resume, configured agent aliases, and cached
+incremental summarization remain deferred and fail explicitly where requested.
 
 ### Slice 2: history adapters
 

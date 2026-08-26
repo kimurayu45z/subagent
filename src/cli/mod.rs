@@ -26,6 +26,7 @@ mod report;
 mod run_cmd;
 mod state_dir;
 mod store;
+mod summarizer;
 mod supervisor;
 mod workspace;
 
@@ -69,7 +70,8 @@ RUN OPTIONS:
     --memory conversation|workspace|none
     --context pair|supervisor|all|none
     --context-mode required|best-effort
-    --summarizer deterministic|COMMAND_ALIAS|none
+    --summarizer deterministic|haiku|luna|none
+    --summarize-above-bytes BYTES  Model summary threshold (default 16384)
     --max-context-bytes BYTES
     --fresh
     --no-record
