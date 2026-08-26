@@ -337,8 +337,11 @@ For each managed run, `subagent` performs the following sequence:
     child runtime handle in one completion transaction.
 
 The current request is already part of the child prompt and must not be injected
-again through pair history. A pending invocation is excluded from its own
-context capsule.
+again through pair history. For future invocations, the exchange ledger stores
+a task-focused request projection: the positional provider prompt and caller
+stdin, without provider executable names or launch flags. The exact child argv
+is represented only by its command digest. A pending invocation is excluded
+from its own context capsule.
 
 In the MVP, supervisor-history reading, cached summaries, and native runtime
 resume in steps 5, 7, 9, and 12 are unavailable. `--context all` still proceeds
@@ -470,7 +473,9 @@ raw supervisor session IDs. `subagent log` reads completed exchanges, and
 `subagent forget` deletes a pair, its dependent ledger rows, and its owned
 capsules.
 
-Command arguments stored for diagnostics are redacted. Full process environments
+Task projections stored as exchange history are redacted. Provider executable
+names and launch arguments are not copied into exchange history; an exact framed
+digest remains on the invocation row for correlation. Full process environments
 are never persisted.
 
 SQLite transactions allocate pair sequence numbers and finalize invocation
@@ -515,8 +520,9 @@ when a provider sandbox cannot read outside the workspace.
 
 The default summarizer does not call a model. The MVP selects recent completed
 pair request/response snippets within a byte budget and preserves their source
-sequence, direction, redaction, and truncation provenance. Future extraction
-may additionally identify:
+sequence, direction, redaction, and truncation provenance. Request snippets are
+task-focused projections, so provider flags and model-selection boilerplate do
+not consume the summary budget. Future extraction may additionally identify:
 
 - current objectives;
 - recent supervisor requests;

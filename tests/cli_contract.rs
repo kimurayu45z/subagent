@@ -382,7 +382,15 @@ fn second_managed_run_receives_the_first_runs_response_in_its_bootstrap() {
         .unwrap();
     assert!(log_output.status.success());
     let log_report: serde_json::Value = serde_json::from_slice(&log_output.stdout).unwrap();
-    assert_eq!(log_report["body"]["exchanges"].as_array().unwrap().len(), 4);
+    let exchanges: &Vec<serde_json::Value> = log_report["body"]["exchanges"].as_array().unwrap();
+    assert_eq!(exchanges.len(), 4);
+    assert_eq!(exchanges[0]["body"]["value"], "perform the current task");
+    assert!(
+        !exchanges[0]["body"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("-p")
+    );
 
     let context_output: std::process::Output =
         subagent_with_resolvable_supervisor(state_dir.path())

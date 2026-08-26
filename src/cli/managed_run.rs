@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
 use uuid::Uuid;
 
 use super::capsule::{self, Capsule, CapsuleRequest};
@@ -16,7 +15,6 @@ use super::child;
 use super::id::SubagentId;
 use super::process::{self, ChildExit, ChildOutcome, ChildRunRequest};
 use super::redaction::{self, RedactionResult};
-use super::report::OsStringJson;
 use super::run_cmd::{ContextMode, ContextScope, SummarizerChoice};
 use super::state_dir;
 use super::store::{self, BegunInvocation, ChildKind, ExchangeBody, ExitOutcome};
@@ -46,30 +44,6 @@ pub(crate) struct ManagedRunRequest<'a> {
     pub max_context_bytes: Option<u64>,
     pub no_record: bool,
     pub forward_signals: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct RecordedRequest {
-    schema_version: u32,
-    program: OsStringJson,
-    args: Vec<OsStringJson>,
-    caller_stdin: RecordedBytes,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "encoding", content = "value", rename_all = "snake_case")]
-enum RecordedBytes {
-    Utf8(String),
-    Bytes(Vec<u8>),
-}
-
-impl RecordedBytes {
-    fn from_slice(bytes: &[u8]) -> RecordedBytes {
-        match std::str::from_utf8(bytes) {
-            Ok(text) => RecordedBytes::Utf8(text.to_string()),
-            Err(_) => RecordedBytes::Bytes(bytes.to_vec()),
-        }
-    }
 }
 
 pub(crate) fn execute(
@@ -172,7 +146,7 @@ pub(crate) fn execute(
         return wrapper_error_exit();
     }
 
-    let recorded_request: ExchangeBody = make_recorded_request(&request);
+    let recorded_request: ExchangeBody = make_recorded_request(kind, &request);
     let provenance: String = context_provenance(request.context_scope);
     let program_name: String = std::path::Path::new(request.program)
         .file_name()
@@ -394,19 +368,9 @@ fn prepare_capsule(
     Ok(Some(capsule))
 }
 
-fn make_recorded_request(request: &ManagedRunRequest<'_>) -> ExchangeBody {
-    let record: RecordedRequest = RecordedRequest {
-        schema_version: 1,
-        program: OsStringJson::from_os_str(request.program),
-        args: request
-            .args
-            .iter()
-            .map(|argument| OsStringJson::from_os_str(argument))
-            .collect(),
-        caller_stdin: RecordedBytes::from_slice(request.caller_stdin),
-    };
-    let json: Vec<u8> = serde_json::to_vec(&record).expect("recorded request always serializes");
-    redaction_to_exchange(redaction::redact(&json, MAX_RECORDED_REQUEST_BYTES))
+fn make_recorded_request(kind: ChildKind, request: &ManagedRunRequest<'_>) -> ExchangeBody {
+    let projected: Vec<u8> = child::project_task_request(kind, request.args, request.caller_stdin);
+    redaction_to_exchange(redaction::redact(&projected, MAX_RECORDED_REQUEST_BYTES))
 }
 
 fn redaction_to_exchange(result: RedactionResult) -> ExchangeBody {

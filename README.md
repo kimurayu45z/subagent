@@ -32,6 +32,10 @@ Everything after the first literal `--` is passed to the provider CLI without
 wrapper parsing. Managed mode currently recognizes `codex exec` and
 `claude -p`/`claude --print`.
 
+Pair history records the task prompt and caller stdin, not provider launch flags.
+The exact child command remains correlatable through a digest without repeatedly
+injecting model and sandbox options into later context.
+
 ## Inspect or remove memory
 
 ```sh
