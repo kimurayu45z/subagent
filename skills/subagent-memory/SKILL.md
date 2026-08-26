@@ -44,12 +44,10 @@ still reporting managed-parent references and hook-registry detection as
 planned. If both native provider IDs are inherited, pass the immediate
 supervisor explicitly; do not guess from process ancestry.
 
-Treat `pair-identity-store` separately from `pair-exchange-ledger`. The former
-means the build can derive a workspace-scoped pair key, remember that the pair
-exists, and show it with `subagent pairs`; it does not mean prior messages can
-already be recorded, recovered, summarized, or injected. Require the exchange
-ledger and context-capsule capabilities before claiming durable conversational
-memory is active.
+Treat `pair-identity-store` separately from `pair-exchange-ledger`. Require the
+exchange ledger, context capsule, deterministic summarizer, and the intended
+child adapter to be `implemented` before claiming durable conversational memory
+is active.
 
 If the desired capability is reported as planned or unavailable:
 
@@ -107,13 +105,36 @@ For interface inspection without starting the child:
 subagent --id gpt-sol-reviewer --dry-run -- codex exec "Review the current diff"
 ```
 
-In builds with `pair-identity-store`, a conversation-memory dry-run
-idempotently creates or refreshes the pair identity metadata even though it
-does not create an invocation/exchange record or start the child. Use
-`--memory none --no-record` when inspection must perform no persistence. Use
-`subagent pairs --format json` to inspect the identities recorded for the
-canonical current workspace; the listing intentionally omits raw supervisor
-session IDs.
+A conversation-memory dry-run idempotently creates or refreshes pair identity
+metadata, but does not create an invocation/exchange, context capsule, or child.
+Use `--memory none --no-record --context none` when inspection must perform no
+persistence.
+
+For an actual managed run, use only the recognized MVP shapes:
+
+```sh
+subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
+subagent --id claude-opus-architect -- claude -p --model opus "Review this design"
+```
+
+The wrapper preserves provider argv and prepends the capsule location plus a
+bounded deterministic history summary through stdin. Do not combine managed
+mode with provider-native resume/fork flags; native runtime-session continuity
+is not implemented yet. Unknown programs are allowed only as explicit
+`--memory none --context none --no-record` passthrough.
+
+Inspect and manage durable state with:
+
+```sh
+subagent pairs --format json
+subagent log --pair PAIR -n 10
+subagent context --pair PAIR
+subagent forget --pair PAIR
+```
+
+`log` exposes redacted completed request/response bodies. `context` reports the
+exact capsule manifest paths. `forget` deletes that pair's ledger records and
+owned capsules; do not run it unless deletion is within the user's request.
 
 Keep the current assignment self-contained even when prior memory is available.
 Memory should supply decisions and continuity, not replace a clear statement of
@@ -135,6 +156,11 @@ actions, external messages, broader tool permissions, or unrelated cleanup.
 - Keep child stdout and structured output free of wrapper reports. Send wrapper
   diagnostics through its documented side channel.
 - Report unavailable, stale, truncated, or redacted context explicitly.
+- Remember that supervisor transcript projection is not in the MVP. Default
+  `--context all` currently supplies pair history and records supervisor history
+  as unavailable; required supervisor-only context fails before spawn.
+- Treat common-credential redaction as damage reduction, not proof that stored
+  prompts contain no secrets. Use `--no-record` for sensitive work.
 
 ## Evaluate before adding model summaries
 

@@ -2,23 +2,26 @@
 //!
 //! This module implements the CLI shell described in `docs/design.md`
 //! section 6 ("CLI contract"), supervisor identity resolution, and the
-//! workspace-scoped pair-identity metadata store. The pair exchange ledger,
-//! context capsule, and managed child-process backend are not implemented
-//! yet. Every command that would require those later milestones reports a
-//! clear, honest diagnostic instead of silently succeeding.
+//! workspace-scoped pair store, durable exchange ledger, context capsule,
+//! and managed child-process backend for Claude print mode and Codex exec.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::process::ExitCode;
 
 mod agent_cmd;
+mod capsule;
+mod child;
 mod context_cmd;
 mod doctor_cmd;
 mod forget_cmd;
 mod id;
 mod log_cmd;
+mod managed_run;
 mod pair_key;
 mod pairs_cmd;
+mod process;
+mod redaction;
 mod report;
 mod run_cmd;
 mod state_dir;
@@ -249,14 +252,10 @@ mod tests {
             let mut out: Vec<u8> = Vec::new();
             let mut err: Vec<u8> = Vec::new();
             let code = dispatch(&args, &mut out, &mut err);
-            // `context`, `log`, `forget`, and `agent` are stateful
-            // placeholders that always report unavailable. `doctor` is a
-            // self-contained report. `pairs` is a real, read-only listing
-            // that succeeds even when nothing has been recorded yet; its
-            // own isolated-state-root behavior is covered by
-            // `pairs_cmd`'s unit tests and by the compiled CLI contract
-            // tests, which inject `SUBAGENT_STATE_DIR` explicitly.
-            if name == "doctor" || name == "pairs" {
+            // Read-only context, doctor, and pair listings succeed on an
+            // empty store. Other bare commands are missing required
+            // arguments or remain profile-management placeholders.
+            if name == "context" || name == "doctor" || name == "pairs" {
                 assert_eq!(code, ExitCode::SUCCESS, "subcommand {name}");
             } else {
                 assert_eq!(code, wrapper_error_exit(), "subcommand {name}");

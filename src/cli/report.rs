@@ -19,8 +19,6 @@ pub(crate) const REPORT_SCHEMA_VERSION: u32 = 1;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReportStatus {
     Ok,
-    Unavailable,
-    Error,
 }
 
 #[derive(Debug, Clone, Serialize)]

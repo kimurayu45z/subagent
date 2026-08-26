@@ -2,7 +2,7 @@
 
 Status: Draft, canonical
 
-Implementation milestone: Slice 1 pair-identity metadata increment
+Implementation milestone: usable provider-neutral managed-run MVP
 
 This document is the current normative design for `subagent`. Dated discussion,
 alternatives, and decision history belong under `docs/meeting-notes/` and do not
@@ -32,8 +32,8 @@ The CLI gives a subordinate access to:
 2. the durable exchange history between that supervisor conversation and the
    logical subordinate;
 3. a compact, provenance-bearing summary of those histories; and
-4. the subordinate's native runtime session when that provider can resume it
-   safely.
+4. eventually, the subordinate's native runtime session when that provider can
+   resume it safely. The MVP uses provider-independent pair history instead.
 
 The design must work on Linux and macOS. Platform-specific discovery is isolated
 behind adapters and must not silently narrow the supported platform set.
@@ -236,7 +236,7 @@ Detection follows this precedence order:
    transcript; or
 5. failure with an actionable diagnostic.
 
-Managed children receive:
+The planned nested-delegation protocol gives managed children:
 
 ```text
 SUBAGENT_SELF_REF=<absolute manifest path>
@@ -247,6 +247,10 @@ SUBAGENT_DEPTH=<non-negative integer>
 This is necessary because nested delegation may inherit an ancestor's
 `CODEX_THREAD_ID` while also receiving the immediate Claude Code supervisor's
 `CLAUDE_CODE_SESSION_ID`, or vice versa.
+
+The MVP does not yet create or resolve this managed-parent manifest. A present
+`SUBAGENT_SELF_REF` therefore fails closed, and nested callers should pass an
+explicit `--supervisor` until the protocol is implemented.
 
 If multiple native provider IDs are present and the immediate supervisor cannot
 be proven, `subagent` must not guess. The user must pass `--supervisor`, or the
@@ -335,6 +339,11 @@ For each managed run, `subagent` performs the following sequence:
 The current request is already part of the child prompt and must not be injected
 again through pair history. A pending invocation is excluded from its own
 context capsule.
+
+In the MVP, supervisor-history reading, cached summaries, and native runtime
+resume in steps 5, 7, 9, and 12 are unavailable. `--context all` still proceeds
+with complete pair history and records supervisor history as unavailable;
+`--context supervisor --context-mode required` fails before spawn.
 
 ## 8. History adapters
 
@@ -450,12 +459,16 @@ summaries(id, scope_kind, scope_id, source_digest, summary_digest,
           summarizer_id, template_version, redaction_version, created_at)
 ```
 
-The current increment implements only `workspaces`, `supervisor_sessions`, and
-`pairs`, with SQLite `user_version = 1`. It enforces one pair row for each
-workspace/supervisor-session/subagent tuple and stores the 32-byte pair key as
-a unique BLOB. `subagent pairs` opens this store read-only and lists only rows
-for the canonical current workspace; a missing store is an empty result and is
-not created. Raw supervisor session IDs are not returned by this listing.
+The MVP uses SQLite `user_version = 2`. It implements `workspaces`,
+`supervisor_sessions`, `pairs`, `invocations`, and `exchange_messages`. It
+enforces one pair row for each workspace/supervisor-session/subagent tuple and
+allocates monotonically increasing per-pair invocation sequences under an
+immediate transaction. Pending, completed, spawn-failed, and abandoned runs are
+distinct states; only completed request/response messages become pair history.
+`subagent pairs` lists only rows for the canonical current workspace and omits
+raw supervisor session IDs. `subagent log` reads completed exchanges, and
+`subagent forget` deletes a pair, its dependent ledger rows, and its owned
+capsules.
 
 Command arguments stored for diagnostics are redacted. Full process environments
 are never persisted.
@@ -472,9 +485,11 @@ Each run receives an immutable capsule:
 context/<run-id>/
   manifest.json
   summary.md
-  supervisor.jsonl
   pair-history.jsonl
 ```
+
+The MVP does not write `supervisor.jsonl`: its manifest records supervisor
+history as unavailable until provider history adapters are implemented.
 
 `manifest.json` records:
 
@@ -490,14 +505,18 @@ The child receives a short bootstrap message containing the capsule path and
 summary. Provider-specific preparation grants read access only when the child
 sandbox would otherwise exclude the capsule.
 
-The full normalized history remains pull-based. It is not copied into the prompt
-unless explicitly requested.
+The full pair history remains pull-based. A bounded deterministic recent-history
+summary is also included directly in the bootstrap so continuity still works
+when a provider sandbox cannot read outside the workspace.
 
 ## 12. Summarization
 
 ### 12.1 Deterministic default
 
-The default summarizer does not call a model. It selects, within a byte budget:
+The default summarizer does not call a model. The MVP selects recent completed
+pair request/response snippets within a byte budget and preserves their source
+sequence, direction, redaction, and truncation provenance. Future extraction
+may additionally identify:
 
 - current objectives;
 - recent supervisor requests;
@@ -549,20 +568,17 @@ applicable, generation time, truncation flag, and source digest.
 
 ### 13.1 Claude Code child
 
-For a new managed child, `subagent` allocates a UUID and supplies Claude Code's
-session-ID option. Later calls for the same pair, child provider, and compatible
-profile resume that exact session. An explicit provider resume/fork option in
-the user's command takes precedence and is recorded as such.
-
-The adapter injects only the short context bootstrap. It must preserve the
-user's prompt and avoid variadic option ambiguity by constructing an explicit
-argument boundary where supported.
+The MVP recognizes `claude -p` / `claude --print`, preserves the caller's argv,
+and prepends the context bootstrap through stdin. Claude native resume,
+continue, session-id, and fork options are rejected in managed mode rather than
+combined ambiguously with pair memory. Use explicit `--context none
+--no-record` passthrough when provider-native session behavior is required.
 
 ### 13.2 Codex child
 
-The compatibility path injects the bootstrap through stdin, which Codex appends
-as a distinct input block when a positional prompt is present. The adapter must
-also preserve caller-provided stdin.
+The MVP recognizes `codex exec` and injects the bootstrap through stdin, which
+Codex appends as a distinct input block when a positional prompt is present.
+Caller-provided stdin is preserved after an explicit delimiter.
 
 Native Codex continuity requires an exact observed thread ID. Managed execution
 through app-server is the preferred long-term implementation. Until that is
@@ -606,9 +622,11 @@ lossy replacement.
   user explicitly names another session.
 - Never read provider authentication stores as part of history discovery.
 - Never persist the full environment.
-- Redact common API keys, authorization headers, private keys, JWTs, credential
-  URLs, and configured project-specific patterns before persistence and before
-  injection.
+- Redact common API keys and authorization material before persistence and
+  injection. The MVP covers credential-shaped key/value assignments, bearer
+  tokens, and common token prefixes. Private-key blocks, JWTs, credential URLs,
+  and configured project-specific patterns remain required hardening work and
+  are not claimed as covered by the current detector.
 - Record the number and classes of redactions without recording removed values.
 - Limit history records, individual record bytes, total capsule bytes, and
   summarizer input bytes.
@@ -624,7 +642,8 @@ system. This limitation is included in `doctor` and capsule provenance.
 
 ## 16. Configuration
 
-Illustrative configuration:
+Illustrative future configuration (the MVP has no configuration-file or agent
+alias loader yet):
 
 ```toml
 schema_version = 1
@@ -674,14 +693,16 @@ is to test the vocabulary and workflow before committing to those mechanisms.
 - strict stream, exit, and signal semantics;
 - `context`, `log`, `pairs`, and `doctor` commands.
 
-Implementation status: the first two Slice 1 increments implement explicit
-supervisor references, unambiguous native Codex/Claude environment detection,
-canonical path-based workspace identity, versioned conversation `PairKey`
-derivation, the SQLite pair-identity metadata subset, and a real read-only
-`pairs` command. Ambiguous, empty, non-UTF-8, missing, or not-yet-supported
-managed parent references fail closed. The pair exchange ledger, deterministic
-summary, context capsule, managed-parent manifest resolution, hook-registry
-detection, and child spawning remain unimplemented.
+Implementation status: the usable MVP implements explicit supervisor
+references, unambiguous native Codex/Claude environment detection, canonical
+path-based workspace identity, conversation `PairKey` derivation, the version 2
+SQLite pair/exchange ledger, common-credential redaction, deterministic recent
+history summaries, owner-only context capsules, raw stream forwarding, signal
+propagation, and actual `claude -p` / `codex exec` child execution. `context`,
+`log`, `pairs`, `forget`, and `doctor` are operational. Managed-parent manifest
+resolution, hook-registry detection, supervisor-history adapters, workspace
+memory, native child-session resume, configured agent aliases, and model-based
+summarization remain deferred and fail explicitly where requested.
 
 ### Slice 2: history adapters
 
@@ -697,11 +718,14 @@ detection, and child spawning remain unimplemented.
 - nested managed delegation manifests;
 - crash recovery for pending invocations.
 
-### Slice 4: managed Codex execution
+### Slice 4: app-server-managed Codex execution
 
 - app-server-driven child thread start/resume;
 - exact child thread observation;
 - output compatibility and cancellation handling.
+
+The provider-neutral MVP already supports the compatibility `codex exec` path;
+this slice is specifically the native app-server resume and observation layer.
 
 ### Slice 5: optional model summaries
 

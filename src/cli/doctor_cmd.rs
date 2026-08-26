@@ -26,7 +26,6 @@ struct DoctorArgs {
 enum CapabilityState {
     Implemented,
     Planned,
-    Unavailable,
 }
 
 impl CapabilityState {
@@ -34,7 +33,6 @@ impl CapabilityState {
         match self {
             CapabilityState::Implemented => "implemented",
             CapabilityState::Planned => "planned",
-            CapabilityState::Unavailable => "unavailable",
         }
     }
 }
@@ -99,14 +97,18 @@ fn capabilities() -> Vec<Capability> {
         ),
         capability(
             "pair-exchange-ledger",
-            CapabilityState::Planned,
-            "invocation and exchange-message recording (design.md section 10's \
-             invocations/exchange_messages tables) is not implemented yet",
+            CapabilityState::Implemented,
+            "completed managed requests and stdout responses are recorded in the SQLite invocation ledger",
         ),
         capability(
             "context-capsule",
-            CapabilityState::Planned,
-            "context capsule materialization (design.md section 11) is not implemented yet",
+            CapabilityState::Implemented,
+            "owner-only manifest, deterministic summary, and pair-history JSONL are materialized per invocation",
+        ),
+        capability(
+            "redaction-common-credentials",
+            CapabilityState::Implemented,
+            "common credential assignments, bearer tokens, and known token prefixes are redacted; non-UTF-8 bodies are tagged as unscannable, and this is not a complete secret classifier",
         ),
         capability(
             "history-adapter-codex",
@@ -120,8 +122,8 @@ fn capabilities() -> Vec<Capability> {
         ),
         capability(
             "summarizer-deterministic",
-            CapabilityState::Planned,
-            "the deterministic summarizer (design.md section 12.1) is not implemented yet",
+            CapabilityState::Implemented,
+            "a bounded model-free summary of recent pair exchanges is injected through child stdin",
         ),
         capability(
             "summarizer-model",
@@ -130,18 +132,18 @@ fn capabilities() -> Vec<Capability> {
         ),
         capability(
             "child-adapter-claude",
-            CapabilityState::Planned,
-            "Claude Code child session assignment and resume (design.md section 13.1) is not implemented yet",
+            CapabilityState::Implemented,
+            "claude -p/--print is supported with argument-preserving stdin bootstrap injection; native resume is intentionally deferred",
         ),
         capability(
             "child-adapter-codex",
-            CapabilityState::Unavailable,
-            "managed Codex execution requires app-server support that is not implemented; native resume is reported unavailable per design.md section 13.2",
+            CapabilityState::Implemented,
+            "codex exec is supported with argument-preserving stdin bootstrap injection; native resume is intentionally deferred",
         ),
         capability(
             "child-spawn",
-            CapabilityState::Unavailable,
-            "an ordinary managed run currently exits before spawning any child process (exit 125)",
+            CapabilityState::Implemented,
+            "stdout/stderr are forwarded as raw bytes, stdout capture is bounded, and child exit status is preserved",
         ),
     ]
 }
@@ -212,13 +214,13 @@ mod tests {
     }
 
     #[test]
-    fn child_spawn_capability_is_explicitly_unavailable() {
+    fn child_spawn_capability_is_implemented() {
         let capabilities: Vec<Capability> = capabilities();
         let child_spawn: &Capability = capabilities
             .iter()
             .find(|c| c.name == "child-spawn")
             .unwrap();
-        assert_eq!(child_spawn.state, CapabilityState::Unavailable);
+        assert_eq!(child_spawn.state, CapabilityState::Implemented);
     }
 
     #[test]

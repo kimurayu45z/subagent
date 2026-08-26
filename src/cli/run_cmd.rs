@@ -7,12 +7,11 @@
 //! preparation, not an exchange record. `--dry-run` prints the resolved
 //! plan and exits successfully without spawning anything. An ordinary
 //! (non-dry-run) managed invocation never spawns the child either; it exits
-//! `125` with an explicit "backend not implemented" diagnostic, per this
-//! milestone's requirement to be honest about what is and is not built.
+//! through the durable ledger, context capsule, and managed child runner.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::Write;
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -197,7 +196,7 @@ impl From<&store::EnsuredPair> for EnsuredPairReport {
 #[derive(Debug, Clone)]
 struct RunPlan {
     id: Option<SubagentId>,
-    supervisor: SupervisorRef,
+    supervisor: Option<SupervisorRef>,
     supervisor_override: Option<String>,
     memory: MemoryMode,
     context: ContextScope,
@@ -215,7 +214,7 @@ struct RunPlan {
 #[derive(Debug, Clone, Serialize)]
 struct RunPlanReport {
     id: Option<String>,
-    supervisor: SupervisorRef,
+    supervisor: Option<SupervisorRef>,
     supervisor_override: Option<String>,
     memory: MemoryMode,
     context: ContextScope,
@@ -269,6 +268,15 @@ pub(crate) fn execute(args: &[OsString], out: &mut dyn Write, err: &mut dyn Writ
             return wrapper_error_exit();
         }
     };
+    let mut caller_stdin: Vec<u8> = Vec::new();
+    let stdin: std::io::Stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        let mut locked: std::io::StdinLock<'_> = stdin.lock();
+        if let Err(io_error) = locked.read_to_end(&mut caller_stdin) {
+            let _ = writeln!(err, "subagent: failed to read caller stdin: {io_error}");
+            return wrapper_error_exit();
+        }
+    }
     execute_with_env(
         args,
         out,
@@ -277,6 +285,8 @@ pub(crate) fn execute(args: &[OsString], out: &mut dyn Write, err: &mut dyn Writ
         &detection_env,
         &cwd,
         state_dir_override.as_deref(),
+        &caller_stdin,
+        true,
     )
 }
 
@@ -285,6 +295,7 @@ pub(crate) fn execute(args: &[OsString], out: &mut dyn Write, err: &mut dyn Writ
 /// `SUBAGENT_STATE_DIR` override all injected explicitly -- each resolved
 /// exactly once, at this process edge -- so tests never need to mutate real
 /// process environment state or touch the real user state root.
+#[allow(clippy::too_many_arguments)]
 fn execute_with_env(
     args: &[OsString],
     out: &mut dyn Write,
@@ -293,6 +304,8 @@ fn execute_with_env(
     detection_env: &DetectionEnv,
     cwd: &Path,
     state_dir_override: Option<&OsStr>,
+    caller_stdin: &[u8],
+    forward_signals: bool,
 ) -> ExitCode {
     let split = split_on_double_dash(args);
 
@@ -340,25 +353,44 @@ fn execute_with_env(
         return wrapper_error_exit();
     }
 
-    let supervisor: SupervisorRef =
+    let context: ContextScope = run_args.context.unwrap_or(if memory == MemoryMode::None {
+        ContextScope::None
+    } else {
+        ContextScope::All
+    });
+    if memory == MemoryMode::None && context != ContextScope::None {
+        let _ = writeln!(
+            err,
+            "subagent: --memory none cannot supply remembered context; use --context none"
+        );
+        return wrapper_error_exit();
+    }
+
+    let supervisor_required: bool = memory != MemoryMode::None || !run_args.no_record;
+    let supervisor: Option<SupervisorRef> = if supervisor_required || run_args.supervisor.is_some()
+    {
         match supervisor::resolve(run_args.supervisor.as_deref(), detection_env) {
-            Ok(supervisor) => supervisor,
+            Ok(supervisor) => Some(supervisor),
             Err(resolution_error) => {
                 let _ = writeln!(err, "subagent: {resolution_error}");
                 return wrapper_error_exit();
             }
-        };
+        }
+    } else {
+        None
+    };
 
     let ensured_pair: Option<store::EnsuredPair> = match memory {
         MemoryMode::None => None,
         MemoryMode::Workspace => unreachable!("--memory workspace already handled above"),
         MemoryMode::Conversation => {
-            // `id` is guaranteed `Some` here: `memory != MemoryMode::None` and
-            // the check above already rejected a missing `--id` in that case.
+            let supervisor_ref: &SupervisorRef = supervisor
+                .as_ref()
+                .expect("conversation memory always requires a resolved supervisor");
             let subagent_id: &SubagentId = id
                 .as_ref()
                 .expect("--memory conversation requires --id, which is enforced before this point");
-            match ensure_conversation_pair(cwd, state_dir_override, &supervisor, subagent_id) {
+            match ensure_conversation_pair(cwd, state_dir_override, supervisor_ref, subagent_id) {
                 Ok(pair) => Some(pair),
                 Err(message) => {
                     let _ = writeln!(err, "subagent: {message}");
@@ -373,7 +405,7 @@ fn execute_with_env(
         supervisor,
         supervisor_override: run_args.supervisor.clone(),
         memory,
-        context: run_args.context.unwrap_or(ContextScope::All),
+        context,
         context_mode: run_args.context_mode.unwrap_or(ContextMode::Required),
         summarizer: SummarizerChoice::resolve(run_args.summarizer.as_deref()),
         max_context_bytes: run_args.max_context_bytes,
@@ -386,17 +418,7 @@ fn execute_with_env(
     };
 
     if let Some(report_path) = &run_args.report {
-        let status: ReportStatus = if run_args.dry_run {
-            ReportStatus::Ok
-        } else {
-            ReportStatus::Error
-        };
-        let kind: &str = if run_args.dry_run {
-            "run_plan"
-        } else {
-            "run_backend_unavailable"
-        };
-        let report = Report::new(kind, status, RunPlanReport::from(&plan));
+        let report = Report::new("run_plan", ReportStatus::Ok, RunPlanReport::from(&plan));
         if let Err(io_error) = write_json_atomic(report_path, &report) {
             let _ = writeln!(
                 err,
@@ -414,15 +436,26 @@ fn execute_with_env(
     if run_args.dry_run {
         ExitCode::SUCCESS
     } else {
-        let _ = writeln!(
+        super::managed_run::execute(
+            super::managed_run::ManagedRunRequest {
+                program: &plan.program,
+                args: &plan.args,
+                cwd,
+                caller_stdin,
+                state_dir_override,
+                pair: plan.ensured_pair.as_ref(),
+                subagent_id: plan.id.as_ref(),
+                supervisor_provider: plan.supervisor.as_ref().map(|value| value.provider),
+                context_scope: plan.context,
+                context_mode: plan.context_mode,
+                summarizer: &plan.summarizer,
+                max_context_bytes: plan.max_context_bytes,
+                no_record: plan.no_record,
+                forward_signals,
+            },
+            out,
             err,
-            "subagent: backend not implemented: the pair exchange ledger, the context capsule, and child process spawning are not implemented in this build"
-        );
-        let _ = writeln!(
-            err,
-            "subagent: no child process was started; re-run with --dry-run to inspect the resolved plan without this error"
-        );
-        wrapper_error_exit()
+        )
     }
 }
 
@@ -495,7 +528,12 @@ fn print_human_plan(plan: &RunPlan, dry_run: bool, err: &mut dyn Write) {
         .map(|id| id.to_string())
         .unwrap_or_else(|| "<none>".to_string());
     let _ = writeln!(err, "  id:                {id_display}");
-    let _ = writeln!(err, "  supervisor:        {}", plan.supervisor);
+    let supervisor_display: String = plan
+        .supervisor
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "<not required>".to_string());
+    let _ = writeln!(err, "  supervisor:        {supervisor_display}");
     let _ = writeln!(err, "  memory:            {}", plan.memory);
     let _ = writeln!(err, "  context:           {}", plan.context);
     let _ = writeln!(err, "  context-mode:      {}", plan.context_mode);
@@ -572,6 +610,8 @@ mod tests {
             detection_env,
             cwd_dir.path(),
             Some(state_root.as_os_str()),
+            &[],
+            false,
         );
         (
             code,
@@ -712,6 +752,8 @@ mod tests {
                 &detection_env,
                 cwd_dir.path(),
                 Some(state_root.as_os_str()),
+                &[],
+                false,
             );
             String::from_utf8(err).unwrap()
         };
@@ -783,11 +825,42 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_run_reports_backend_not_implemented_and_exits_125() {
-        let args = os(&["--id", "reviewer", "--", "claude", "-p", "hello"]);
+    fn ordinary_unrecorded_passthrough_runs_the_child() {
+        let args = os(&[
+            "--memory",
+            "none",
+            "--context",
+            "none",
+            "--no-record",
+            "--quiet",
+            "--",
+            "true",
+        ]);
         let (code, _out, err) = run(&args, None);
-        assert_eq!(code, wrapper_error_exit());
-        assert!(err.contains("backend not implemented"));
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn ephemeral_passthrough_does_not_require_a_supervisor_identity() {
+        let detection_env = DetectionEnv {
+            self_ref: None,
+            codex_thread_id: None,
+            claude_session_id: None,
+        };
+        let args = os(&[
+            "--memory",
+            "none",
+            "--context",
+            "none",
+            "--no-record",
+            "--quiet",
+            "--",
+            "true",
+        ]);
+        let (code, _out, err) = run_with_detection(&args, None, &detection_env);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.is_empty());
     }
 
     #[test]
@@ -930,7 +1003,7 @@ mod tests {
         }
 
         #[test]
-        fn ordinary_run_still_exits_125_without_spawning_even_with_a_resolved_supervisor() {
+        fn unsupported_managed_child_exits_125_with_a_resolved_supervisor() {
             let detection_env = DetectionEnv {
                 self_ref: None,
                 codex_thread_id: Some(OsString::from("thread-1")),
@@ -939,7 +1012,7 @@ mod tests {
             let args = os(&["--id", "reviewer", "--", "echo", "hi"]);
             let (code, _out, err) = run_with_detection(&args, None, &detection_env);
             assert_eq!(code, wrapper_error_exit());
-            assert!(err.contains("backend not implemented"));
+            assert!(err.contains("supports only"));
             assert!(!err.contains("supervisor detection"));
         }
     }

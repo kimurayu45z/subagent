@@ -2,8 +2,7 @@
 //! binary as a real subprocess, as opposed to the in-process unit tests in
 //! `src/cli/*`. These specifically cover the guarantees a caller of the
 //! binary relies on: exit codes, stream separation, the mandatory `--`
-//! boundary, that a managed run never spawns the child process in this
-//! milestone, and that pair-identity persistence is isolated to an explicit
+//! boundary, managed child execution and continuity, and that persistence is isolated to an explicit
 //! `SUBAGENT_STATE_DIR` so no test ever touches the real user state root.
 
 use std::fs;
@@ -115,14 +114,14 @@ fn invalid_id_is_rejected_with_a_clear_diagnostic() {
 }
 
 #[test]
-fn ordinary_managed_run_exits_125_with_backend_diagnostic_and_no_child_output() {
+fn unsupported_managed_program_exits_125_without_child_output() {
     let state_dir = isolated_state_dir();
     subagent_with_resolvable_supervisor(state_dir.path())
         .args(["--id", "reviewer", "--", "echo", "should-not-run"])
         .assert()
         .code(WRAPPER_ERROR_EXIT)
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("backend not implemented"));
+        .stderr(predicate::str::contains("supports only"));
 }
 
 /// A real child, if it were spawned, would leave evidence behind on disk.
@@ -294,25 +293,123 @@ fn plan_report_is_written_with_owner_only_permissions() {
     assert_eq!(mode, 0o600);
 }
 
+#[cfg(unix)]
 #[test]
-fn ordinary_run_report_reflects_backend_unavailable_status() {
+fn ordinary_run_report_reflects_a_resolved_managed_plan() {
     let state_dir = isolated_state_dir();
     let temp_dir = isolated_state_dir();
     let report_path: PathBuf = temp_dir.path().join("plan.json");
+    let claude_path: PathBuf = write_fake_claude(temp_dir.path(), "managed-ok");
 
     subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(temp_dir.path())
         .args(["--id", "reviewer", "--report"])
         .arg(&report_path)
-        .args(["--", "claude", "-p", "hello"])
+        .arg("--")
+        .arg(&claude_path)
+        .args(["-p", "hello"])
         .assert()
-        .code(WRAPPER_ERROR_EXIT);
+        .success()
+        .stdout("managed-ok\n");
 
     let report_text = fs::read_to_string(&report_path).unwrap();
     let report: serde_json::Value = serde_json::from_str(&report_text).unwrap();
-    assert_eq!(report["kind"], "run_backend_unavailable");
-    assert_eq!(report["status"], "error");
+    assert_eq!(report["kind"], "run_plan");
+    assert_eq!(report["status"], "ok");
     assert_eq!(report["body"]["supervisor"]["provider"], "codex");
     assert!(!report["body"]["ensured_pair"].is_null());
+}
+
+#[cfg(unix)]
+fn write_fake_claude(dir: &Path, response: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script_path: PathBuf = dir.join("claude");
+    fs::write(
+        &script_path,
+        format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{}'\n", response),
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&script_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).unwrap();
+    script_path
+}
+
+#[cfg(unix)]
+#[test]
+fn second_managed_run_receives_the_first_runs_response_in_its_bootstrap() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir = isolated_state_dir();
+    let workspace = isolated_state_dir();
+    let claude_path: PathBuf = workspace.path().join("claude");
+    fs::write(
+        &claude_path,
+        "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n  *FIRST_RUN_MARKER*) printf 'CONTINUITY_OK\\n' ;;\n  *) printf 'FIRST_RUN_MARKER\\n' ;;\nesac\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&claude_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&claude_path, permissions).unwrap();
+
+    for expected in ["FIRST_RUN_MARKER\n", "CONTINUITY_OK\n"] {
+        subagent_with_resolvable_supervisor(state_dir.path())
+            .current_dir(workspace.path())
+            .args(["--id", "gpt-sol-worker", "--quiet", "--"])
+            .arg(&claude_path)
+            .args(["-p", "perform the current task"])
+            .assert()
+            .success()
+            .stdout(expected);
+    }
+
+    let pairs_output: std::process::Output = subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args(["pairs", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(pairs_output.status.success());
+    let pairs_report: serde_json::Value = serde_json::from_slice(&pairs_output.stdout).unwrap();
+    let pair_key: &str = pairs_report["body"]["pairs"][0]["pair_key"]
+        .as_str()
+        .unwrap();
+
+    let log_output: std::process::Output = subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args(["log", "--pair", pair_key, "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(log_output.status.success());
+    let log_report: serde_json::Value = serde_json::from_slice(&log_output.stdout).unwrap();
+    assert_eq!(log_report["body"]["exchanges"].as_array().unwrap().len(), 4);
+
+    let context_output: std::process::Output =
+        subagent_with_resolvable_supervisor(state_dir.path())
+            .current_dir(workspace.path())
+            .args(["context", "--pair", pair_key, "--format", "json"])
+            .output()
+            .unwrap();
+    assert!(context_output.status.success());
+    let context_report: serde_json::Value = serde_json::from_slice(&context_output.stdout).unwrap();
+    let invocations: &Vec<serde_json::Value> =
+        context_report["body"]["invocations"].as_array().unwrap();
+    assert_eq!(invocations.len(), 2);
+    for invocation in invocations {
+        let manifest_path: &str = invocation["capsule_path"]["value"].as_str().unwrap();
+        assert!(Path::new(manifest_path).is_file());
+    }
+
+    subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args(["forget", "--pair", pair_key])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("forgot pair"));
+    let remaining_context_entries: usize = fs::read_dir(state_dir.path().join("context"))
+        .unwrap()
+        .count();
+    assert_eq!(remaining_context_entries, 0);
 }
 
 #[cfg(unix)]
@@ -351,13 +448,13 @@ fn non_utf8_child_arguments_are_preserved_and_reported_without_lossy_replacement
 }
 
 #[test]
-fn doctor_text_output_reports_child_spawn_as_unavailable() {
+fn doctor_text_output_reports_child_spawn_as_implemented() {
     subagent()
         .arg("doctor")
         .assert()
         .success()
         .stdout(predicate::str::contains("child-spawn"))
-        .stdout(predicate::str::contains("unavailable"));
+        .stdout(predicate::str::contains("implemented"));
 }
 
 #[test]
@@ -394,15 +491,14 @@ fn doctor_json_output_is_a_valid_versioned_report() {
             .unwrap_or_else(|| panic!("missing capability {name}"))
     };
     assert_eq!(find("pair-identity-store")["state"], "implemented");
-    assert_eq!(find("pair-exchange-ledger")["state"], "planned");
+    assert_eq!(find("pair-exchange-ledger")["state"], "implemented");
 }
 
 #[test]
-fn stateful_placeholder_commands_report_unavailable_without_creating_files() {
+fn profile_placeholders_and_invalid_state_commands_create_no_files() {
     let temp_dir = isolated_state_dir();
 
     let cases: Vec<Vec<&str>> = vec![
-        vec!["context"],
         vec!["log", "--pair", "p1"],
         vec!["forget", "--pair", "p1"],
         vec!["agent", "list"],
@@ -424,6 +520,18 @@ fn stateful_placeholder_commands_report_unavailable_without_creating_files() {
             "command {case:?} created files: {entries:?}"
         );
     }
+}
+
+#[test]
+fn context_locates_the_default_context_root_without_creating_it() {
+    let temp_dir = isolated_state_dir();
+    let state_root: PathBuf = temp_dir.path().join("state");
+    subagent_with_clean_supervisor_env(&state_root)
+        .arg("context")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("context root:"));
+    assert!(!state_root.exists());
 }
 
 #[test]

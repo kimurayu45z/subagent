@@ -66,6 +66,19 @@ impl PairKey {
         PairKey(bytes)
     }
 
+    pub(crate) fn from_hex(raw: &str) -> Result<PairKey, String> {
+        if raw.len() != 64 {
+            return Err("pair key must contain exactly 64 hexadecimal characters".to_string());
+        }
+        let mut bytes: [u8; 32] = [0_u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let start: usize = index * 2;
+            *byte = u8::from_str_radix(&raw[start..start + 2], 16)
+                .map_err(|_| "pair key contains a non-hexadecimal character".to_string())?;
+        }
+        Ok(PairKey(bytes))
+    }
+
     pub(crate) fn to_hex(self) -> String {
         let mut hex = String::with_capacity(self.0.len() * 2);
         for byte in &self.0 {
@@ -191,5 +204,13 @@ mod tests {
         let round_tripped = PairKey::from_bytes(*key.as_bytes());
         assert_eq!(key, round_tripped);
         assert_eq!(key.to_hex(), round_tripped.to_hex());
+    }
+
+    #[test]
+    fn hex_parser_round_trips_and_rejects_malformed_values() {
+        let expected: PairKey = PairKey::compute(b"/w", Provider::Codex, "session", &id("worker"));
+        assert_eq!(PairKey::from_hex(&expected.to_hex()).unwrap(), expected);
+        assert!(PairKey::from_hex("abc").is_err());
+        assert!(PairKey::from_hex(&"z".repeat(64)).is_err());
     }
 }
