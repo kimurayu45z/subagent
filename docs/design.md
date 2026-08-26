@@ -8,6 +8,9 @@ This document is the current normative design for `subagent`. Dated discussion,
 alternatives, and decision history belong under `docs/meeting-notes/` and do not
 override this document.
 
+Accepted architectural decisions live under `docs/adr/`. ADRs explain why a
+direction was chosen; this document remains authoritative if wording diverges.
+
 ## 1. Purpose
 
 `subagent` is a Rust CLI that preserves useful context across delegations between
@@ -750,6 +753,13 @@ actual `claude -p` / `codex exec` child execution. `context`,
 resolution, hook-registry detection, supervisor-history adapters, workspace
 memory, native child-session resume, configured agent aliases, and cached
 incremental summarization remain deferred and fail explicitly where requested.
+
+Before starting the deferred history-adapter or cached/incremental-summary
+slices, use the current managed-run implementation in real delegations and
+record enough evidence to judge invocation frequency, latency, fallback rate,
+and summary usefulness. FreeToken/Qwen support follows the provider-neutral,
+implementation-deferred decision in
+[ADR 0001](adr/0001-freetoken-openai-compatible-local-inference.md).
 
 ### Slice 2: history adapters
 
