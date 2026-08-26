@@ -1,0 +1,4 @@
+interface:
+  display_name: "Subagent Memory"
+  short_description: "Preserve context across repeated agent delegation"
+  default_prompt: "Use $subagent-memory to decide whether this repeated delegation should use durable subordinate context."
