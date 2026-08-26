@@ -35,8 +35,10 @@ use super::workspace::WorkspaceRef;
 ///
 /// Version 1 introduced `workspaces`, `supervisor_sessions`, and `pairs`.
 /// Version 2 additively introduces `invocations` and `exchange_messages`
-/// without altering any version 1 table or row.
-pub(crate) const LEDGER_SCHEMA_VERSION: i64 = 2;
+/// without altering any version 1 table or row. Version 3 additively
+/// introduces `pair_inheritance` without altering any version 1 or version 2
+/// table or row.
+pub(crate) const LEDGER_SCHEMA_VERSION: i64 = 3;
 
 const DB_FILE_NAME: &str = "ledger.sqlite3";
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -140,6 +142,25 @@ CREATE TABLE exchange_messages (
 );
 ";
 
+/// Additive version 2 -> 3 migration: an explicit, one-way declaration that
+/// one pair (`target_pair_id`) inherits history from another
+/// (`source_pair_id`). `target_pair_id` is the primary key so a target can
+/// have at most one declared source; a target already bound to a source must
+/// be rejected rather than silently rebound (see
+/// [`Store::declare_inheritance`]). Both foreign keys cascade on delete, so
+/// deleting either the target or the source pair removes the edge, matching
+/// how `invocations.pair_id` already cascades in version 2.
+const SCHEMA_SQL_V3_ADDITIONS: &str = "
+CREATE TABLE pair_inheritance (
+    target_pair_id INTEGER PRIMARY KEY REFERENCES pairs(id) ON DELETE CASCADE,
+    source_pair_id INTEGER NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+    declared_at INTEGER NOT NULL,
+    CHECK (target_pair_id != source_pair_id)
+);
+
+CREATE INDEX pair_inheritance_source_pair_id_idx ON pair_inheritance (source_pair_id);
+";
+
 #[derive(Debug)]
 pub(crate) enum StoreError {
     Io(std::io::Error),
@@ -173,6 +194,19 @@ pub(crate) enum StoreError {
     CorruptExitValue {
         field: &'static str,
         value: i64,
+    },
+    /// [`Store::declare_inheritance`] was called with the same pair key as
+    /// both target and source; a pair cannot inherit from itself.
+    SelfInheritance(PairKey),
+    /// [`Store::declare_inheritance`]'s target pair already has a declared
+    /// source, and it is not the source requested this time. Inheritance is
+    /// one-way and declared once; rebinding to a different source must be an
+    /// explicit, separate operation (not implemented by this method), not a
+    /// silent overwrite.
+    InheritanceSourceMismatch {
+        target: PairKey,
+        existing_source: PairKey,
+        requested_source: PairKey,
     },
 }
 
@@ -276,6 +310,19 @@ impl fmt::Display for StoreError {
             StoreError::CorruptExitValue { field, value } => write!(
                 f,
                 "state store contains an out-of-range {field} value {value}"
+            ),
+            StoreError::SelfInheritance(pair_key) => write!(
+                f,
+                "pair {pair_key} cannot be declared as its own inheritance source"
+            ),
+            StoreError::InheritanceSourceMismatch {
+                target,
+                existing_source,
+                requested_source,
+            } => write!(
+                f,
+                "pair {target} already inherits from {existing_source}; cannot also declare \
+                 inheritance from {requested_source} without first removing the existing edge"
             ),
         }
     }
@@ -512,10 +559,12 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     let user_version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match user_version {
         0 => {
-            // A brand-new database reaches version 2 in one transaction:
-            // there is no observable intermediate state at version 1.
+            // A brand-new database reaches the current version in one
+            // transaction: there is no observable intermediate state at
+            // version 1 or version 2.
             transaction.execute_batch(SCHEMA_SQL_V1)?;
             transaction.execute_batch(SCHEMA_SQL_V2_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V3_ADDITIONS)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -523,6 +572,15 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             // An existing version 1 database is migrated additively: every
             // version 1 row is untouched, and only the new tables appear.
             transaction.execute_batch(SCHEMA_SQL_V2_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V3_ADDITIONS)?;
+            transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+        2 => {
+            // An existing version 2 database is migrated additively: every
+            // version 1 and version 2 row is untouched, and only
+            // `pair_inheritance` appears.
+            transaction.execute_batch(SCHEMA_SQL_V3_ADDITIONS)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -650,6 +708,7 @@ pub(crate) struct EnsuredPair {
 pub(crate) struct PairSummary {
     pub pair_key: PairKey,
     pub subagent_id: String,
+    pub inherited_from: Option<String>,
     pub provider: Provider,
     pub created_at_unix: i64,
     pub last_seen_unix: i64,
@@ -811,6 +870,15 @@ pub(crate) struct CompletedExchange {
     pub created_at_unix: i64,
 }
 
+/// One declared inheritance edge, as returned by [`Store::inheritance_for`]:
+/// the source pair that a target pair explicitly, one-way inherits history
+/// from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InheritanceEdge {
+    pub source_pair_key: PairKey,
+    pub source_subagent_id: String,
+}
+
 /// The result of a read-only store open, since a missing state root or
 /// database is a normal "nothing recorded yet" state, not an error.
 pub(crate) enum OpenForRead {
@@ -948,6 +1016,13 @@ impl Store {
         })
     }
 
+    /// Returns whether one exact pair key exists without updating any
+    /// timestamps. Used to validate an explicit inheritance source before a
+    /// new target pair is materialized.
+    pub(crate) fn contains_pair(&self, pair_key: &PairKey) -> Result<bool, StoreError> {
+        Ok(find_pair_id(&self.conn, pair_key)?.is_some())
+    }
+
     /// Lists every pair recorded for the given workspace, oldest first.
     /// Returns an empty list when the workspace itself has never been
     /// recorded.
@@ -969,21 +1044,26 @@ impl Store {
         };
 
         let mut statement = self.conn.prepare(
-            "SELECT p.pair_key, p.subagent_id, s.provider, p.created_at, p.last_seen
+            "SELECT p.pair_key, p.subagent_id, source.subagent_id,
+                    s.provider, p.created_at, p.last_seen
              FROM pairs p
              JOIN supervisor_sessions s ON s.id = p.supervisor_session_id
+             LEFT JOIN pair_inheritance inheritance ON inheritance.target_pair_id = p.id
+             LEFT JOIN pairs source ON source.id = inheritance.source_pair_id
              WHERE p.workspace_id = ?1
              ORDER BY p.created_at ASC, p.id ASC",
         )?;
         let rows = statement.query_map(params![workspace_id], |row| {
             let pair_key_bytes: Vec<u8> = row.get(0)?;
             let subagent_id: String = row.get(1)?;
-            let provider_text: String = row.get(2)?;
-            let created_at: i64 = row.get(3)?;
-            let last_seen: i64 = row.get(4)?;
+            let inherited_from: Option<String> = row.get(2)?;
+            let provider_text: String = row.get(3)?;
+            let created_at: i64 = row.get(4)?;
+            let last_seen: i64 = row.get(5)?;
             Ok((
                 pair_key_bytes,
                 subagent_id,
+                inherited_from,
                 provider_text,
                 created_at,
                 last_seen,
@@ -992,7 +1072,8 @@ impl Store {
 
         let mut summaries: Vec<PairSummary> = Vec::new();
         for row in rows {
-            let (pair_key_bytes, subagent_id, provider_text, created_at, last_seen) = row?;
+            let (pair_key_bytes, subagent_id, inherited_from, provider_text, created_at, last_seen) =
+                row?;
             let pair_key_array: [u8; 32] = pair_key_bytes
                 .try_into()
                 .map_err(|_| StoreError::CorruptPairKey)?;
@@ -1001,6 +1082,7 @@ impl Store {
             summaries.push(PairSummary {
                 pair_key: PairKey::from_bytes(pair_key_array),
                 subagent_id,
+                inherited_from,
                 provider,
                 created_at_unix: created_at,
                 last_seen_unix: last_seen,
@@ -1453,6 +1535,98 @@ impl Store {
         secure_sidecars(&self.db_path)?;
         Ok(rows > 0)
     }
+
+    /// Declares that `target_pair_key` explicitly, one-way inherits history
+    /// from `source_pair_key`, in one transaction.
+    ///
+    /// Idempotent: declaring the same `(target, source)` edge again is a
+    /// no-op. Rejects self-inheritance with [`StoreError::SelfInheritance`],
+    /// rejects a `target_pair_key` or `source_pair_key` that names no pair
+    /// with [`StoreError::PairNotFound`], and rejects rebinding a target
+    /// that already has a *different* declared source with
+    /// [`StoreError::InheritanceSourceMismatch`], since inheritance is
+    /// declared once, not silently overwritten.
+    pub(crate) fn declare_inheritance(
+        &mut self,
+        target_pair_key: &PairKey,
+        source_pair_key: &PairKey,
+    ) -> Result<(), StoreError> {
+        if target_pair_key == source_pair_key {
+            return Err(StoreError::SelfInheritance(*target_pair_key));
+        }
+
+        let now: i64 = unix_now();
+        let tx: rusqlite::Transaction<'_> = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let target_pair_id: i64 =
+            find_pair_id(&tx, target_pair_key)?.ok_or(StoreError::PairNotFound)?;
+        let source_pair_id: i64 =
+            find_pair_id(&tx, source_pair_key)?.ok_or(StoreError::PairNotFound)?;
+
+        let existing_source_pair_id: Option<i64> = tx
+            .query_row(
+                "SELECT source_pair_id FROM pair_inheritance WHERE target_pair_id = ?1",
+                params![target_pair_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        match existing_source_pair_id {
+            Some(existing_id) if existing_id == source_pair_id => {
+                // Already declared exactly this edge; nothing to change.
+            }
+            Some(existing_id) => {
+                let (existing_source_key, _existing_subagent_id): (PairKey, String) =
+                    find_pair_key_and_subagent_id(&tx, existing_id)?;
+                return Err(StoreError::InheritanceSourceMismatch {
+                    target: *target_pair_key,
+                    existing_source: existing_source_key,
+                    requested_source: *source_pair_key,
+                });
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO pair_inheritance (target_pair_id, source_pair_id, declared_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![target_pair_id, source_pair_id, now],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        secure_sidecars(&self.db_path)?;
+        Ok(())
+    }
+
+    /// Looks up the inheritance edge declared for `target_pair_key`, if any.
+    /// Returns `None` both when `target_pair_key` names no pair and when it
+    /// names a pair with no declared source.
+    pub(crate) fn inheritance_for(
+        &self,
+        target_pair_key: &PairKey,
+    ) -> Result<Option<InheritanceEdge>, StoreError> {
+        let Some(target_pair_id) = find_pair_id(&self.conn, target_pair_key)? else {
+            return Ok(None);
+        };
+        let source_pair_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT source_pair_id FROM pair_inheritance WHERE target_pair_id = ?1",
+                params![target_pair_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(source_pair_id) = source_pair_id else {
+            return Ok(None);
+        };
+        let (source_pair_key, source_subagent_id): (PairKey, String) =
+            find_pair_key_and_subagent_id(&self.conn, source_pair_id)?;
+        Ok(Some(InheritanceEdge {
+            source_pair_key,
+            source_subagent_id,
+        }))
+    }
 }
 
 fn find_pair_id(conn: &Connection, pair_key: &PairKey) -> Result<Option<i64>, StoreError> {
@@ -1463,6 +1637,25 @@ fn find_pair_id(conn: &Connection, pair_key: &PairKey) -> Result<Option<i64>, St
     )
     .optional()
     .map_err(StoreError::from)
+}
+
+/// Looks up the [`PairKey`] and `subagent_id` of the `pairs` row with
+/// internal id `pair_id`. Callers already hold `pair_id` from a query
+/// against `pairs` (or a table with a foreign key into it), so a missing row
+/// here means the ledger's own foreign-key invariants were violated.
+fn find_pair_key_and_subagent_id(
+    conn: &Connection,
+    pair_id: i64,
+) -> Result<(PairKey, String), StoreError> {
+    let (pair_key_bytes, subagent_id): (Vec<u8>, String) = conn.query_row(
+        "SELECT pair_key, subagent_id FROM pairs WHERE id = ?1",
+        params![pair_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let pair_key_array: [u8; 32] = pair_key_bytes
+        .try_into()
+        .map_err(|_| StoreError::CorruptPairKey)?;
+    Ok((PairKey::from_bytes(pair_key_array), subagent_id))
 }
 
 fn digest_to_blob(digest: [u8; 32]) -> Vec<u8> {
@@ -1889,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_reaches_version_2_with_a_usable_invocation_ledger() {
+    fn fresh_database_reaches_version_3_with_a_usable_ledger() {
         let root = tempfile::tempdir().unwrap();
         let state_root = root.path().join("state");
         let store = Store::open_for_write(&state_root).unwrap();
@@ -1899,7 +2092,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, LEDGER_SCHEMA_VERSION);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 2);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 3);
 
         let invocation_count: i64 = store
             .conn
@@ -1913,14 +2106,21 @@ mod tests {
             })
             .unwrap();
         assert_eq!(exchange_count, 0);
+        let inheritance_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pair_inheritance", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(inheritance_count, 0);
     }
 
     /// Builds an on-disk version 1 database by hand (the exact schema the
     /// pair-identity-store increment shipped, `SCHEMA_SQL_V1`) with one
     /// pre-existing pair, so the migration path exercised here is the real
-    /// version 1 -> 2 upgrade rather than a stand-in.
+    /// version 1 -> 3 upgrade (through version 2) rather than a stand-in.
     #[test]
-    fn opening_a_v1_fixture_migrates_to_v2_and_preserves_its_pair() {
+    fn opening_a_v1_fixture_migrates_to_the_current_version_and_preserves_its_pair() {
         let root = tempfile::tempdir().unwrap();
         let state_root = root.path().join("state");
         let workspace_dir = tempfile::tempdir().unwrap();
@@ -2002,6 +2202,378 @@ mod tests {
             )
             .unwrap();
         assert_eq!(begun.sequence, 1);
+
+        // The version 3 addition works too: a second pair can now declare
+        // that it inherits from the migrated pair.
+        let second_pair: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer"),
+            )
+            .unwrap();
+        store
+            .declare_inheritance(&second_pair.pair_key, &pair_key)
+            .unwrap();
+        let edge = store.inheritance_for(&second_pair.pair_key).unwrap();
+        assert_eq!(
+            edge,
+            Some(InheritanceEdge {
+                source_pair_key: pair_key,
+                source_subagent_id: "reviewer".to_string(),
+            })
+        );
+    }
+
+    /// Builds an on-disk version 2 database by hand (`SCHEMA_SQL_V1` plus
+    /// `SCHEMA_SQL_V2_ADDITIONS`) with a pre-existing pair and a completed
+    /// invocation, so the migration path exercised here is the real version
+    /// 2 -> 3 upgrade rather than a stand-in.
+    #[test]
+    fn opening_a_v2_fixture_migrates_to_v3_and_preserves_its_invocations() {
+        let root = tempfile::tempdir().unwrap();
+        let state_root = root.path().join("state");
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let workspace_ref = workspace(workspace_dir.path());
+        let identity_bytes: Vec<u8> = workspace_ref.identity_bytes();
+        let pair_key = PairKey::compute(
+            &identity_bytes,
+            Provider::Codex,
+            "session-1",
+            &id("reviewer"),
+        );
+
+        std::fs::create_dir(&state_root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let db_path = state_root.join(DB_FILE_NAME);
+        {
+            let fixture_conn = Connection::open(&db_path).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V1).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V2_ADDITIONS).unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO workspaces (canonical_path, identity_kind, created_at)
+                     VALUES (?1, 'path', 1000)",
+                    params![identity_bytes],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO supervisor_sessions
+                         (provider, native_id, workspace_id, first_seen, last_seen)
+                     VALUES ('codex', 'session-1', 1, 1000, 1000)",
+                    [],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO pairs
+                         (pair_key, workspace_id, supervisor_session_id, subagent_id,
+                          created_at, last_seen)
+                     VALUES (?1, 1, 1, 'reviewer', 1000, 1000)",
+                    params![pair_key.as_bytes().as_slice()],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO invocations (
+                         id, pair_id, sequence, status, started_at, completed_at,
+                         wrapper_pid, command_digest, program_name, child_kind,
+                         exit_kind, exit_code, context_provenance
+                     ) VALUES (
+                         '018f0000-0000-7000-8000-000000000000', 1, 1, 'completed',
+                         1000, 1001, 42, ?1, 'codex', 'codex', 'exited', 0, 'provenance'
+                     )",
+                    params![vec![9u8; 32]],
+                )
+                .unwrap();
+            fixture_conn
+                .pragma_update(None, "user_version", 2i64)
+                .unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut store = Store::open_for_write(&state_root).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LEDGER_SCHEMA_VERSION);
+
+        // Every version 1 and version 2 row survives the migration intact.
+        let pairs = store.list_pairs_for_workspace(&workspace_ref).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].pair_key, pair_key);
+        let invocation = store
+            .invocation("018f0000-0000-7000-8000-000000000000")
+            .unwrap()
+            .unwrap();
+        assert_eq!(invocation.status, InvocationStatus::Completed);
+
+        // The version 3 addition works too.
+        let second_pair: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer"),
+            )
+            .unwrap();
+        store
+            .declare_inheritance(&second_pair.pair_key, &pair_key)
+            .unwrap();
+        assert!(
+            store
+                .inheritance_for(&second_pair.pair_key)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn declare_inheritance_is_idempotent_for_the_same_edge() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_for_write(&root.path().join("state")).unwrap();
+        let workspace_ref = workspace(workspace_dir.path());
+
+        let source: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("reviewer"),
+            )
+            .unwrap();
+        let target: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer"),
+            )
+            .unwrap();
+
+        store
+            .declare_inheritance(&target.pair_key, &source.pair_key)
+            .unwrap();
+        store
+            .declare_inheritance(&target.pair_key, &source.pair_key)
+            .unwrap();
+
+        let edge: InheritanceEdge = store.inheritance_for(&target.pair_key).unwrap().unwrap();
+        assert_eq!(edge.source_pair_key, source.pair_key);
+        assert_eq!(edge.source_subagent_id, "reviewer");
+    }
+
+    #[test]
+    fn declare_inheritance_rejects_self_inheritance() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_for_write(&root.path().join("state")).unwrap();
+        let workspace_ref = workspace(workspace_dir.path());
+        let pair: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("reviewer"),
+            )
+            .unwrap();
+
+        let error = store
+            .declare_inheritance(&pair.pair_key, &pair.pair_key)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::SelfInheritance(key) if key == pair.pair_key
+        ));
+        assert!(store.inheritance_for(&pair.pair_key).unwrap().is_none());
+    }
+
+    #[test]
+    fn declare_inheritance_rejects_a_missing_target_or_source() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_for_write(&root.path().join("state")).unwrap();
+        let workspace_ref = workspace(workspace_dir.path());
+        let pair: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("reviewer"),
+            )
+            .unwrap();
+
+        let missing_key: PairKey = PairKey::compute(
+            &workspace_ref.identity_bytes(),
+            Provider::Codex,
+            "session-1",
+            &id("ghost"),
+        );
+
+        assert!(matches!(
+            store
+                .declare_inheritance(&pair.pair_key, &missing_key)
+                .unwrap_err(),
+            StoreError::PairNotFound
+        ));
+        assert!(matches!(
+            store
+                .declare_inheritance(&missing_key, &pair.pair_key)
+                .unwrap_err(),
+            StoreError::PairNotFound
+        ));
+    }
+
+    #[test]
+    fn declare_inheritance_rejects_rebinding_a_target_to_a_different_source() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_for_write(&root.path().join("state")).unwrap();
+        let workspace_ref = workspace(workspace_dir.path());
+
+        let source_a: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("reviewer-a"),
+            )
+            .unwrap();
+        let source_b: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("reviewer-b"),
+            )
+            .unwrap();
+        let target: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer"),
+            )
+            .unwrap();
+
+        store
+            .declare_inheritance(&target.pair_key, &source_a.pair_key)
+            .unwrap();
+
+        let error = store
+            .declare_inheritance(&target.pair_key, &source_b.pair_key)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::InheritanceSourceMismatch {
+                target: target_key,
+                existing_source,
+                requested_source,
+            } if target_key == target.pair_key
+                && existing_source == source_a.pair_key
+                && requested_source == source_b.pair_key
+        ));
+
+        // The original edge is untouched by the rejected rebind attempt.
+        let edge: InheritanceEdge = store.inheritance_for(&target.pair_key).unwrap().unwrap();
+        assert_eq!(edge.source_pair_key, source_a.pair_key);
+    }
+
+    #[test]
+    fn inheritance_for_returns_none_for_a_pair_with_no_declared_source() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_for_write(&root.path().join("state")).unwrap();
+        let workspace_ref = workspace(workspace_dir.path());
+        let pair: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("reviewer"),
+            )
+            .unwrap();
+
+        assert!(store.inheritance_for(&pair.pair_key).unwrap().is_none());
+    }
+
+    #[test]
+    fn deleting_either_pair_cascades_to_the_inheritance_edge() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_for_write(&root.path().join("state")).unwrap();
+        let workspace_ref = workspace(workspace_dir.path());
+
+        let source: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("reviewer"),
+            )
+            .unwrap();
+        let target: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer"),
+            )
+            .unwrap();
+        store
+            .declare_inheritance(&target.pair_key, &source.pair_key)
+            .unwrap();
+
+        assert!(store.delete_pair(&source.pair_key).unwrap());
+        assert!(store.inheritance_for(&target.pair_key).unwrap().is_none());
+        let inheritance_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pair_inheritance", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(inheritance_count, 0);
+
+        // Symmetric: deleting the target side of a fresh edge also cascades.
+        let source_2: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("reviewer-2"),
+            )
+            .unwrap();
+        let target_2: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer-2"),
+            )
+            .unwrap();
+        store
+            .declare_inheritance(&target_2.pair_key, &source_2.pair_key)
+            .unwrap();
+        assert!(store.delete_pair(&target_2.pair_key).unwrap());
+        let inheritance_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pair_inheritance", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(inheritance_count, 0);
     }
 
     #[test]

@@ -33,6 +33,7 @@ struct PairsArgs {
 struct PairEntry {
     pair_key: String,
     subagent_id: String,
+    inherited_from: Option<String>,
     provider: Provider,
     created_at_unix: i64,
     last_seen_unix: i64,
@@ -43,6 +44,7 @@ impl From<store::PairSummary> for PairEntry {
         PairEntry {
             pair_key: summary.pair_key.to_hex(),
             subagent_id: summary.subagent_id,
+            inherited_from: summary.inherited_from,
             provider: summary.provider,
             created_at_unix: summary.created_at_unix,
             last_seen_unix: summary.last_seen_unix,
@@ -151,9 +153,10 @@ fn execute_with_env(
                 for pair in &body.pairs {
                     let _ = writeln!(
                         out,
-                        "  {}  subagent={:<20} provider={:<6} created_at={} last_seen={}",
+                        "  {}  subagent={:<20} inherited_from={:<20} provider={:<6} created_at={} last_seen={}",
                         pair.pair_key,
                         pair.subagent_id,
+                        pair.inherited_from.as_deref().unwrap_or("-"),
                         pair.provider,
                         pair.created_at_unix,
                         pair.last_seen_unix

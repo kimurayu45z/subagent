@@ -289,6 +289,7 @@ mode and do not receive managed session behavior.
 ```text
 --id ID
 --supervisor PROVIDER:SESSION_ID
+--inherit-from ID
 --memory conversation|workspace|none
 --context pair|supervisor|all|none
 --context-mode required|best-effort
@@ -315,6 +316,12 @@ start the child or write an invocation/exchange record. In a
 conversation-memory run it may create or update the workspace,
 supervisor-session, and pair identity rows. It prints the resolved plan to
 stderr or as an explicitly requested machine report.
+
+`--inherit-from ID` explicitly declares that a new logical subordinate may read
+older history from another ID in the same canonical workspace and immediate
+supervisor session. The source and target remain distinct pairs. The edge is
+one-way, non-transitive, persistent, and immutable: re-declaring the same edge
+is idempotent, while rebinding requires forgetting the target pair first.
 
 ## 7. Invocation lifecycle
 
@@ -453,6 +460,7 @@ workspaces(id, canonical_path, identity_kind, created_at)
 supervisor_sessions(id, provider, native_id, workspace_id, first_seen, last_seen)
 pairs(id, pair_key, workspace_id, supervisor_session_id, subagent_id,
       created_at, last_seen)
+pair_inheritance(target_pair_id, source_pair_id, declared_at)
 workspace_memories(id, workspace_id, subagent_id, created_at)
 child_sessions(id, pair_id, provider, profile_hash, native_id, status, last_seen)
 invocations(id, pair_id, sequence, status, started_at, completed_at,
@@ -462,8 +470,9 @@ summaries(id, scope_kind, scope_id, source_digest, summary_digest,
           summarizer_id, template_version, redaction_version, created_at)
 ```
 
-The MVP uses SQLite `user_version = 2`. It implements `workspaces`,
-`supervisor_sessions`, `pairs`, `invocations`, and `exchange_messages`. It
+The MVP uses SQLite `user_version = 3`. It implements `workspaces`,
+`supervisor_sessions`, `pairs`, `pair_inheritance`, `invocations`, and
+`exchange_messages`. It
 enforces one pair row for each workspace/supervisor-session/subagent tuple and
 allocates monotonically increasing per-pair invocation sequences under an
 immediate transaction. Pending, completed, spawn-failed, and abandoned runs are
@@ -472,6 +481,12 @@ distinct states; only completed request/response messages become pair history.
 raw supervisor session IDs. `subagent log` reads completed exchanges, and
 `subagent forget` deletes a pair, its dependent ledger rows, and its owned
 capsules.
+
+An inheritance edge is created only by explicit `--inherit-from`. It points
+from one target pair to one source pair in the same resolved conversation
+scope. Source records are summarized under a separately labeled, bounded
+untrusted-history section; they are not copied into the target pair's
+`pair-history.jsonl`, and target responses never flow back to the source.
 
 Task projections stored as exchange history are redacted. Provider executable
 names and launch arguments are not copied into exchange history; an exact framed
@@ -626,6 +641,8 @@ lossy replacement.
 
 - Invoke-time access is limited to the current supervisor session unless the
   user explicitly names another session.
+- `--inherit-from` cannot cross the current workspace or supervisor session;
+  inherited text remains framed as untrusted historical data.
 - Never read provider authentication stores as part of history discovery.
 - Never persist the full environment.
 - Redact common API keys and authorization material before persistence and
@@ -701,10 +718,11 @@ is to test the vocabulary and workflow before committing to those mechanisms.
 
 Implementation status: the usable MVP implements explicit supervisor
 references, unambiguous native Codex/Claude environment detection, canonical
-path-based workspace identity, conversation `PairKey` derivation, the version 2
+path-based workspace identity, conversation `PairKey` derivation, the version 3
 SQLite pair/exchange ledger, common-credential redaction, deterministic recent
-history summaries, owner-only context capsules, raw stream forwarding, signal
-propagation, and actual `claude -p` / `codex exec` child execution. `context`,
+history summaries, explicit one-way same-conversation pair inheritance,
+owner-only context capsules, raw stream forwarding, signal propagation, and
+actual `claude -p` / `codex exec` child execution. `context`,
 `log`, `pairs`, `forget`, and `doctor` are operational. Managed-parent manifest
 resolution, hook-registry detection, supervisor-history adapters, workspace
 memory, native child-session resume, configured agent aliases, and model-based

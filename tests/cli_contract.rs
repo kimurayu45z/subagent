@@ -422,6 +422,90 @@ fn second_managed_run_receives_the_first_runs_response_in_its_bootstrap() {
 
 #[cfg(unix)]
 #[test]
+fn inherit_from_persists_one_way_context_for_a_renamed_subagent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir = isolated_state_dir();
+    let workspace = isolated_state_dir();
+    let claude_path: PathBuf = workspace.path().join("claude");
+    fs::write(
+        &claude_path,
+        "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n  *SOURCE_MEMORY_MARKER*) printf 'HANDOFF_OK\\n' ;;\n  *) printf 'SOURCE_MEMORY_MARKER\\n' ;;\nesac\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&claude_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&claude_path, permissions).unwrap();
+
+    subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--id",
+            "gpt-luna-architect",
+            "--supervisor",
+            "codex:inheritance-test",
+            "--quiet",
+            "--",
+        ])
+        .arg(&claude_path)
+        .args(["-p", "establish source context"])
+        .assert()
+        .success()
+        .stdout("SOURCE_MEMORY_MARKER\n");
+
+    subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--id",
+            "claude-haiku-architect",
+            "--inherit-from",
+            "gpt-luna-architect",
+            "--supervisor",
+            "codex:inheritance-test",
+            "--quiet",
+            "--",
+        ])
+        .arg(&claude_path)
+        .args(["-p", "continue after the model switch"])
+        .assert()
+        .success()
+        .stdout("HANDOFF_OK\n");
+
+    // The explicit edge is durable: later calls use the target id alone.
+    subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--id",
+            "claude-haiku-architect",
+            "--supervisor",
+            "codex:inheritance-test",
+            "--quiet",
+            "--",
+        ])
+        .arg(&claude_path)
+        .args(["-p", "continue once more"])
+        .assert()
+        .success()
+        .stdout("HANDOFF_OK\n");
+
+    let pairs_output: std::process::Output = subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args(["pairs", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(pairs_output.status.success());
+    let pairs_report: serde_json::Value = serde_json::from_slice(&pairs_output.stdout).unwrap();
+    let pairs: &Vec<serde_json::Value> = pairs_report["body"]["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 2);
+    let target: &serde_json::Value = pairs
+        .iter()
+        .find(|pair| pair["subagent_id"] == "claude-haiku-architect")
+        .unwrap();
+    assert_eq!(target["inherited_from"], "gpt-luna-architect");
+}
+
+#[cfg(unix)]
+#[test]
 fn non_utf8_child_arguments_are_preserved_and_reported_without_lossy_replacement() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;

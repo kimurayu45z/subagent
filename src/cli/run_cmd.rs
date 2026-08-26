@@ -128,6 +128,11 @@ struct RunArgs {
     #[arg(long)]
     supervisor: Option<String>,
 
+    /// Explicitly inherit older context from another logical subagent in
+    /// this same workspace and immediate supervisor session.
+    #[arg(long = "inherit-from")]
+    inherit_from: Option<String>,
+
     #[arg(long, value_enum)]
     memory: Option<MemoryMode>,
 
@@ -196,6 +201,7 @@ impl From<&store::EnsuredPair> for EnsuredPairReport {
 #[derive(Debug, Clone)]
 struct RunPlan {
     id: Option<SubagentId>,
+    inherit_from: Option<SubagentId>,
     supervisor: Option<SupervisorRef>,
     supervisor_override: Option<String>,
     memory: MemoryMode,
@@ -214,6 +220,7 @@ struct RunPlan {
 #[derive(Debug, Clone, Serialize)]
 struct RunPlanReport {
     id: Option<String>,
+    inherit_from: Option<String>,
     supervisor: Option<SupervisorRef>,
     supervisor_override: Option<String>,
     memory: MemoryMode,
@@ -233,6 +240,7 @@ impl From<&RunPlan> for RunPlanReport {
     fn from(plan: &RunPlan) -> Self {
         RunPlanReport {
             id: plan.id.as_ref().map(|id| id.as_str().to_string()),
+            inherit_from: plan.inherit_from.as_ref().map(|id| id.as_str().to_string()),
             supervisor: plan.supervisor.clone(),
             supervisor_override: plan.supervisor_override.clone(),
             memory: plan.memory,
@@ -334,8 +342,31 @@ fn execute_with_env(
         Ok(id) => id,
         Err(code) => return code,
     };
+    let inherit_from: Option<SubagentId> = match run_args.inherit_from.as_deref() {
+        Some(raw_id) => match SubagentId::parse(raw_id) {
+            Ok(source_id) => Some(source_id),
+            Err(invalid) => {
+                let _ = writeln!(err, "subagent: invalid --inherit-from: {invalid}");
+                return wrapper_error_exit();
+            }
+        },
+        None => None,
+    };
+    if let (Some(target_id), Some(source_id)) = (&id, &inherit_from)
+        && target_id == source_id
+    {
+        let _ = writeln!(err, "subagent: --inherit-from must differ from --id");
+        return wrapper_error_exit();
+    }
 
     let memory: MemoryMode = run_args.memory.unwrap_or_default();
+    if inherit_from.is_some() && memory != MemoryMode::Conversation {
+        let _ = writeln!(
+            err,
+            "subagent: --inherit-from requires --memory conversation"
+        );
+        return wrapper_error_exit();
+    }
     if id.is_none() && (memory != MemoryMode::None || !run_args.no_record) {
         let _ = writeln!(
             err,
@@ -390,7 +421,13 @@ fn execute_with_env(
             let subagent_id: &SubagentId = id
                 .as_ref()
                 .expect("--memory conversation requires --id, which is enforced before this point");
-            match ensure_conversation_pair(cwd, state_dir_override, supervisor_ref, subagent_id) {
+            match ensure_conversation_pair(
+                cwd,
+                state_dir_override,
+                supervisor_ref,
+                subagent_id,
+                inherit_from.as_ref(),
+            ) {
                 Ok(pair) => Some(pair),
                 Err(message) => {
                     let _ = writeln!(err, "subagent: {message}");
@@ -402,6 +439,7 @@ fn execute_with_env(
 
     let plan = RunPlan {
         id,
+        inherit_from,
         supervisor,
         supervisor_override: run_args.supervisor.clone(),
         memory,
@@ -470,6 +508,7 @@ fn ensure_conversation_pair(
     state_dir_override: Option<&OsStr>,
     supervisor: &SupervisorRef,
     subagent_id: &SubagentId,
+    inherit_from: Option<&SubagentId>,
 ) -> Result<store::EnsuredPair, String> {
     let workspace_ref: WorkspaceRef = WorkspaceRef::from_dir(cwd).map_err(|io_error| {
         format!(
@@ -486,7 +525,30 @@ fn ensure_conversation_pair(
                 state_root.display()
             )
         })?;
-    pair_store
+    let source_pair_key: Option<super::pair_key::PairKey> = inherit_from.map(|source_id| {
+        super::pair_key::PairKey::compute(
+            &workspace_ref.identity_bytes(),
+            supervisor.provider,
+            &supervisor.session_id,
+            source_id,
+        )
+    });
+    if let Some(source_key) = &source_pair_key
+        && !pair_store
+            .contains_pair(source_key)
+            .map_err(|store_error: store::StoreError| {
+                format!("failed to validate inheritance source: {store_error}")
+            })?
+    {
+        let source_id: &str = inherit_from
+            .map(SubagentId::as_str)
+            .expect("a source key is computed only when --inherit-from is present");
+        return Err(format!(
+            "--inherit-from source {source_id:?} does not exist in this workspace and supervisor conversation"
+        ));
+    }
+
+    let pair: store::EnsuredPair = pair_store
         .ensure_pair(
             &workspace_ref,
             supervisor.provider,
@@ -495,7 +557,15 @@ fn ensure_conversation_pair(
         )
         .map_err(|store_error: store::StoreError| {
             format!("failed to record the pair identity: {store_error}")
-        })
+        })?;
+    if let Some(source_pair_key) = source_pair_key {
+        pair_store
+            .declare_inheritance(&pair.pair_key, &source_pair_key)
+            .map_err(|store_error: store::StoreError| {
+                format!("failed to declare pair inheritance: {store_error}")
+            })?;
+    }
+    Ok(pair)
 }
 
 fn resolve_id(
@@ -528,6 +598,12 @@ fn print_human_plan(plan: &RunPlan, dry_run: bool, err: &mut dyn Write) {
         .map(|id| id.to_string())
         .unwrap_or_else(|| "<none>".to_string());
     let _ = writeln!(err, "  id:                {id_display}");
+    let inherit_from_display: &str = plan
+        .inherit_from
+        .as_ref()
+        .map(SubagentId::as_str)
+        .unwrap_or("<none>");
+    let _ = writeln!(err, "  inherit from:      {inherit_from_display}");
     let supervisor_display: String = plan
         .supervisor
         .as_ref()
@@ -642,6 +718,52 @@ mod tests {
         let (code, _out, err) = run(&args, None);
         assert_eq!(code, wrapper_error_exit());
         assert!(err.contains("invalid subagent id"));
+    }
+
+    #[test]
+    fn inherit_from_rejects_an_invalid_or_identical_id() {
+        let invalid_args: Vec<OsString> = os(&[
+            "--id",
+            "gpt-luna-worker",
+            "--inherit-from",
+            "not valid",
+            "--",
+            "echo",
+        ]);
+        let (invalid_code, _out, invalid_err) = run(&invalid_args, None);
+        assert_eq!(invalid_code, wrapper_error_exit());
+        assert!(invalid_err.contains("invalid --inherit-from"));
+
+        let same_args: Vec<OsString> = os(&[
+            "--id",
+            "gpt-luna-worker",
+            "--inherit-from",
+            "gpt-luna-worker",
+            "--",
+            "echo",
+        ]);
+        let (same_code, _out, same_err) = run(&same_args, None);
+        assert_eq!(same_code, wrapper_error_exit());
+        assert!(same_err.contains("must differ"));
+    }
+
+    #[test]
+    fn inherit_from_requires_conversation_memory() {
+        let args: Vec<OsString> = os(&[
+            "--id",
+            "claude-haiku-worker",
+            "--inherit-from",
+            "gpt-luna-worker",
+            "--memory",
+            "none",
+            "--no-record",
+            "--dry-run",
+            "--",
+            "echo",
+        ]);
+        let (code, _out, err) = run(&args, None);
+        assert_eq!(code, wrapper_error_exit());
+        assert!(err.contains("requires --memory conversation"));
     }
 
     #[test]

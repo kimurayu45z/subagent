@@ -28,6 +28,16 @@ subagent --id gpt-sol-reviewer --supervisor claude:SESSION_ID -- \
   codex exec "Continue the review"
 ```
 
+When a model-prefixed logical identity changes, declare a one-way handoff from
+the older identity. The source must exist in this same workspace and supervisor
+conversation; the edge persists, so later calls need only the new ID:
+
+```sh
+subagent --id claude-haiku-architect \
+  --inherit-from gpt-luna-architect -- \
+  claude -p --model haiku "Continue the architecture work"
+```
+
 Everything after the first literal `--` is passed to the provider CLI without
 wrapper parsing. Managed mode currently recognizes `codex exec` and
 `claude -p`/`claude --print`.

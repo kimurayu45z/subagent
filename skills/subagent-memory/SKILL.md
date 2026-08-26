@@ -47,7 +47,7 @@ supervisor explicitly; do not guess from process ancestry.
 Treat `pair-identity-store` separately from `pair-exchange-ledger`. Require the
 exchange ledger, context capsule, deterministic summarizer, and the intended
 child adapter to be `implemented` before claiming durable conversational memory
-is active.
+is active. Require `pair-inheritance` before using an ID handoff.
 
 If the desired capability is reported as planned or unavailable:
 
@@ -85,6 +85,20 @@ This form is a convention, not a requirement enforced by `subagent`. A plain
 role name such as `reviewer` remains a valid ID, and an existing custom ID
 does not need to be renamed to comply.
 
+When an intentional model change also changes the model-prefixed ID, preserve
+the historical boundary with an explicit one-way handoff:
+
+```sh
+subagent --id claude-haiku-architect \
+  --inherit-from gpt-luna-architect -- \
+  claude -p --model haiku "Continue the architecture work"
+```
+
+The source must already exist in the same workspace and immediate supervisor
+conversation. The target remains a distinct pair, and the edge persists, so do
+not repeat `--inherit-from` on later target invocations. Do not use inheritance
+to pull context from another conversation or workspace.
+
 Conversation-pair memory is the safe default. Carrying memory into other
 supervisor conversations or workspaces requires explicit user intent; do not
 select workspace-wide memory merely for convenience.
@@ -118,7 +132,9 @@ subagent --id claude-opus-architect -- claude -p --model opus "Review this desig
 ```
 
 The wrapper preserves provider argv and prepends the capsule location plus a
-bounded deterministic history summary through stdin. Do not combine managed
+bounded deterministic history summary through stdin. Recorded request memory
+contains the task prompt and caller stdin rather than provider launch flags.
+Do not combine managed
 mode with provider-native resume/fork flags; native runtime-session continuity
 is not implemented yet. Unknown programs are allowed only as explicit
 `--memory none --context none --no-record` passthrough.

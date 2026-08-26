@@ -64,6 +64,8 @@ USAGE:
 RUN OPTIONS:
     --id ID                        Logical subordinate id
     --supervisor PROVIDER:SESSION  Explicit supervisor override
+    --inherit-from ID              Inherit older history from another id in
+                                    this supervisor conversation
     --memory conversation|workspace|none
     --context pair|supervisor|all|none
     --context-mode required|best-effort

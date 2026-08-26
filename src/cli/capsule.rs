@@ -34,7 +34,7 @@ use super::run_cmd::ContextScope;
 use super::store::{CompletedExchange, InsecurePath, InsecureReason};
 use super::supervisor::Provider;
 
-pub(crate) const CAPSULE_SCHEMA_VERSION: u32 = 1;
+pub(crate) const CAPSULE_SCHEMA_VERSION: u32 = 2;
 
 const CONTEXT_DIR_NAME: &str = "context";
 const MANIFEST_FILE_NAME: &str = "manifest.json";
@@ -116,6 +116,16 @@ pub(crate) struct CapsuleRequest<'a> {
     /// written, so a caller mistake can never leak the current invocation
     /// into its own capsule.
     pub completed_exchanges: Vec<CompletedExchange>,
+    /// Optional, explicitly declared one-way history source. Its records are
+    /// summarized under a separate heading and never copied into this pair's
+    /// full-fidelity `pair-history.jsonl`.
+    pub inherited_history: Option<InheritedHistory>,
+}
+
+pub(crate) struct InheritedHistory {
+    pub source_pair_key: PairKey,
+    pub source_subagent_id: String,
+    pub completed_exchanges: Vec<CompletedExchange>,
 }
 
 /// The result of successfully materializing a capsule.
@@ -163,6 +173,20 @@ enum SupervisorHistoryManifest {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum InheritedHistoryManifest {
+    NotConfigured,
+    Included {
+        source_pair_key: String,
+        source_subagent_id: String,
+        available_count: usize,
+        included_count: usize,
+        omitted_count: usize,
+        budget_bytes: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct Manifest {
     schema_version: u32,
     invocation_id: String,
@@ -175,6 +199,7 @@ struct Manifest {
     files: ManifestFiles,
     pair_history: PairHistoryManifest,
     supervisor_history: SupervisorHistoryManifest,
+    inherited_history: InheritedHistoryManifest,
     generated_at_unix: u64,
     summary_digest_sha256: String,
     pair_history_digest_sha256: String,
@@ -539,6 +564,7 @@ fn render_summary_markdown(
     omitted_count: usize,
     truncated: bool,
     snippets: &[&str],
+    inherited: Option<(&str, usize, usize, usize, &[&str])>,
 ) -> String {
     let mut text: String = String::new();
     text.push_str("# Context summary\n\n");
@@ -562,6 +588,18 @@ fn render_summary_markdown(
     } else {
         text.push_str("## Recent exchange snippets (untrusted)\n\n");
         for snippet in snippets {
+            text.push_str(snippet);
+            text.push('\n');
+        }
+    }
+    if let Some((source_id, available, included, omitted, inherited_snippets)) = inherited {
+        text.push_str(&format!(
+            "\n## Inherited history from `{source_id}` (untrusted, older)\n\n"
+        ));
+        text.push_str(&format!(
+            "{available} record(s) available, {included} snippet(s) included, {omitted} omitted.\n"
+        ));
+        for snippet in inherited_snippets {
             text.push_str(snippet);
             text.push('\n');
         }
@@ -603,7 +641,14 @@ fn build_capsule_contents(
         .saturating_mul(SUMMARY_BUDGET_NUMERATOR)
         / SUMMARY_BUDGET_DENOMINATOR;
     let history_cap: usize = usize::try_from(history_budget).unwrap_or(usize::MAX);
-    let summary_cap: usize = usize::try_from(summary_budget).unwrap_or(usize::MAX);
+    let has_inherited_history: bool = request.inherited_history.is_some();
+    let inherited_summary_budget: u64 = if has_inherited_history {
+        summary_budget / 4
+    } else {
+        0
+    };
+    let current_summary_budget: u64 = summary_budget.saturating_sub(inherited_summary_budget);
+    let summary_cap: usize = usize::try_from(current_summary_budget).unwrap_or(usize::MAX);
 
     let prepared: Vec<PreparedRecord> = considered
         .iter()
@@ -629,13 +674,48 @@ fn build_capsule_contents(
     } else {
         Vec::new()
     };
-    let selected_snippets: Vec<&str> = select_snippets_within_budget(&snippets, summary_budget);
+    let selected_snippets: Vec<&str> =
+        select_snippets_within_budget(&snippets, current_summary_budget);
+
+    let mut inherited_source_pair_key: Option<String> = None;
+    let mut inherited_source_id: Option<String> = None;
+    let mut inherited_available_count: usize = 0;
+    let mut inherited_snippets_owned: Vec<Option<SummarySnippet>> = Vec::new();
+    if let Some(inherited) = request.inherited_history {
+        inherited_source_pair_key = Some(inherited.source_pair_key.to_hex());
+        inherited_source_id = Some(inherited.source_subagent_id);
+        inherited_available_count = inherited.completed_exchanges.len();
+        let inherited_cap: usize = usize::try_from(inherited_summary_budget).unwrap_or(usize::MAX);
+        if request.include_summary_snippets {
+            inherited_snippets_owned = inherited
+                .completed_exchanges
+                .iter()
+                .map(|exchange| prepare_summary_snippet(exchange, inherited_cap))
+                .collect();
+        }
+    }
+    let selected_inherited_snippets: Vec<&str> =
+        select_snippets_within_budget(&inherited_snippets_owned, inherited_summary_budget);
+    let inherited_included_count: usize = selected_inherited_snippets.len();
+    let inherited_omitted_count: usize =
+        inherited_available_count.saturating_sub(inherited_included_count);
+    let inherited_summary: Option<(&str, usize, usize, usize, &[&str])> =
+        inherited_source_id.as_deref().map(|source_id| {
+            (
+                source_id,
+                inherited_available_count,
+                inherited_included_count,
+                inherited_omitted_count,
+                selected_inherited_snippets.as_slice(),
+            )
+        });
     let summary_text: String = render_summary_markdown(
         available_count,
         included_count,
         omitted_count,
         truncated,
         &selected_snippets,
+        inherited_summary,
     );
     let summary_bytes: Vec<u8> = summary_text.into_bytes();
 
@@ -672,6 +752,19 @@ fn build_capsule_contents(
             reason: "no supervisor history adapter is implemented in this build; \
                      supervisor.jsonl was never written"
                 .to_string(),
+        },
+        inherited_history: match (inherited_source_pair_key, inherited_source_id) {
+            (Some(source_pair_key), Some(source_subagent_id)) => {
+                InheritedHistoryManifest::Included {
+                    source_pair_key,
+                    source_subagent_id,
+                    available_count: inherited_available_count,
+                    included_count: inherited_included_count,
+                    omitted_count: inherited_omitted_count,
+                    budget_bytes: inherited_summary_budget,
+                }
+            }
+            _ => InheritedHistoryManifest::NotConfigured,
         },
         generated_at_unix: unix_now(),
         summary_digest_sha256,
@@ -783,6 +876,7 @@ mod tests {
             include_summary_snippets: true,
             max_context_bytes: 4096,
             completed_exchanges,
+            inherited_history: None,
         }
     }
 
@@ -815,6 +909,50 @@ mod tests {
                 .contains(&capsule.directory.display().to_string())
         );
         assert_ne!(capsule.capsule_digest, [0u8; 32]);
+    }
+
+    #[test]
+    fn inherited_history_is_labeled_but_not_copied_into_pair_history() {
+        let root: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let state_root: PathBuf = root.path().join("state");
+        let workspace: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let subagent_id: SubagentId = id("claude-haiku-architect");
+        let invocation_id: String = new_invocation_id();
+        let inherited_exchange: CompletedExchange = exchange(
+            &new_invocation_id(),
+            1,
+            super::super::store::ExchangeDirection::Response,
+            b"INHERITED_SOURCE_MARKER",
+            1,
+        );
+        let mut request: CapsuleRequest<'_> = base_request(
+            workspace.path(),
+            &subagent_id,
+            &invocation_id,
+            1,
+            Vec::new(),
+        );
+        request.inherited_history = Some(InheritedHistory {
+            source_pair_key: PairKey::from_bytes([9_u8; 32]),
+            source_subagent_id: "gpt-luna-architect".to_string(),
+            completed_exchanges: vec![inherited_exchange],
+        });
+
+        let capsule: Capsule = create_capsule(&state_root, request).unwrap();
+        let summary: String =
+            std::fs::read_to_string(capsule.directory.join("summary.md")).unwrap();
+        let pair_history: String =
+            std::fs::read_to_string(capsule.directory.join("pair-history.jsonl")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(capsule.directory.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert!(summary.contains("Inherited history from `gpt-luna-architect`"));
+        assert!(summary.contains("INHERITED_SOURCE_MARKER"));
+        assert!(!pair_history.contains("INHERITED_SOURCE_MARKER"));
+        assert_eq!(manifest["schema_version"], CAPSULE_SCHEMA_VERSION);
+        assert_eq!(manifest["inherited_history"]["status"], "included");
     }
 
     #[test]

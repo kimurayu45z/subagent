@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
-use super::capsule::{self, Capsule, CapsuleRequest};
+use super::capsule::{self, Capsule, CapsuleRequest, InheritedHistory};
 use super::child;
 use super::id::SubagentId;
 use super::process::{self, ChildExit, ChildOutcome, ChildRunRequest};
@@ -347,6 +347,20 @@ fn prepare_capsule(
     let history: Vec<store::CompletedExchange> = ledger
         .list_completed_exchanges(&pair.pair_key, Some(sequence))
         .map_err(|error| format!("failed to read pair history: {error}"))?;
+    let inherited_history: Option<InheritedHistory> = ledger
+        .inheritance_for(&pair.pair_key)
+        .map_err(|error| format!("failed to resolve inherited pair history: {error}"))?
+        .map(|edge: store::InheritanceEdge| {
+            let completed_exchanges: Vec<store::CompletedExchange> = ledger
+                .list_completed_exchanges(&edge.source_pair_key, None)
+                .map_err(|error| format!("failed to read inherited pair history: {error}"))?;
+            Ok::<InheritedHistory, String>(InheritedHistory {
+                source_pair_key: edge.source_pair_key,
+                source_subagent_id: edge.source_subagent_id,
+                completed_exchanges,
+            })
+        })
+        .transpose()?;
     let capsule: Capsule = capsule::create_capsule(
         state_root,
         CapsuleRequest {
@@ -362,6 +376,7 @@ fn prepare_capsule(
             include_summary_snippets: matches!(request.summarizer, SummarizerChoice::Deterministic),
             max_context_bytes,
             completed_exchanges: history,
+            inherited_history,
         },
     )
     .map_err(|error| format!("failed to create context capsule: {error}"))?;

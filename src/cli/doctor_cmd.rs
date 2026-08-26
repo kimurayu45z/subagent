@@ -101,6 +101,16 @@ fn capabilities() -> Vec<Capability> {
             "completed managed requests and stdout responses are recorded in the SQLite invocation ledger",
         ),
         capability(
+            "pair-inheritance",
+            CapabilityState::Implemented,
+            "--inherit-from persists a bounded, one-way history edge between distinct pairs in the same workspace and supervisor conversation",
+        ),
+        capability(
+            "task-request-projection",
+            CapabilityState::Implemented,
+            "request memory keeps the positional task prompt and caller stdin while excluding provider launch flags",
+        ),
+        capability(
             "context-capsule",
             CapabilityState::Implemented,
             "owner-only manifest, deterministic summary, and pair-history JSONL are materialized per invocation",
