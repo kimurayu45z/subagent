@@ -19,6 +19,7 @@ use serde::Serialize;
 
 use super::id::SubagentId;
 use super::report::{OsStringJson, Report, ReportStatus, write_json_atomic};
+use super::supervisor::{self, DetectionEnv, SupervisorRef};
 use super::{handle_clap_error, split_on_double_dash, wrapper_error_exit};
 
 const SUBAGENT_ID_ENV: &str = "SUBAGENT_ID";
@@ -163,6 +164,7 @@ struct RunArgs {
 #[derive(Debug, Clone)]
 struct RunPlan {
     id: Option<SubagentId>,
+    supervisor: SupervisorRef,
     supervisor_override: Option<String>,
     memory: MemoryMode,
     context: ContextScope,
@@ -179,6 +181,7 @@ struct RunPlan {
 #[derive(Debug, Clone, Serialize)]
 struct RunPlanReport {
     id: Option<String>,
+    supervisor: SupervisorRef,
     supervisor_override: Option<String>,
     memory: MemoryMode,
     context: ContextScope,
@@ -196,6 +199,7 @@ impl From<&RunPlan> for RunPlanReport {
     fn from(plan: &RunPlan) -> Self {
         RunPlanReport {
             id: plan.id.as_ref().map(|id| id.as_str().to_string()),
+            supervisor: plan.supervisor.clone(),
             supervisor_override: plan.supervisor_override.clone(),
             memory: plan.memory,
             context: plan.context,
@@ -217,17 +221,20 @@ impl From<&RunPlan> for RunPlanReport {
 
 pub(crate) fn execute(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let subagent_id_env: Option<String> = std::env::var(SUBAGENT_ID_ENV).ok();
-    execute_with_env(args, out, err, subagent_id_env.as_deref())
+    let detection_env: DetectionEnv = DetectionEnv::from_process_env();
+    execute_with_env(args, out, err, subagent_id_env.as_deref(), &detection_env)
 }
 
-/// Same as [`execute`], but with the `SUBAGENT_ID` environment lookup
-/// injected explicitly so tests never need to mutate real process
-/// environment state (which is unsafe to do from parallel test threads).
+/// Same as [`execute`], but with the `SUBAGENT_ID` environment lookup and
+/// the supervisor-detection environment injected explicitly so tests never
+/// need to mutate real process environment state (which is unsafe to do
+/// from parallel test threads).
 fn execute_with_env(
     args: &[OsString],
     out: &mut dyn Write,
     err: &mut dyn Write,
     subagent_id_env: Option<&str>,
+    detection_env: &DetectionEnv,
 ) -> ExitCode {
     let split = split_on_double_dash(args);
 
@@ -266,15 +273,19 @@ fn execute_with_env(
         return wrapper_error_exit();
     }
 
-    let supervisor_override: Option<String> =
-        match validate_supervisor_override(run_args.supervisor.as_deref(), err) {
+    let supervisor: SupervisorRef =
+        match supervisor::resolve(run_args.supervisor.as_deref(), detection_env) {
             Ok(supervisor) => supervisor,
-            Err(code) => return code,
+            Err(resolution_error) => {
+                let _ = writeln!(err, "subagent: {resolution_error}");
+                return wrapper_error_exit();
+            }
         };
 
     let plan = RunPlan {
         id,
-        supervisor_override,
+        supervisor,
+        supervisor_override: run_args.supervisor.clone(),
         memory,
         context: run_args.context.unwrap_or(ContextScope::All),
         context_mode: run_args.context_mode.unwrap_or(ContextMode::Required),
@@ -318,7 +329,7 @@ fn execute_with_env(
     } else {
         let _ = writeln!(
             err,
-            "subagent: backend not implemented: supervisor detection, the pair ledger, the context capsule, and child process spawning are not implemented in this build"
+            "subagent: backend not implemented: the pair ledger, the context capsule, and child process spawning are not implemented in this build"
         );
         let _ = writeln!(
             err,
@@ -326,30 +337,6 @@ fn execute_with_env(
         );
         wrapper_error_exit()
     }
-}
-
-fn validate_supervisor_override(
-    raw: Option<&str>,
-    err: &mut dyn Write,
-) -> Result<Option<String>, ExitCode> {
-    let Some(value) = raw else {
-        return Ok(None);
-    };
-    let Some((provider, session_id)) = value.split_once(':') else {
-        let _ = writeln!(
-            err,
-            "subagent: invalid --supervisor {value:?}: expected codex:SESSION_ID or claude:SESSION_ID"
-        );
-        return Err(wrapper_error_exit());
-    };
-    if !matches!(provider, "codex" | "claude") || session_id.is_empty() {
-        let _ = writeln!(
-            err,
-            "subagent: invalid --supervisor {value:?}: expected codex:SESSION_ID or claude:SESSION_ID"
-        );
-        return Err(wrapper_error_exit());
-    }
-    Ok(Some(value.to_string()))
 }
 
 fn resolve_id(
@@ -382,13 +369,7 @@ fn print_human_plan(plan: &RunPlan, dry_run: bool, err: &mut dyn Write) {
         .map(|id| id.to_string())
         .unwrap_or_else(|| "<none>".to_string());
     let _ = writeln!(err, "  id:                {id_display}");
-    let _ = writeln!(
-        err,
-        "  supervisor:        {}",
-        plan.supervisor_override
-            .as_deref()
-            .unwrap_or("<auto-detect: not implemented>")
-    );
+    let _ = writeln!(err, "  supervisor:        {}", plan.supervisor);
     let _ = writeln!(err, "  memory:            {}", plan.memory);
     let _ = writeln!(err, "  context:           {}", plan.context);
     let _ = writeln!(err, "  context-mode:      {}", plan.context_mode);
@@ -420,10 +401,31 @@ mod tests {
         values.iter().map(OsString::from).collect()
     }
 
+    /// Most tests in this module are not about supervisor detection, so
+    /// they run with one unambiguous native id already resolvable.
+    /// Supervisor-detection precedence, ambiguity, and failure behavior are
+    /// covered by the dedicated `supervisor_resolution` tests below and by
+    /// `src/cli/supervisor.rs`'s own unit tests.
+    fn default_detection_env() -> DetectionEnv {
+        DetectionEnv {
+            self_ref: None,
+            codex_thread_id: Some(OsString::from("test-thread")),
+            claude_session_id: None,
+        }
+    }
+
     fn run(args: &[OsString], env_id: Option<&str>) -> (ExitCode, String, String) {
+        run_with_detection(args, env_id, &default_detection_env())
+    }
+
+    fn run_with_detection(
+        args: &[OsString],
+        env_id: Option<&str>,
+        detection_env: &DetectionEnv,
+    ) -> (ExitCode, String, String) {
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        let code = execute_with_env(args, &mut out, &mut err, env_id);
+        let code = execute_with_env(args, &mut out, &mut err, env_id, detection_env);
         (
             code,
             String::from_utf8(out).unwrap(),
@@ -500,6 +502,7 @@ mod tests {
         let (code, _out, err) = run(&args, None);
         assert_eq!(code, wrapper_error_exit());
         assert!(err.contains("invalid --supervisor"));
+        assert!(!err.contains("unknown:session"));
     }
 
     #[test]
@@ -565,11 +568,8 @@ mod tests {
             "--dry-run",
             "--",
         ]);
-        let mut out: Vec<u8> = Vec::new();
-        let mut err: Vec<u8> = Vec::new();
-        let code = execute_with_env(&args, &mut out, &mut err, None);
+        let (code, _out, err) = run(&args, None);
         assert_eq!(code, ExitCode::SUCCESS);
-        let err = String::from_utf8(err).unwrap();
         assert!(err.contains("child program:     echo"));
         assert!(err.contains("child arg[0]:      --id"));
         assert!(err.contains("child arg[1]:      sneaky"));
@@ -583,5 +583,121 @@ mod tests {
         let (code, _out, err) = run(&args, None);
         assert_eq!(code, wrapper_error_exit());
         assert!(!err.is_empty());
+    }
+
+    mod supervisor_resolution {
+        use super::*;
+
+        #[test]
+        fn explicit_supervisor_wins_over_native_env() {
+            let detection_env = DetectionEnv {
+                self_ref: None,
+                codex_thread_id: Some(OsString::from("thread-1")),
+                claude_session_id: None,
+            };
+            let args = os(&[
+                "--id",
+                "reviewer",
+                "--supervisor",
+                "claude:override-session",
+                "--dry-run",
+                "--",
+                "echo",
+            ]);
+            let (code, _out, err) = run_with_detection(&args, None, &detection_env);
+            assert_eq!(code, ExitCode::SUCCESS);
+            assert!(err.contains("claude:override-session (via explicit)"));
+        }
+
+        #[test]
+        fn native_codex_thread_id_is_detected_when_unambiguous() {
+            let detection_env = DetectionEnv {
+                self_ref: None,
+                codex_thread_id: Some(OsString::from("thread-42")),
+                claude_session_id: None,
+            };
+            let args = os(&["--id", "reviewer", "--dry-run", "--", "echo"]);
+            let (code, _out, err) = run_with_detection(&args, None, &detection_env);
+            assert_eq!(code, ExitCode::SUCCESS);
+            assert!(err.contains("codex:thread-42 (via native-env)"));
+        }
+
+        #[test]
+        fn native_claude_session_id_is_detected_when_unambiguous() {
+            let detection_env = DetectionEnv {
+                self_ref: None,
+                codex_thread_id: None,
+                claude_session_id: Some(OsString::from("session-42")),
+            };
+            let args = os(&["--id", "reviewer", "--dry-run", "--", "echo"]);
+            let (code, _out, err) = run_with_detection(&args, None, &detection_env);
+            assert_eq!(code, ExitCode::SUCCESS);
+            assert!(err.contains("claude:session-42 (via native-env)"));
+        }
+
+        #[test]
+        fn both_native_ids_present_is_rejected_as_ambiguous() {
+            let detection_env = DetectionEnv {
+                self_ref: None,
+                codex_thread_id: Some(OsString::from("thread-1")),
+                claude_session_id: Some(OsString::from("session-1")),
+            };
+            let args = os(&["--id", "reviewer", "--dry-run", "--", "echo"]);
+            let (code, _out, err) = run_with_detection(&args, None, &detection_env);
+            assert_eq!(code, wrapper_error_exit());
+            assert!(err.contains("ambiguous") || err.contains("cannot be inferred safely"));
+        }
+
+        #[test]
+        fn no_identity_present_is_rejected_with_actionable_diagnostic() {
+            let detection_env = DetectionEnv::default();
+            let args = os(&["--id", "reviewer", "--dry-run", "--", "echo"]);
+            let (code, _out, err) = run_with_detection(&args, None, &detection_env);
+            assert_eq!(code, wrapper_error_exit());
+            assert!(err.contains("no supervisor identity found"));
+            assert!(err.contains("--supervisor"));
+        }
+
+        #[test]
+        fn present_but_empty_native_id_is_rejected_not_silently_accepted() {
+            let detection_env = DetectionEnv {
+                self_ref: None,
+                codex_thread_id: Some(OsString::new()),
+                claude_session_id: None,
+            };
+            let args = os(&["--id", "reviewer", "--dry-run", "--", "echo"]);
+            let (code, _out, err) = run_with_detection(&args, None, &detection_env);
+            assert_eq!(code, wrapper_error_exit());
+            assert!(err.contains("CODEX_THREAD_ID"));
+            assert!(err.contains("set but empty"));
+        }
+
+        #[test]
+        fn managed_ref_fails_closed_instead_of_falling_through_to_native_env() {
+            let detection_env = DetectionEnv {
+                self_ref: Some(OsString::from("/tmp/manifest.json")),
+                codex_thread_id: Some(OsString::from("thread-1")),
+                claude_session_id: None,
+            };
+            let args = os(&["--id", "reviewer", "--dry-run", "--", "echo"]);
+            let (code, _out, err) = run_with_detection(&args, None, &detection_env);
+            assert_eq!(code, wrapper_error_exit());
+            assert!(err.contains("SUBAGENT_SELF_REF"));
+            assert!(err.contains("not implemented"));
+        }
+
+        #[test]
+        fn ordinary_run_still_exits_125_without_spawning_even_with_a_resolved_supervisor() {
+            let detection_env = DetectionEnv {
+                self_ref: None,
+                codex_thread_id: Some(OsString::from("thread-1")),
+                claude_session_id: None,
+            };
+            let args = os(&["--id", "reviewer", "--", "echo", "hi"]);
+            let (code, _out, err) = run_with_detection(&args, None, &detection_env);
+            assert_eq!(code, wrapper_error_exit());
+            assert!(err.contains("backend not implemented"));
+            assert!(!err.contains("supervisor detection"));
+        }
     }
 }

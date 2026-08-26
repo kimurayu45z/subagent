@@ -639,6 +639,12 @@ is to test the vocabulary and workflow before committing to those mechanisms.
 - strict stream, exit, and signal semantics;
 - `context`, `log`, `pairs`, and `doctor` commands.
 
+Implementation status: the first Slice 1 increment implements explicit
+supervisor references and unambiguous native Codex/Claude environment
+detection. Ambiguous, empty, non-UTF-8, missing, or not-yet-supported managed
+parent references fail closed. Managed-parent manifest resolution, hook-registry
+detection, persistence, capsules, and child spawning remain unimplemented.
+
 ### Slice 2: history adapters
 
 - Codex app-server `thread/read` adapter;

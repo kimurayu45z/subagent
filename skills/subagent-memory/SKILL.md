@@ -38,6 +38,12 @@ Run `subagent doctor` before relying on persistence, history discovery, native
 resume, or summarization. Treat its capability report as authoritative for the
 installed build.
 
+Supervisor detection is capability-specific. A build may implement explicit
+`--supervisor` and one unambiguous native Codex or Claude environment ID while
+still reporting managed-parent references and hook-registry detection as
+planned. If both native provider IDs are inherited, pass the immediate
+supervisor explicitly; do not guess from process ancestry.
+
 If the desired capability is reported as planned or unavailable:
 
 - do not tell the user that memory, history discovery, or summarization occurred;

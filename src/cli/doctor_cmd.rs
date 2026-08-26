@@ -72,9 +72,23 @@ fn capabilities() -> Vec<Capability> {
             "resolves and displays the run plan without spawning a child",
         ),
         capability(
-            "supervisor-detection",
+            "supervisor-detection-explicit-native",
+            CapabilityState::Implemented,
+            "resolves an explicit --supervisor codex:ID or claude:ID, or exactly one \
+             unambiguous, non-empty CODEX_THREAD_ID or CLAUDE_CODE_SESSION_ID (design.md \
+             section 5, steps 1 and 3)",
+        ),
+        capability(
+            "supervisor-detection-managed-ref",
             CapabilityState::Planned,
-            "Codex/Claude Code supervisor detection (design.md section 5) is not implemented yet",
+            "SUBAGENT_SELF_REF managed-parent resolution (design.md section 5, step 2) is \
+             not implemented and currently fails closed",
+        ),
+        capability(
+            "supervisor-detection-hook-registry",
+            CapabilityState::Planned,
+            "provider hook-registry resolution (design.md section 5, step 4) is not \
+             implemented yet",
         ),
         capability(
             "pair-ledger",
@@ -191,11 +205,32 @@ mod tests {
 
     #[test]
     fn child_spawn_capability_is_explicitly_unavailable() {
-        let capabilities = capabilities();
-        let child_spawn = capabilities
+        let capabilities: Vec<Capability> = capabilities();
+        let child_spawn: &Capability = capabilities
             .iter()
             .find(|c| c.name == "child-spawn")
             .unwrap();
         assert_eq!(child_spawn.state, CapabilityState::Unavailable);
+    }
+
+    #[test]
+    fn supervisor_detection_reports_implemented_and_planned_parts_separately() {
+        let capabilities: Vec<Capability> = capabilities();
+        let explicit_native: &Capability = capabilities
+            .iter()
+            .find(|capability| capability.name == "supervisor-detection-explicit-native")
+            .unwrap();
+        let managed_ref: &Capability = capabilities
+            .iter()
+            .find(|capability| capability.name == "supervisor-detection-managed-ref")
+            .unwrap();
+        let hook_registry: &Capability = capabilities
+            .iter()
+            .find(|capability| capability.name == "supervisor-detection-hook-registry")
+            .unwrap();
+
+        assert_eq!(explicit_native.state, CapabilityState::Implemented);
+        assert_eq!(managed_ref.state, CapabilityState::Planned);
+        assert_eq!(hook_registry.state, CapabilityState::Planned);
     }
 }

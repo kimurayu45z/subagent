@@ -20,6 +20,7 @@ mod log_cmd;
 mod pairs_cmd;
 mod report;
 mod run_cmd;
+mod supervisor;
 
 /// Wrapper-level exit code used for every failure that happens before, or in
 /// place of, spawning a managed child process. See `docs/design.md` section
