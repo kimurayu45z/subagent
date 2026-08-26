@@ -56,12 +56,14 @@ version. The recommended, non-normative form is:
 <model-family>-<stable-alias>-<role>[-<stable-variant>]
 ```
 
-For example: `claude-opus-architect`, `claude-sonnet-implementer`,
-`claude-haiku-summarizer`, `gpt-sol-architect`, `gpt-terra-reviewer`, and
-`gpt-luna-implementer`. `claude`/`gpt` are model families, `opus` / `sonnet` /
-`haiku` / `sol` / `terra` / `luna` are stable aliases, and the role segment
-(`architect`, `implementer`, `reviewer`, `summarizer`, ...) is durable and
-should outlive any one model choice.
+For example: `gpt-sol-architect`, `gpt-terra-reviewer`,
+`gpt-luna-implementer`, `claude-opus-architect`, `claude-sonnet-implementer`,
+and `claude-haiku-summarizer`. `gpt`/`claude` are model families, `sol` /
+`terra` / `luna` / `opus` / `sonnet` / `haiku` are stable aliases, and the role
+segment (`architect`, `implementer`, `reviewer`, `summarizer`, ...) is durable
+and should outlive any one model choice.
+
+When listing both families, put GPT examples before Claude examples.
 
 Do not encode a concrete model version or an execution/API provider (for
 example `openai`, `anthropic`, `bedrock`, `vertex`) in the ID; that belongs in
@@ -82,8 +84,8 @@ Put wrapper arguments before an explicit `--` boundary and preserve the child
 command as an argument vector:
 
 ```sh
-subagent --id claude-opus-architect -- claude -p --model opus "Review this design"
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
+subagent --id claude-opus-architect -- claude -p --model opus "Review this design"
 ```
 
 For interface inspection without starting the child:

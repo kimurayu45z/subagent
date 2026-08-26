@@ -22,8 +22,8 @@ subagent --id <logical-subagent-id> [OPTIONS] -- <child-command> [child-argument
 For example:
 
 ```sh
-subagent --id claude-opus-architect -- claude -p --model opus "Review this design"
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
+subagent --id claude-opus-architect -- claude -p --model opus "Review this design"
 ```
 
 The CLI gives a subordinate access to:
@@ -89,7 +89,7 @@ Claude Code, it is normally `CLAUDE_CODE_SESSION_ID`.
 ### 3.2 Logical subordinate ID
 
 `SubagentId` is a user-controlled stable persona name such as `reviewer` or
-`claude-opus-architect`. It is execution-provider-independent and is the
+`gpt-sol-reviewer`. It is execution-provider-independent and is the
 identity to which durable pair memory belongs.
 
 An ID must match:
@@ -107,13 +107,16 @@ The recommended, non-normative naming form is:
 <model-family>-<stable-alias>-<role>[-<stable-variant>]
 ```
 
-For example: `claude-opus-architect`, `claude-sonnet-implementer`,
-`claude-haiku-summarizer`, `gpt-sol-architect`, `gpt-terra-reviewer`, and
-`gpt-luna-implementer`. Here `claude`/`gpt` are model families, `opus` /
-`sonnet` / `haiku` / `sol` / `terra` / `luna` are stable aliases the provider
+For example: `gpt-sol-architect`, `gpt-terra-reviewer`,
+`gpt-luna-implementer`, `claude-opus-architect`, `claude-sonnet-implementer`,
+and `claude-haiku-summarizer`. Here `gpt`/`claude` are model families, `sol` /
+`terra` / `luna` / `opus` / `sonnet` / `haiku` are stable aliases the provider
 keeps pointed at its current recommended model, and the role segment (for
 example `architect`, `implementer`, `reviewer`, `summarizer`) is durable and
 should not change when the model changes.
+
+When documentation lists both families, GPT examples appear before Claude
+examples.
 
 Concrete model versions (for example a dated release string) and
 execution/API providers (for example `openai`, `anthropic`, `bedrock`, or

@@ -34,11 +34,11 @@ Adopt a recommended, non-normative naming form:
 <model-family>-<stable-alias>-<role>[-<stable-variant>]
 ```
 
-- `<model-family>`: `claude`, `gpt`, and similar top-level model families.
+- `<model-family>`: `gpt`, `claude`, and similar top-level model families.
 - `<stable-alias>`: a name the provider keeps pointed at its current
-  recommended model within a size class, such as `opus`, `sonnet`, `haiku` for
-  Claude, or project-chosen stable aliases such as `sol`, `terra`, `luna` for
-  GPT-based agents that do not have provider-assigned aliases.
+  recommended model within a size class, such as project-chosen stable aliases
+  `sol`, `terra`, `luna` for GPT-based agents that do not have
+  provider-assigned aliases, or `opus`, `sonnet`, `haiku` for Claude.
 - `<role>`: a durable responsibility such as `architect`, `implementer`,
   `reviewer`, or `summarizer`. The role segment must not change when the
   underlying model changes.
@@ -46,9 +46,9 @@ Adopt a recommended, non-normative naming form:
   family/alias/role (for example a second reviewer persona), not for a
   concrete version or environment.
 
-Representative examples: `claude-opus-architect`, `claude-sonnet-implementer`,
-`claude-haiku-summarizer`, `gpt-sol-architect`, `gpt-terra-reviewer`,
-`gpt-luna-implementer`.
+Representative examples: `gpt-sol-architect`, `gpt-terra-reviewer`,
+`gpt-luna-implementer`, `claude-opus-architect`, `claude-sonnet-implementer`,
+`claude-haiku-summarizer`.
 
 Concrete model versions and execution/API providers (`openai`, `anthropic`,
 `bedrock`, `vertex`, and similar) are deliberately excluded from the logical
@@ -83,9 +83,11 @@ plain role names such as `reviewer` that do not follow the recommended form.
   examples so that an agent choosing an ID for the first time follows it by
   default.
 - Existing illustrative IDs in the canonical spec and skill were updated to
-  `claude-opus-architect` and `gpt-sol-reviewer` for consistency. Plain IDs such
+  `gpt-sol-reviewer` and `claude-opus-architect` for consistency. Plain IDs such
   as `reviewer` remain valid and are documented as such, but are not used as the
   recommended invocation examples.
+- When both model families are presented, GPT examples are listed before
+  Claude examples.
 - No CLI behavior, dependency, report schema, or `SubagentId::parse` validation
   logic changed as part of this decision.
 
