@@ -71,6 +71,7 @@ RUN OPTIONS:
     --memory conversation|workspace|none
     --context pair|supervisor|all|none
     --context-mode required|best-effort
+    --context-delivery pointer|inline
     --summarizer deterministic|haiku|luna|none
     --summarize-above-bytes BYTES  Model summary threshold (default 16384)
     --max-context-bytes BYTES

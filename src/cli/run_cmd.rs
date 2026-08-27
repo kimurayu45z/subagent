@@ -88,6 +88,24 @@ impl fmt::Display for ContextMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ContextDelivery {
+    #[default]
+    Pointer,
+    Inline,
+}
+
+impl fmt::Display for ContextDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text: &str = match self {
+            ContextDelivery::Pointer => "pointer",
+            ContextDelivery::Inline => "inline",
+        };
+        f.write_str(text)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SummarizerChoice {
@@ -143,6 +161,9 @@ struct RunArgs {
 
     #[arg(long = "context-mode", value_enum)]
     context_mode: Option<ContextMode>,
+
+    #[arg(long = "context-delivery", value_enum)]
+    context_delivery: Option<ContextDelivery>,
 
     #[arg(long)]
     summarizer: Option<String>,
@@ -212,6 +233,7 @@ struct RunPlan {
     memory: MemoryMode,
     context: ContextScope,
     context_mode: ContextMode,
+    context_delivery: ContextDelivery,
     summarizer: SummarizerChoice,
     summarize_above_bytes: u64,
     max_context_bytes: Option<u64>,
@@ -232,6 +254,7 @@ struct RunPlanReport {
     memory: MemoryMode,
     context: ContextScope,
     context_mode: ContextMode,
+    context_delivery: ContextDelivery,
     summarizer: SummarizerChoice,
     summarize_above_bytes: u64,
     max_context_bytes: Option<u64>,
@@ -253,6 +276,7 @@ impl From<&RunPlan> for RunPlanReport {
             memory: plan.memory,
             context: plan.context,
             context_mode: plan.context_mode,
+            context_delivery: plan.context_delivery,
             summarizer: plan.summarizer.clone(),
             summarize_above_bytes: plan.summarize_above_bytes,
             max_context_bytes: plan.max_context_bytes,
@@ -481,6 +505,7 @@ fn execute_with_env(
         memory,
         context,
         context_mode: run_args.context_mode.unwrap_or(ContextMode::Required),
+        context_delivery: run_args.context_delivery.unwrap_or_default(),
         summarizer,
         summarize_above_bytes,
         max_context_bytes: run_args.max_context_bytes,
@@ -523,6 +548,7 @@ fn execute_with_env(
                 supervisor: plan.supervisor.as_ref(),
                 context_scope: plan.context,
                 context_mode: plan.context_mode,
+                context_delivery: plan.context_delivery,
                 summarizer: &plan.summarizer,
                 summarize_above_bytes: plan.summarize_above_bytes,
                 max_context_bytes: plan.max_context_bytes,
@@ -652,6 +678,7 @@ fn print_human_plan(plan: &RunPlan, dry_run: bool, err: &mut dyn Write) {
     let _ = writeln!(err, "  memory:            {}", plan.memory);
     let _ = writeln!(err, "  context:           {}", plan.context);
     let _ = writeln!(err, "  context-mode:      {}", plan.context_mode);
+    let _ = writeln!(err, "  context-delivery:  {}", plan.context_delivery);
     let _ = writeln!(err, "  summarizer:        {}", plan.summarizer);
     let _ = writeln!(
         err,

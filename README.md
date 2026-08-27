@@ -1,7 +1,9 @@
 # subagent
 
-`subagent` is a Rust wrapper that gives repeated Codex and Claude Code
-delegations a stable logical identity and durable pair history.
+`subagent` is a Rust wrapper that gives Codex and Claude Code delegations a
+role-level audit trail and a pull-based path to prior context. It complements a
+precise task prompt and exact provider-native resume; it does not treat a reused
+role name as proof that two assignments are the same work.
 
 ## Install
 
@@ -31,9 +33,10 @@ subagent --id claude-opus-architect -- claude -p "Review this design" --model op
 ```
 
 The same `--id`, canonical working directory, and supervisor conversation reuse
-one pair history. `CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID` is detected when
-exactly one is present. When detection is ambiguous, specify the immediate
-supervisor explicitly:
+one role-level pair history. The ID is useful for audit and lookup, but does not
+automatically make a new task a continuation. `CODEX_THREAD_ID` or
+`CLAUDE_CODE_SESSION_ID` is detected when exactly one is present. When detection
+is ambiguous, specify the immediate supervisor explicitly:
 
 ```sh
 subagent --id gpt-sol-reviewer --supervisor claude:SESSION_ID -- \
@@ -101,8 +104,40 @@ Pair history records the task prompt and caller stdin, not provider launch flags
 The exact child command remains correlatable through a digest without repeatedly
 injecting model and sandbox options into later context.
 
-Deterministic summarization remains the offline default. To use a cheap model
-only after history grows beyond the default 16 KiB threshold:
+### Choose how prior context is delivered
+
+The default is pull-based pointer delivery. The child receives the capsule path
+and provenance warning, but no old conclusion is pasted into its prompt:
+
+```sh
+subagent --id gpt-sol-reviewer -- \
+  codex exec "Review this separate change"
+```
+
+Use `inline` only for an intentional continuation or when the child cannot read
+the capsule because file-reading tools are disabled or its sandbox denies the
+state path:
+
+```sh
+subagent --id claude-opus-architect --context-delivery inline -- \
+  claude -p "Continue the architecture review" --model opus
+```
+
+Accepted product decisions should live in version-controlled design files,
+ADRs, issues, or pull requests. The SQLite ledger is operational evidence and a
+recovery/indexing aid, not the canonical product specification.
+
+Managed provider-native resume is not enabled yet. The planned design adds an
+explicit workstream identity below the role pair; exact resume will require that
+workstream and a compatible child profile, and will fail rather than silently
+starting a new session. Until then, use direct provider-native resume for an
+exact follow-up and use `subagent` when role history, cross-provider handoff, or
+an audit trail is useful.
+
+Deterministic summary artifacts remain the offline default. Under pointer
+delivery they stay in the capsule for pull-based reading; they are not pasted
+into the prompt. To use a cheap model only after history grows beyond the
+default 16 KiB threshold:
 
 ```sh
 subagent --id gpt-luna-reviewer --summarizer luna -- \

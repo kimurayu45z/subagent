@@ -96,6 +96,10 @@ Claude Code, it is normally `CLAUDE_CODE_SESSION_ID`.
 `gpt-sol-reviewer`. It is execution-provider-independent and is the
 identity to which durable pair memory belongs.
 
+`SubagentId` identifies a role for audit and history lookup. Reusing it does
+not assert that the current assignment continues the preceding assignment,
+and it is never sufficient on its own to authorize provider-native resume.
+
 An ID must match:
 
 ```text
@@ -141,6 +145,14 @@ disabled.
 
 `ChildRuntimeSession` is a provider-native session handle used for `--resume`
 or the equivalent API. It may rotate without changing `SubagentId`.
+
+Future managed resume also requires an explicit `WorkstreamId`, representing
+one intentional chain of follow-up assignments. `WorkstreamId` does not enter
+`PairKey`: the pair remains the durable role-level audit boundary, while the
+resume key is `(pair, workstream, child kind, profile schema version, profile
+hash)`. An invocation without a workstream starts a new provider session. A
+resume request whose exact compatible session cannot be proved fails closed;
+it never silently starts a fresh session in the same invocation.
 
 ### 3.4 Pair key
 
@@ -297,6 +309,7 @@ mode and do not receive managed session behavior.
 --memory conversation|workspace|none
 --context pair|supervisor|all|none
 --context-mode required|best-effort
+--context-delivery pointer|inline
 --summarizer deterministic|haiku|luna|none
 --summarize-above-bytes BYTES
 --max-context-bytes BYTES
@@ -313,6 +326,7 @@ Defaults are:
 - `--context-mode required` for the pair ledger;
 - best-effort supervisor transcript enrichment, reported as `unavailable` when
   it cannot be read;
+- `--context-delivery pointer`;
 - deterministic summarization;
 - a 16 KiB model-summarization threshold when an opt-in model alias is selected;
 - no model process for history below that threshold; and
@@ -340,7 +354,7 @@ For each managed run, `subagent` performs the following sequence:
 4. Recover the latest completed pair exchange sequence.
 5. Read a safe supervisor-history projection through the provider adapter.
 6. Redact and normalize all context before persistence or injection.
-7. Reuse or update the cached summary.
+7. Build or update the selected summary artifact.
 8. Materialize a per-run context capsule.
 9. Resolve a resumable child runtime session, unless `--fresh` was specified.
 10. Record the pending invocation and spawn the child.
@@ -548,16 +562,24 @@ summary budgets remain unchanged.
 - the source cursor and digest of each history source;
 - redaction and truncation status;
 - summary provenance;
+- context delivery as `pointer` or `inline`;
 - generation time; and
 - the exact files the child is permitted to read.
 
-The child receives a short bootstrap message containing the capsule path and
-summary. Provider-specific preparation grants read access only when the child
-sandbox would otherwise exclude the capsule.
+The child always receives a short bootstrap message containing the capsule
+path. `--context-delivery pointer` includes no historical body in that
+bootstrap: the child may read a capsule file only when the current assignment
+requires it. `--context-delivery inline` additionally includes `summary.md`
+directly, so continuity still works when a provider sandbox cannot read outside
+the workspace. Full pair history remains pull-based in both modes.
 
-The full pair history remains pull-based. A bounded deterministic recent-history
-summary is also included directly in the bootstrap so continuity still works
-when a provider sandbox cannot read outside the workspace.
+`pointer` is the default after isolated real-provider tests proved that Codex
+Luna under its ordinary read-only sandbox and Claude Haiku with the Read tool
+can open the capsule path. A child profile that disables file-reading tools or
+otherwise denies that path must explicitly use `inline` when it needs automatic
+continuity. Pointer delivery must not be described as context isolation: the
+pointer still exposes role-level history, but avoids forcing an older conclusion
+into every new prompt.
 
 ## 12. Summarization
 
@@ -683,6 +705,11 @@ terminal `invalid` row. Historical rows remain for audit, and deleting a pair
 cascades to its child sessions. This storage and hashing substrate is present
 before runtime resume is enabled, so `--fresh` continues to fail closed until
 the later assigned-session slice lands.
+
+Before managed resume is enabled, a later SQLite migration must add
+`workstream_id` to the live-session uniqueness key. It must not add the
+workstream to `PairKey`, because doing so would fragment the role-level ledger
+and invalidate existing pair identities.
 
 ### 13.4 Claude prompt placement
 
@@ -813,7 +840,8 @@ path-based workspace identity, conversation `PairKey` derivation, the version 4
 SQLite pair/exchange ledger and inert child-session substrate,
 common-credential redaction, deterministic recent
 history summaries, explicit one-way same-conversation pair inheritance,
-owner-only context capsules, raw stream forwarding, signal propagation, and
+owner-only context capsules with explicit pointer/inline delivery, raw stream
+forwarding, signal propagation, and
 actual `claude -p` / `codex exec` child execution. `context`,
 `log`, `pairs`, `forget`, and `doctor` are operational. Managed-parent manifest
 resolution, hook-registry detection, the Claude supervisor-history adapter,
@@ -838,10 +866,13 @@ provider-neutral, implementation-deferred decision in
 
 - schema migration adding provider-native child sessions (implemented as the
   inert SQLite version 4 substrate);
+- a migration adding explicit workstream identity to the child-session resume
+  key without changing `PairKey`;
 - command-profile compatibility hashing (implemented but not yet consumed by
   managed execution);
 - caller-assigned Claude session IDs and exact resume;
-- explicit `--fresh` recovery with no silent same-invocation fallback; and
+- explicit new-session versus resume selection, with resume requiring a
+  workstream and no silent same-invocation fallback; and
 - continuity provenance on every invocation.
 
 ### Slice 3: remaining history and nested delegation

@@ -16,7 +16,7 @@ use super::history::{self, SupervisorHistory};
 use super::id::SubagentId;
 use super::process::{self, ChildExit, ChildOutcome, ChildRunRequest};
 use super::redaction::{self, RedactionResult};
-use super::run_cmd::{ContextMode, ContextScope, SummarizerChoice};
+use super::run_cmd::{ContextDelivery, ContextMode, ContextScope, SummarizerChoice};
 use super::state_dir;
 use super::store::{self, BegunInvocation, ChildKind, ExchangeBody, ExitOutcome};
 use super::summarizer;
@@ -42,6 +42,7 @@ pub(crate) struct ManagedRunRequest<'a> {
     pub supervisor: Option<&'a SupervisorRef>,
     pub context_scope: ContextScope,
     pub context_mode: ContextMode,
+    pub context_delivery: ContextDelivery,
     pub summarizer: &'a SummarizerChoice,
     pub summarize_above_bytes: u64,
     pub max_context_bytes: Option<u64>,
@@ -191,7 +192,11 @@ pub(crate) fn execute(
     }
 
     let recorded_request: ExchangeBody = make_recorded_request(kind, &request);
-    let provenance: String = context_provenance(request.context_scope, &supervisor_history);
+    let provenance: String = context_provenance(
+        request.context_scope,
+        request.context_delivery,
+        &supervisor_history,
+    );
     let program_name: String = std::path::Path::new(request.program)
         .file_name()
         .unwrap_or(request.program)
@@ -462,6 +467,7 @@ fn prepare_capsule(
                 .map(|supervisor: &SupervisorRef| supervisor.provider)
                 .ok_or_else(|| "context requires a resolved supervisor".to_string())?,
             context_scope: request.context_scope,
+            context_delivery: request.context_delivery,
             include_summary_snippets,
             max_context_bytes,
             completed_exchanges: history,
@@ -514,7 +520,11 @@ fn prepare_child_stdin(capsule: Option<&Capsule>, caller_stdin: &[u8]) -> Vec<u8
     bytes
 }
 
-fn context_provenance(scope: ContextScope, supervisor_history: &SupervisorHistory) -> String {
+fn context_provenance(
+    scope: ContextScope,
+    delivery: ContextDelivery,
+    supervisor_history: &SupervisorHistory,
+) -> String {
     let pair: &str = if matches!(scope, ContextScope::Pair | ContextScope::All) {
         "included"
     } else {
@@ -525,7 +535,7 @@ fn context_provenance(scope: ContextScope, supervisor_history: &SupervisorHistor
         SupervisorHistory::Unavailable { .. } => "unavailable",
         SupervisorHistory::NotRequested => "not_requested",
     };
-    format!("{{\"pair\":\"{pair}\",\"supervisor\":\"{supervisor}\"}}")
+    format!("{{\"pair\":\"{pair}\",\"supervisor\":\"{supervisor}\",\"delivery\":\"{delivery}\"}}")
 }
 
 fn report_forwarding_errors(outcome: &ChildOutcome, err: &mut dyn Write) {

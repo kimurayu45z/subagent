@@ -275,6 +275,7 @@ fn dry_run_writes_a_json_plan_report_preserving_child_arguments_verbatim() {
     assert_eq!(report["kind"], "run_plan");
     assert_eq!(report["status"], "ok");
     assert_eq!(report["body"]["id"], "reviewer");
+    assert_eq!(report["body"]["context_delivery"], "pointer");
     assert_eq!(report["body"]["program"]["encoding"], "utf8");
     assert_eq!(report["body"]["program"]["value"], "claude");
     assert_eq!(report["body"]["supervisor"]["provider"], "codex");
@@ -544,7 +545,14 @@ fn second_managed_run_receives_the_first_runs_response_in_its_bootstrap() {
     for expected in ["FIRST_RUN_MARKER\n", "CONTINUITY_OK\n"] {
         subagent_with_resolvable_supervisor(state_dir.path())
             .current_dir(workspace.path())
-            .args(["--id", "gpt-sol-worker", "--quiet", "--"])
+            .args([
+                "--id",
+                "gpt-sol-worker",
+                "--context-delivery",
+                "inline",
+                "--quiet",
+                "--",
+            ])
             .arg(&claude_path)
             .args(["-p", "perform the current task"])
             .assert()
@@ -610,6 +618,57 @@ fn second_managed_run_receives_the_first_runs_response_in_its_bootstrap() {
 
 #[cfg(unix)]
 #[test]
+fn pointer_delivery_is_default_and_keeps_prior_response_out_of_the_bootstrap() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let claude_path: PathBuf = workspace.path().join("claude");
+    fs::write(
+        &claude_path,
+        "#!/bin/sh\ninput=$(cat)\ncase \"$*\" in\n  *establish*) printf 'PRIOR_POINTER_MARKER\\n' ;;\n  *) case \"$input\" in\n       *PRIOR_POINTER_MARKER*) printf 'STALE_BODY_WAS_INLINED\\n' ;;\n       *'Delivery mode: pointer'*) printf 'POINTER_ONLY_OK\\n' ;;\n       *) printf 'POINTER_MISSING\\n' ;;\n     esac ;;\nesac\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&claude_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&claude_path, permissions).unwrap();
+
+    subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args(["--id", "gpt-sol-worker", "--quiet", "--"])
+        .arg(&claude_path)
+        .args(["-p", "establish prior response"])
+        .assert()
+        .success()
+        .stdout("PRIOR_POINTER_MARKER\n");
+
+    subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args(["--id", "gpt-sol-worker", "--quiet", "--"])
+        .arg(&claude_path)
+        .args(["-p", "perform a separate task"])
+        .assert()
+        .success()
+        .stdout("POINTER_ONLY_OK\n");
+
+    let context_root: PathBuf = state_dir.path().join("context");
+    let mut manifests: Vec<PathBuf> = fs::read_dir(context_root)
+        .unwrap()
+        .map(|entry: std::io::Result<fs::DirEntry>| entry.unwrap().path().join("manifest.json"))
+        .collect();
+    manifests.sort();
+    let pointer_manifest: serde_json::Value = manifests
+        .iter()
+        .map(|path: &PathBuf| {
+            serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap()
+        })
+        .find(|value: &serde_json::Value| value["context_delivery"] == "pointer")
+        .expect("one pointer-delivery manifest");
+    assert_eq!(pointer_manifest["schema_version"], 5);
+}
+
+#[cfg(unix)]
+#[test]
 fn inherit_from_persists_one_way_context_for_a_renamed_subagent() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -632,6 +691,8 @@ fn inherit_from_persists_one_way_context_for_a_renamed_subagent() {
             "gpt-luna-architect",
             "--supervisor",
             "codex:inheritance-test",
+            "--context-delivery",
+            "inline",
             "--quiet",
             "--",
         ])
@@ -650,6 +711,8 @@ fn inherit_from_persists_one_way_context_for_a_renamed_subagent() {
             "gpt-luna-architect",
             "--supervisor",
             "codex:inheritance-test",
+            "--context-delivery",
+            "inline",
             "--quiet",
             "--",
         ])
@@ -667,6 +730,8 @@ fn inherit_from_persists_one_way_context_for_a_renamed_subagent() {
             "claude-haiku-architect",
             "--supervisor",
             "codex:inheritance-test",
+            "--context-delivery",
+            "inline",
             "--quiet",
             "--",
         ])
@@ -730,6 +795,8 @@ fn cheap_model_summarizer_runs_only_after_the_configured_threshold() {
                 "codex:summarizer-threshold-test",
                 "--summarizer",
                 "haiku",
+                "--context-delivery",
+                "inline",
                 "--summarize-above-bytes",
                 threshold,
                 "--quiet",

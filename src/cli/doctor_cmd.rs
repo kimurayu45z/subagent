@@ -118,7 +118,7 @@ fn capabilities() -> Vec<Capability> {
         capability(
             "context-capsule",
             CapabilityState::Implemented,
-            "owner-only manifest, deterministic summary, pair-history JSONL, and available supervisor-history JSONL are materialized per invocation",
+            "owner-only manifest, deterministic summary, pair-history JSONL, and available supervisor-history JSONL are materialized per invocation; pointer delivery is the default and inline delivery is explicit",
         ),
         capability(
             "redaction-common-credentials",
@@ -138,7 +138,7 @@ fn capabilities() -> Vec<Capability> {
         capability(
             "summarizer-deterministic",
             CapabilityState::Implemented,
-            "a bounded model-free summary of recent pair exchanges is injected through child stdin",
+            "a bounded model-free summary of recent pair exchanges is materialized for pull-based reading and is injected through child stdin only with inline delivery",
         ),
         capability(
             "summarizer-model",
