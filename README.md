@@ -40,6 +40,26 @@ subagent --id gpt-sol-reviewer --supervisor claude:SESSION_ID -- \
   codex exec "Continue the review"
 ```
 
+For a Codex supervisor, requested `all`/`supervisor` context is enriched through
+the read-only `codex app-server thread/read` interface. The capsule allowlists
+visible user and agent messages; reasoning and raw tool records are excluded.
+Claude supervisor transcript discovery remains a later adapter milestone.
+
+## Isolated experiments
+
+Keep trials away from normal pair history by assigning a fresh state root:
+
+```sh
+experiment_state_dir=$(mktemp -d)
+SUBAGENT_STATE_DIR="$experiment_state_dir" \
+  subagent --id gpt-luna-experiment-reviewer -- \
+  codex exec --model gpt-5.6-luna "Review this isolated fixture"
+```
+
+All SQLite rows and context capsules for that invocation stay below the
+temporary directory. Do not run `subagent forget` against a normal pair merely
+to clean up an experiment.
+
 When a model-prefixed logical identity changes, declare a one-way handoff from
 the older identity. The source must exist in this same workspace and supervisor
 conversation; the edge persists, so later calls need only the new ID:

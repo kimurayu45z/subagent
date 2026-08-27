@@ -339,6 +339,85 @@ fn write_fake_claude(dir: &Path, response: &str) -> PathBuf {
 
 #[cfg(unix)]
 #[test]
+fn required_supervisor_history_failure_happens_before_child_spawn() {
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let canary_path: PathBuf = workspace.path().join("child-ran");
+    let child_path: PathBuf = write_canary_script(workspace.path(), &canary_path);
+    let claude_path: PathBuf = workspace.path().join("claude");
+    fs::rename(child_path, &claude_path).unwrap();
+
+    subagent_with_clean_supervisor_env(state_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--id",
+            "claude-sonnet-required-test",
+            "--supervisor",
+            "claude:required-history-test",
+            "--context",
+            "supervisor",
+            "--context-mode",
+            "required",
+            "--",
+        ])
+        .arg(&claude_path)
+        .args(["-p", "must not run"])
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stderr(predicate::str::contains(
+            "required supervisor history is unavailable",
+        ));
+
+    assert!(
+        !canary_path.exists(),
+        "delegated child ran after required context failure"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn all_context_degrades_best_effort_and_manifests_unavailable_adapter() {
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let claude_path: PathBuf = write_fake_claude(workspace.path(), "BEST_EFFORT_OK");
+
+    subagent_with_clean_supervisor_env(state_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--id",
+            "claude-sonnet-best-effort-test",
+            "--supervisor",
+            "claude:best-effort-history-test",
+            "--context",
+            "all",
+            "--quiet",
+            "--",
+        ])
+        .arg(&claude_path)
+        .args(["-p", "continue without supervisor transcript"])
+        .assert()
+        .success()
+        .stdout("BEST_EFFORT_OK\n");
+
+    let context_root: PathBuf = state_dir.path().join("context");
+    let capsule_dir: PathBuf = fs::read_dir(&context_root)
+        .unwrap()
+        .next()
+        .expect("one capsule directory")
+        .unwrap()
+        .path();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(capsule_dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["supervisor_history"]["status"], "unavailable");
+    assert_eq!(
+        manifest["supervisor_history"]["reason_kind"],
+        "adapter_not_implemented"
+    );
+    assert!(manifest["files"].get("supervisor_history").is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn second_managed_run_receives_the_first_runs_response_in_its_bootstrap() {
     use std::os::unix::fs::PermissionsExt;
 

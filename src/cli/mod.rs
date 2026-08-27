@@ -15,6 +15,7 @@ mod child;
 mod context_cmd;
 mod doctor_cmd;
 mod forget_cmd;
+mod history;
 mod id;
 mod log_cmd;
 mod managed_run;

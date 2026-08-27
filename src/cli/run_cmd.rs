@@ -512,7 +512,7 @@ fn execute_with_env(
                 state_dir_override,
                 pair: plan.ensured_pair.as_ref(),
                 subagent_id: plan.id.as_ref(),
-                supervisor_provider: plan.supervisor.as_ref().map(|value| value.provider),
+                supervisor: plan.supervisor.as_ref(),
                 context_scope: plan.context,
                 context_mode: plan.context_mode,
                 summarizer: &plan.summarizer,

@@ -113,7 +113,7 @@ fn capabilities() -> Vec<Capability> {
         capability(
             "context-capsule",
             CapabilityState::Implemented,
-            "owner-only manifest, deterministic summary, and pair-history JSONL are materialized per invocation",
+            "owner-only manifest, deterministic summary, pair-history JSONL, and available supervisor-history JSONL are materialized per invocation",
         ),
         capability(
             "redaction-common-credentials",
@@ -122,8 +122,8 @@ fn capabilities() -> Vec<Capability> {
         ),
         capability(
             "history-adapter-codex",
-            CapabilityState::Planned,
-            "the Codex app-server thread/read adapter (design.md section 8.1) is not implemented yet",
+            CapabilityState::Implemented,
+            "a bounded read-only Codex app-server thread/read adapter projects visible user and agent messages through an allowlist",
         ),
         capability(
             "history-adapter-claude",

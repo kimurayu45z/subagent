@@ -205,9 +205,10 @@ claims with actual files and command output, and disclose incomplete checks.
 - Keep child stdout and structured output free of wrapper reports. Send wrapper
   diagnostics through its documented side channel.
 - Report unavailable, stale, truncated, or redacted context explicitly.
-- Remember that supervisor transcript projection is not in the MVP. Default
-  `--context all` currently supplies pair history and records supervisor history
-  as unavailable; required supervisor-only context fails before spawn.
+- Codex supervisor transcript projection uses a bounded, read-only app-server
+  adapter and includes only visible user/agent text. Claude supervisor history
+  remains unavailable. Default `--context all` degrades best-effort when an
+  adapter is unavailable; required supervisor-only context fails before spawn.
 - Treat common-credential redaction as damage reduction, not proof that stored
   prompts contain no secrets. Use `--no-record` for sensitive work.
 

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use super::capsule::{self, Capsule, CapsuleRequest, InheritedHistory};
 use super::child;
+use super::history::{self, SupervisorHistory};
 use super::id::SubagentId;
 use super::process::{self, ChildExit, ChildOutcome, ChildRunRequest};
 use super::redaction::{self, RedactionResult};
@@ -19,7 +20,7 @@ use super::run_cmd::{ContextMode, ContextScope, SummarizerChoice};
 use super::state_dir;
 use super::store::{self, BegunInvocation, ChildKind, ExchangeBody, ExitOutcome};
 use super::summarizer;
-use super::supervisor::Provider;
+use super::supervisor::SupervisorRef;
 use super::wrapper_error_exit;
 
 const DEFAULT_MAX_CONTEXT_BYTES: u64 = 256 * 1024;
@@ -38,7 +39,7 @@ pub(crate) struct ManagedRunRequest<'a> {
     pub state_dir_override: Option<&'a OsStr>,
     pub pair: Option<&'a store::EnsuredPair>,
     pub subagent_id: Option<&'a SubagentId>,
-    pub supervisor_provider: Option<Provider>,
+    pub supervisor: Option<&'a SupervisorRef>,
     pub context_scope: ContextScope,
     pub context_mode: ContextMode,
     pub summarizer: &'a SummarizerChoice,
@@ -75,16 +76,6 @@ pub(crate) fn execute(
             }
         };
 
-    if request.context_scope == ContextScope::Supervisor
-        && request.context_mode == ContextMode::Required
-    {
-        let _ = writeln!(
-            err,
-            "subagent: required supervisor history is unavailable in this build; use --context pair, --context all, or --context-mode best-effort"
-        );
-        return wrapper_error_exit();
-    }
-
     let max_context_bytes: u64 = request
         .max_context_bytes
         .unwrap_or(DEFAULT_MAX_CONTEXT_BYTES);
@@ -96,8 +87,57 @@ pub(crate) fn execute(
         return wrapper_error_exit();
     }
 
+    let supervisor_history: SupervisorHistory = if matches!(
+        request.context_scope,
+        ContextScope::Supervisor | ContextScope::All
+    ) {
+        match request.supervisor {
+            Some(supervisor) => history::read_supervisor_history(supervisor, request.cwd),
+            None => SupervisorHistory::Unavailable {
+                adapter: "none",
+                reason_kind: "missing_supervisor",
+                reason: "supervisor history was requested without a resolved supervisor"
+                    .to_string(),
+            },
+        }
+    } else {
+        SupervisorHistory::NotRequested
+    };
+    if request.context_scope == ContextScope::Supervisor
+        && request.context_mode == ContextMode::Required
+        && !supervisor_history.is_available()
+    {
+        let reason: &str = supervisor_history
+            .reason()
+            .unwrap_or("supervisor history is unavailable");
+        let _ = writeln!(
+            err,
+            "subagent: required supervisor history is unavailable: {reason}"
+        );
+        return wrapper_error_exit();
+    }
+    if matches!(
+        request.context_scope,
+        ContextScope::Supervisor | ContextScope::All
+    ) && !supervisor_history.is_available()
+        && !request.quiet
+        && let Some(reason) = supervisor_history.reason()
+    {
+        let _ = writeln!(
+            err,
+            "subagent: warning: supervisor history unavailable: {reason}"
+        );
+    }
+
     if request.no_record {
-        return execute_unrecorded(request, child_kind, max_context_bytes, out, err);
+        return execute_unrecorded(
+            request,
+            child_kind,
+            max_context_bytes,
+            &supervisor_history,
+            out,
+            err,
+        );
     }
 
     let Some(pair) = request.pair else {
@@ -143,7 +183,7 @@ pub(crate) fn execute(
     }
 
     let recorded_request: ExchangeBody = make_recorded_request(kind, &request);
-    let provenance: String = context_provenance(request.context_scope);
+    let provenance: String = context_provenance(request.context_scope, &supervisor_history);
     let program_name: String = std::path::Path::new(request.program)
         .file_name()
         .unwrap_or(request.program)
@@ -172,6 +212,7 @@ pub(crate) fn execute(
         begun.sequence,
         &ledger,
         max_context_bytes,
+        &supervisor_history,
         err,
     ) {
         Ok(capsule) => capsule,
@@ -241,6 +282,7 @@ fn execute_unrecorded(
     request: ManagedRunRequest<'_>,
     _child_kind: Option<ChildKind>,
     max_context_bytes: u64,
+    supervisor_history: &SupervisorHistory,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -280,6 +322,7 @@ fn execute_unrecorded(
             i64::MAX,
             &ledger,
             max_context_bytes,
+            supervisor_history,
             err,
         ) {
             Ok(value) => value,
@@ -327,6 +370,7 @@ fn execute_unrecorded(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_capsule(
     request: &ManagedRunRequest<'_>,
     state_root: &Path,
@@ -334,6 +378,7 @@ fn prepare_capsule(
     sequence: i64,
     ledger: &store::Store,
     max_context_bytes: u64,
+    supervisor_history: &SupervisorHistory,
     err: &mut dyn Write,
 ) -> Result<Option<Capsule>, String> {
     if request.context_scope == ContextScope::None {
@@ -405,12 +450,14 @@ fn prepare_capsule(
             workspace: &pair.workspace,
             subagent_id,
             supervisor_provider: request
-                .supervisor_provider
+                .supervisor
+                .map(|supervisor: &SupervisorRef| supervisor.provider)
                 .ok_or_else(|| "context requires a resolved supervisor".to_string())?,
             context_scope: request.context_scope,
             include_summary_snippets,
             max_context_bytes,
             completed_exchanges: history,
+            supervisor_history: supervisor_history.clone(),
             inherited_history,
             model_summary,
         },
@@ -459,16 +506,16 @@ fn prepare_child_stdin(capsule: Option<&Capsule>, caller_stdin: &[u8]) -> Vec<u8
     bytes
 }
 
-fn context_provenance(scope: ContextScope) -> String {
+fn context_provenance(scope: ContextScope, supervisor_history: &SupervisorHistory) -> String {
     let pair: &str = if matches!(scope, ContextScope::Pair | ContextScope::All) {
         "included"
     } else {
         "not_requested"
     };
-    let supervisor: &str = if matches!(scope, ContextScope::Supervisor | ContextScope::All) {
-        "unavailable"
-    } else {
-        "not_requested"
+    let supervisor: &str = match supervisor_history {
+        SupervisorHistory::Available { .. } => "included",
+        SupervisorHistory::Unavailable { .. } => "unavailable",
+        SupervisorHistory::NotRequested => "not_requested",
     };
     format!("{{\"pair\":\"{pair}\",\"supervisor\":\"{supervisor}\"}}")
 }

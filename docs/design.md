@@ -2,7 +2,7 @@
 
 Status: Draft, canonical
 
-Implementation milestone: usable provider-neutral managed-run MVP
+Implementation milestone: Codex supervisor-history adapter
 
 This document is the current normative design for `subagent`. Dated discussion,
 alternatives, and decision history belong under `docs/meeting-notes/` and do not
@@ -36,7 +36,8 @@ The CLI gives a subordinate access to:
    logical subordinate;
 3. a compact, provenance-bearing summary of those histories; and
 4. eventually, the subordinate's native runtime session when that provider can
-   resume it safely. The MVP uses provider-independent pair history instead.
+   resume it safely. Provider-independent pair history remains the fallback;
+   Codex supervisors also provide a read-only visible-message projection.
 
 The design must work on Linux and macOS. Platform-specific discovery is isolated
 behind adapters and must not silently narrow the supported platform set.
@@ -356,10 +357,12 @@ stdin, without provider executable names or launch flags. The exact child argv
 is represented only by its command digest. A pending invocation is excluded
 from its own context capsule.
 
-In the MVP, supervisor-history reading, cached summaries, and native runtime
-resume in steps 5, 7, 9, and 12 are unavailable. `--context all` still proceeds
-with complete pair history and records supervisor history as unavailable;
-`--context supervisor --context-mode required` fails before spawn.
+Codex supervisor-history reading is implemented for step 5. Cached summaries
+and native runtime resume in steps 7, 9, and 12 remain unavailable. For a Codex
+supervisor, `--context all` enriches pair history on a best-effort basis;
+`--context supervisor --context-mode required` fails before spawning the
+delegated child when the exact thread cannot be read safely. Claude supervisor
+history remains explicitly unavailable until its transcript adapter lands.
 
 ## 8. History adapters
 
@@ -371,6 +374,17 @@ The preferred interface is Codex app-server:
 - call `thread/read` for `CODEX_THREAD_ID`;
 - project persisted user and visible agent message items; and
 - preserve item/turn IDs as source cursors.
+
+The implemented adapter starts `codex app-server --stdio`, performs only
+`initialize` and `thread/read(includeTurns: true)`, keeps stdin open until the
+response is received, and terminates the helper after the exact response. It
+uses a 10-second timeout and a 32 MiB protocol-output cap. The returned thread
+ID and canonical working directory must match the resolved supervisor and
+workspace. Projection is allowlist-based: only `userMessage` text parts and
+`agentMessage` text are accepted. Reasoning, command/file/MCP/web records,
+attachments, and unknown item kinds are excluded by construction. A malformed
+known message invalidates the entire projection rather than yielding partial
+history.
 
 Raw rollout JSONL reading is a compatibility fallback only. The fallback must be
 versioned, report its confidence, tolerate unknown records, and return
@@ -398,7 +412,7 @@ side chains as a single linear conversation.
 ```text
 HistoryRecord {
     source_provider,
-    source_session_id,
+    source_session_digest_sha256,
     source_record_id,
     sequence,
     timestamp,
@@ -512,10 +526,15 @@ context/<run-id>/
   manifest.json
   summary.md
   pair-history.jsonl
+  supervisor.jsonl  # only when the requested adapter succeeds
 ```
 
-The MVP does not write `supervisor.jsonl`: its manifest records supervisor
-history as unavailable until provider history adapters are implemented.
+The manifest distinguishes `included`, `unavailable`, and `not_requested`
+supervisor history. An unavailable adapter never creates an empty
+`supervisor.jsonl`, because that would confuse "could not read" with "the
+conversation contained no visible messages". Supervisor history receives the
+previously unallocated one-eighth of `--max-context-bytes`; pair-history and
+summary budgets remain unchanged.
 
 `manifest.json` records:
 
@@ -750,20 +769,22 @@ history summaries, explicit one-way same-conversation pair inheritance,
 owner-only context capsules, raw stream forwarding, signal propagation, and
 actual `claude -p` / `codex exec` child execution. `context`,
 `log`, `pairs`, `forget`, and `doctor` are operational. Managed-parent manifest
-resolution, hook-registry detection, supervisor-history adapters, workspace
-memory, native child-session resume, configured agent aliases, and cached
-incremental summarization remain deferred and fail explicitly where requested.
+resolution, hook-registry detection, the Claude supervisor-history adapter,
+workspace memory, native child-session resume, configured agent aliases, and
+cached incremental summarization remain deferred and fail explicitly where
+requested. The Codex app-server supervisor-history adapter is implemented with
+bounded, read-only, allowlisted projection.
 
-Before starting the deferred history-adapter or cached/incremental-summary
+Before starting the Claude history-adapter or cached/incremental-summary
 slices, use the current managed-run implementation in real delegations and
-record enough evidence to judge invocation frequency, latency, fallback rate,
-and summary usefulness. FreeToken/Qwen support follows the provider-neutral,
-implementation-deferred decision in
+record enough evidence to judge invocation frequency, app-server latency,
+fallback rate, and summary usefulness. FreeToken/Qwen support follows the
+provider-neutral, implementation-deferred decision in
 [ADR 0001](adr/0001-freetoken-openai-compatible-local-inference.md).
 
 ### Slice 2: history adapters
 
-- Codex app-server `thread/read` adapter;
+- Codex app-server `thread/read` adapter (implemented);
 - Claude Code hook registry and transcript adapter;
 - normalized projection, redaction, cursoring, and provenance;
 - corrupt, partial, and unknown-format fixtures.
