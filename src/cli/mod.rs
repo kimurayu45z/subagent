@@ -253,18 +253,15 @@ mod tests {
     #[test]
     fn dispatch_routes_known_subcommands_by_leading_token() {
         for name in ["context", "log", "pairs", "doctor", "forget", "agent"] {
-            let args = os(&[name]);
+            let args = os(&[name, "--help"]);
             let mut out: Vec<u8> = Vec::new();
             let mut err: Vec<u8> = Vec::new();
             let code = dispatch(&args, &mut out, &mut err);
-            // Read-only context, doctor, and pair listings succeed on an
-            // empty store. Other bare commands are missing required
-            // arguments or remain profile-management placeholders.
-            if name == "context" || name == "doctor" || name == "pairs" {
-                assert_eq!(code, ExitCode::SUCCESS, "subcommand {name}");
-            } else {
-                assert_eq!(code, wrapper_error_exit(), "subcommand {name}");
-            }
+            // Help proves routing without consulting the user's real state
+            // directory or depending on its current schema version.
+            assert_eq!(code, ExitCode::SUCCESS, "subcommand {name}");
+            assert!(!out.is_empty(), "subcommand {name}");
+            assert!(err.is_empty(), "subcommand {name}");
         }
     }
 }

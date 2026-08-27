@@ -106,6 +106,11 @@ fn capabilities() -> Vec<Capability> {
             "--inherit-from persists a bounded, one-way history edge between distinct pairs in the same workspace and supervisor conversation",
         ),
         capability(
+            "child-session-store",
+            CapabilityState::Implemented,
+            "SQLite schema version 4 stores typed provider-native child sessions and versioned command-profile hashes; managed assignment and resume are not wired yet",
+        ),
+        capability(
             "task-request-projection",
             CapabilityState::Implemented,
             "request memory keeps the positional task prompt and caller stdin while excluding provider launch flags",

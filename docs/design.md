@@ -482,7 +482,9 @@ pairs(id, pair_key, workspace_id, supervisor_session_id, subagent_id,
       created_at, last_seen)
 pair_inheritance(target_pair_id, source_pair_id, declared_at)
 workspace_memories(id, workspace_id, subagent_id, created_at)
-child_sessions(id, pair_id, provider, profile_hash, native_id, status, last_seen)
+child_sessions(id, pair_id, child_kind, profile_hash, profile_schema_version,
+               native_id, status, created_at, last_seen, retired_at,
+               retired_reason)
 invocations(id, pair_id, sequence, status, started_at, completed_at,
             child_session_id, command_digest, exit_kind, exit_code, signal)
 exchange_messages(id, invocation_id, direction, text, redactions, created_at)
@@ -490,9 +492,12 @@ summaries(id, scope_kind, scope_id, source_digest, summary_digest,
           summarizer_id, template_version, redaction_version, created_at)
 ```
 
-The MVP uses SQLite `user_version = 3`. It implements `workspaces`,
+The MVP uses SQLite `user_version = 4`. It implements `workspaces`,
 `supervisor_sessions`, `pairs`, `pair_inheritance`, `invocations`, and
-`exchange_messages`. It
+`exchange_messages`, plus the inert provider-native continuity substrate in
+`child_sessions` and the nullable `invocations.child_session_id` link. Runtime
+session assignment and resume are not enabled merely because these rows can be
+stored. It
 enforces one pair row for each workspace/supervisor-session/subagent tuple and
 allocates monotonically increasing per-pair invocation sequences under an
 immediate transaction. Pending, completed, spawn-failed, and abandoned runs are
@@ -654,9 +659,30 @@ must not guess by filesystem recency.
 ### 13.3 Command profiles
 
 A child session is resumable only when its profile remains compatible. The
-profile hash includes provider, executable identity, model selection, working
-directory, persistent system-prompt options, and relevant permission mode. A
-profile change starts a new child runtime session while retaining pair history.
+versioned profile hash is SHA-256 over length-framed fields: child kind, exact
+executable bytes, canonical working-directory bytes, and the retained provider
+argv in order. It uses a default-include rule, so an unknown future provider
+option changes the hash rather than being assumed compatible. Model selection,
+persistent system-prompt and settings options, tools, MCP configuration, and
+permission mode therefore remain part of the profile.
+
+An unambiguously located task text, caller stdin, managed mode selectors,
+provider-native session-continuity flags, output-shaping flags, and per-run
+budget limits are excluded. These values either vary by invocation or are
+injected by the wrapper and do not define the persistent agent environment.
+Exclusions are limited to provider options with known non-variadic arity; a
+future ambiguous option remains included. In particular, Codex task text is
+omitted only when it appears immediately after `exec` or after an explicit
+`--`; an ambiguous trailing positional remains hashed. A profile change starts
+a new child runtime session while retaining pair history.
+
+Schema version 4 stores at most one live `assigned` or `active` child session
+for each pair, child kind, profile schema version, and profile hash. Deliberate
+replacement produces a terminal `retired` row; provider rejection produces a
+terminal `invalid` row. Historical rows remain for audit, and deleting a pair
+cascades to its child sessions. This storage and hashing substrate is present
+before runtime resume is enabled, so `--fresh` continues to fail closed until
+the later assigned-session slice lands.
 
 ### 13.4 Claude prompt placement
 
@@ -783,8 +809,9 @@ is to test the vocabulary and workflow before committing to those mechanisms.
 
 Implementation status: the usable MVP implements explicit supervisor
 references, unambiguous native Codex/Claude environment detection, canonical
-path-based workspace identity, conversation `PairKey` derivation, the version 3
-SQLite pair/exchange ledger, common-credential redaction, deterministic recent
+path-based workspace identity, conversation `PairKey` derivation, the version 4
+SQLite pair/exchange ledger and inert child-session substrate,
+common-credential redaction, deterministic recent
 history summaries, explicit one-way same-conversation pair inheritance,
 owner-only context capsules, raw stream forwarding, signal propagation, and
 actual `claude -p` / `codex exec` child execution. `context`,
@@ -809,8 +836,10 @@ provider-neutral, implementation-deferred decision in
 
 ### Slice 2: Claude runtime continuity
 
-- schema migration adding provider-native child sessions;
-- command-profile compatibility hashing;
+- schema migration adding provider-native child sessions (implemented as the
+  inert SQLite version 4 substrate);
+- command-profile compatibility hashing (implemented but not yet consumed by
+  managed execution);
 - caller-assigned Claude session IDs and exact resume;
 - explicit `--fresh` recovery with no silent same-invocation fallback; and
 - continuity provenance on every invocation.

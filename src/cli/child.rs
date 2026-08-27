@@ -4,6 +4,12 @@
 //! CLIs accept additional stdin alongside a positional prompt, so the runner
 //! can inject a context bootstrap through stdin while preserving the caller's
 //! original `OsString` argv byte-for-byte.
+//!
+//! Scope note: the command-profile hashing substrate below
+//! ([`ProfileHash`], [`CommandProfile`], [`command_profile_hash`]) is
+//! additive and inert in this build. No runtime path spawns a child through
+//! a profile or persists its hash yet; only this module's own tests
+//! exercise it until a later increment wires it into `managed_run`.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -14,6 +20,13 @@ use sha2::{Digest, Sha256};
 use super::store::ChildKind;
 
 const COMMAND_DIGEST_DOMAIN: &[u8] = b"subagent.command.v1\n";
+
+/// Versions the byte layout hashed by [`command_profile_hash`], independent
+/// of [`super::store::LEDGER_SCHEMA_VERSION`]: a stored row's
+/// `profile_schema_version` pins it to the algorithm that produced it, so a
+/// later change here never silently reinterprets an old hash.
+pub(crate) const COMMAND_PROFILE_SCHEMA_VERSION: u32 = 1;
+const COMMAND_PROFILE_DOMAIN: &[u8] = b"subagent.command-profile.v1\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChildAdapterError {
@@ -143,6 +156,11 @@ pub(crate) fn project_task_request(
 }
 
 fn likely_positional_prompt(kind: ChildKind, args: &[OsString]) -> Option<&OsStr> {
+    let index: usize = likely_positional_prompt_index(kind, args)?;
+    Some(args[index].as_os_str())
+}
+
+fn likely_positional_prompt_index(kind: ChildKind, args: &[OsString]) -> Option<usize> {
     let first_index: usize = match kind {
         ChildKind::Claude => 0,
         ChildKind::Codex => 1,
@@ -152,13 +170,13 @@ fn likely_positional_prompt(kind: ChildKind, args: &[OsString]) -> Option<&OsStr
     }
 
     if kind == ChildKind::Claude
-        && let Some(prompt) = claude_prompt_immediately_after_print(args)
+        && let Some(index) = claude_prompt_immediately_after_print_index(args)
     {
-        return Some(prompt);
+        return Some(index);
     }
 
-    if let Some(prompt) = explicit_separator_prompt(args, first_index) {
-        return Some(prompt);
+    if let Some(index) = explicit_separator_prompt_index(args, first_index) {
+        return Some(index);
     }
 
     if kind == ChildKind::Claude {
@@ -176,29 +194,49 @@ fn likely_positional_prompt(kind: ChildKind, args: &[OsString]) -> Option<&OsStr
             index -= 1;
             continue;
         }
-        return Some(argument);
+        return Some(index);
     }
     None
 }
 
 fn claude_prompt_immediately_after_print(args: &[OsString]) -> Option<&OsStr> {
+    let index: usize = claude_prompt_immediately_after_print_index(args)?;
+    Some(args[index].as_os_str())
+}
+
+fn claude_prompt_immediately_after_print_index(args: &[OsString]) -> Option<usize> {
     let print_index: usize = args.iter().position(|argument: &OsString| {
         argument == OsStr::new("-p") || argument == OsStr::new("--print")
     })?;
-    let candidate: &OsStr = args.get(print_index + 1)?.as_os_str();
+    let candidate_index: usize = print_index + 1;
+    let candidate: &OsStr = args.get(candidate_index)?.as_os_str();
     if candidate == OsStr::new("-") || looks_like_option(candidate) {
         None
     } else {
-        Some(candidate)
+        Some(candidate_index)
     }
 }
 
 fn explicit_separator_prompt(args: &[OsString], first_index: usize) -> Option<&OsStr> {
+    let index: usize = explicit_separator_prompt_index(args, first_index)?;
+    Some(args[index].as_os_str())
+}
+
+/// The index of the token immediately following an explicit `--` separator
+/// at or after `first_index`, or `None` if there is no such separator or it
+/// is the last token. Shared by the prompt-placement heuristic and
+/// [`command_profile_hash`]'s task-token exclusion, which locate the same
+/// token for different reasons.
+fn explicit_separator_prompt_index(args: &[OsString], first_index: usize) -> Option<usize> {
     let separator_index: usize = args[first_index..]
         .iter()
         .position(|argument: &OsString| argument == OsStr::new("--"))?;
-    args.get(first_index + separator_index + 1)
-        .map(OsString::as_os_str)
+    let candidate_index: usize = first_index + separator_index + 1;
+    if candidate_index < args.len() {
+        Some(candidate_index)
+    } else {
+        None
+    }
 }
 
 fn looks_like_option(argument: &OsStr) -> bool {
@@ -341,6 +379,215 @@ fn write_framed(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+/// A 32-byte SHA-256 digest identifying a child's non-task launch
+/// configuration, as produced by [`command_profile_hash`]. Mirrors
+/// [`super::pair_key::PairKey`]'s byte/hex accessors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProfileHash([u8; 32]);
+
+impl ProfileHash {
+    // `as_bytes`, `from_bytes`, and `to_hex` are the accessors a later
+    // increment needs to persist and display a profile hash; nothing calls
+    // them yet because `command_profile_hash` itself is not wired into
+    // `managed_run` in this build. See the module-level scope note.
+    #[allow(dead_code)]
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> ProfileHash {
+        ProfileHash(bytes)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn to_hex(self) -> String {
+        let mut hex: String = String::with_capacity(self.0.len() * 2);
+        for byte in &self.0 {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        hex
+    }
+}
+
+/// The exact launch configuration hashed by [`command_profile_hash`]:
+/// everything about a child invocation except its task text and caller
+/// stdin, both of which vary every run and are already recorded as exchange
+/// history.
+// See this module's scope note: exercised only by this module's own tests
+// until a later increment spawns a child through this profile.
+#[allow(dead_code)]
+pub(crate) struct CommandProfile<'a> {
+    pub child_kind: ChildKind,
+    pub program: &'a OsStr,
+    pub working_directory: &'a Path,
+    pub args: &'a [OsString],
+}
+
+/// Stable SHA-256 hash of a child's launch configuration, excluding the task
+/// text and a short list of session-continuity, output-shaping, and
+/// per-run-budget options that the managed wrapper injects or that vary
+/// every run without changing what the provider does. Every other argv
+/// token — including any option this build does not recognize — is
+/// included by default, so an unrecognized flag is treated as a
+/// configuration change rather than silently ignored: see
+/// [`ChildAdapterError::ClaudePromptPlacementAmbiguous`]'s "unknown implies
+/// incompatible" posture.
+///
+/// The `profile_schema_version` accompanying a stored hash pins it to
+/// [`COMMAND_PROFILE_SCHEMA_VERSION`], so a later change to this function's
+/// byte layout never gets reused across algorithm versions.
+// See this module's scope note: exercised only by this module's own tests
+// until a later increment wires this into `managed_run`.
+#[allow(dead_code)]
+pub(crate) fn command_profile_hash(profile: &CommandProfile<'_>) -> ProfileHash {
+    let excluded: Vec<bool> = excluded_profile_token_mask(profile.child_kind, profile.args);
+    let residual_token_count: u64 =
+        excluded.iter().filter(|is_excluded| !**is_excluded).count() as u64;
+
+    let mut hasher: Sha256 = Sha256::new();
+    hasher.update(COMMAND_PROFILE_DOMAIN);
+    write_framed(&mut hasher, &COMMAND_PROFILE_SCHEMA_VERSION.to_le_bytes());
+    write_framed(&mut hasher, profile.child_kind.to_string().as_bytes());
+    write_framed(&mut hasher, &os_bytes(profile.program));
+    write_framed(
+        &mut hasher,
+        &os_bytes(profile.working_directory.as_os_str()),
+    );
+    write_framed(&mut hasher, &residual_token_count.to_le_bytes());
+    for (index, argument) in profile.args.iter().enumerate() {
+        if excluded[index] {
+            continue;
+        }
+        write_framed(&mut hasher, &os_bytes(argument));
+    }
+    ProfileHash(hasher.finalize().into())
+}
+
+/// Marks, by index, every argv token [`command_profile_hash`] must exclude:
+/// the task token, the mode-selector token(s), and any token on the short
+/// exclusion list together with its value (if the option takes one, per
+/// [`option_takes_value`]). A token whose text cannot be decoded as UTF-8
+/// never matches an exclusion rule and is therefore always retained,
+/// matching the default-include posture.
+// Reachable only from `command_profile_hash`, which is itself unwired; see
+// this module's scope note.
+#[allow(dead_code)]
+fn excluded_profile_token_mask(kind: ChildKind, args: &[OsString]) -> Vec<bool> {
+    let mut excluded: Vec<bool> = vec![false; args.len()];
+
+    match kind {
+        ChildKind::Claude => {
+            for (index, argument) in args.iter().enumerate() {
+                if argument == OsStr::new("-p") || argument == OsStr::new("--print") {
+                    excluded[index] = true;
+                }
+            }
+        }
+        ChildKind::Codex => {
+            if args.first().map(OsString::as_os_str) == Some(OsStr::new("exec")) {
+                excluded[0] = true;
+            }
+        }
+    }
+
+    let task_index: Option<usize> = profile_task_index(kind, args);
+    if let Some(index) = task_index {
+        excluded[index] = true;
+        if index > 0 && args[index - 1] == OsStr::new("--") {
+            excluded[index - 1] = true;
+        }
+    }
+
+    let mut index: usize = 0;
+    while index < args.len() {
+        if excluded[index] {
+            index += 1;
+            continue;
+        }
+        let is_excluded_option: bool = profile_excluded_option_name(args[index].as_os_str())
+            .map(is_excluded_profile_option_name)
+            .unwrap_or(false);
+        if is_excluded_option {
+            excluded[index] = true;
+            if option_takes_value(kind, args[index].as_os_str()) && index + 1 < args.len() {
+                excluded[index + 1] = true;
+                index += 2;
+                continue;
+            }
+        }
+        index += 1;
+    }
+
+    excluded
+}
+
+/// Locates only a task position whose syntax is unambiguous enough to omit
+/// from a resume-compatibility hash. Request projection may heuristically use
+/// a trailing Codex positional, but doing that here could mistake a future
+/// variadic option value for the task and create a false-compatible profile.
+#[allow(dead_code)]
+fn profile_task_index(kind: ChildKind, args: &[OsString]) -> Option<usize> {
+    match kind {
+        ChildKind::Claude => claude_prompt_immediately_after_print_index(args)
+            .or_else(|| explicit_separator_prompt_index(args, 0)),
+        ChildKind::Codex => {
+            if let Some(index) = explicit_separator_prompt_index(args, 1) {
+                return Some(index);
+            }
+            let candidate_index: usize = 1;
+            let candidate: &OsStr = args.get(candidate_index)?.as_os_str();
+            if candidate == OsStr::new("-") || looks_like_option(candidate) {
+                None
+            } else {
+                Some(candidate_index)
+            }
+        }
+    }
+}
+
+/// The option name portion of an argv token, splitting off a `--opt=value`
+/// suffix so `--opt=value` and `--opt value` are recognized as the same
+/// option name for exclusion purposes. `None` for non-UTF-8 tokens.
+// Reachable only from `excluded_profile_token_mask`, which is itself
+// unwired; see this module's scope note.
+#[allow(dead_code)]
+fn profile_excluded_option_name(token: &OsStr) -> Option<&str> {
+    let text: &str = token.to_str()?;
+    Some(text.split_once('=').map(|(name, _)| name).unwrap_or(text))
+}
+
+/// The exclusion list from the command-profile hash design: session-
+/// continuity options (injected by the wrapper in a later increment),
+/// output-shaping/telemetry options, and per-run budget knobs. Each entry is
+/// a known single-token or `--opt value` pair; arity is resolved separately
+/// via [`option_takes_value`].
+// Reachable only from `excluded_profile_token_mask`, which is itself
+// unwired; see this module's scope note.
+#[allow(dead_code)]
+fn is_excluded_profile_option_name(name: &str) -> bool {
+    matches!(
+        name,
+        "--session-id"
+            | "--resume"
+            | "-r"
+            | "--continue"
+            | "-c"
+            | "--fork-session"
+            | "--output-format"
+            | "--input-format"
+            | "--json-schema"
+            | "--debug-file"
+            | "--color"
+            | "-o"
+            | "--output-last-message"
+            | "--output-schema"
+            | "--json"
+            | "--max-turns"
+            | "--max-budget-usd"
+    )
+}
+
 #[cfg(unix)]
 fn os_bytes(value: &OsStr) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
@@ -417,6 +664,195 @@ mod tests {
         let second: [u8; 32] = command_digest(OsStr::new("a"), &args(&["bc"]));
         assert_ne!(first, second);
         assert_eq!(first, command_digest(OsStr::new("ab"), &args(&["c"])));
+    }
+
+    #[test]
+    fn command_profile_hash_is_framed_and_stable() {
+        let cwd = Path::new("/workspace");
+        let first: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Codex,
+            program: OsStr::new("ab"),
+            working_directory: cwd,
+            args: &args(&["exec", "c"]),
+        });
+        let second: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Codex,
+            program: OsStr::new("a"),
+            working_directory: cwd,
+            args: &args(&["exec", "bc"]),
+        });
+        assert_ne!(first, second);
+
+        let repeat: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Codex,
+            program: OsStr::new("ab"),
+            working_directory: cwd,
+            args: &args(&["exec", "c"]),
+        });
+        assert_eq!(first, repeat);
+    }
+
+    #[test]
+    fn command_profile_hash_ignores_claude_task_text() {
+        let cwd = Path::new("/workspace");
+        let program = OsStr::new("claude");
+        let first: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program,
+            working_directory: cwd,
+            args: &args(&["-p", "review the diff", "--model", "haiku"]),
+        });
+        let second: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program,
+            working_directory: cwd,
+            args: &args(&["-p", "an entirely different task", "--model", "haiku"]),
+        });
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn command_profile_hash_ignores_only_unambiguous_codex_task_text() {
+        let cwd = Path::new("/workspace");
+        let program = OsStr::new("codex");
+        let first: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Codex,
+            program,
+            working_directory: cwd,
+            args: &args(&["exec", "--sandbox", "read-only", "--", "review this"]),
+        });
+        let second: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Codex,
+            program,
+            working_directory: cwd,
+            args: &args(&["exec", "--sandbox", "read-only", "--", "summarize that"]),
+        });
+        assert_eq!(first, second);
+
+        let ordinary_first: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Codex,
+            program,
+            working_directory: cwd,
+            args: &args(&["exec", "ordinary task", "--sandbox", "read-only"]),
+        });
+        let ordinary_second: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Codex,
+            program,
+            working_directory: cwd,
+            args: &args(&["exec", "different task", "--sandbox", "read-only"]),
+        });
+        assert_eq!(ordinary_first, ordinary_second);
+
+        let ambiguous_a: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Codex,
+            program,
+            working_directory: cwd,
+            args: &args(&["exec", "--future-variadic", "value-a"]),
+        });
+        let ambiguous_b: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Codex,
+            program,
+            working_directory: cwd,
+            args: &args(&["exec", "--future-variadic", "value-b"]),
+        });
+        assert_ne!(ambiguous_a, ambiguous_b);
+    }
+
+    #[test]
+    fn command_profile_hash_changes_with_model_cwd_program_or_unknown_option() {
+        let base_args: Vec<OsString> = args(&["-p", "task", "--model", "haiku"]);
+        let base: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program: OsStr::new("claude"),
+            working_directory: Path::new("/workspace"),
+            args: &base_args,
+        });
+
+        let different_model: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program: OsStr::new("claude"),
+            working_directory: Path::new("/workspace"),
+            args: &args(&["-p", "task", "--model", "opus"]),
+        });
+        assert_ne!(base, different_model);
+
+        let different_cwd: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program: OsStr::new("claude"),
+            working_directory: Path::new("/other-workspace"),
+            args: &base_args,
+        });
+        assert_ne!(base, different_cwd);
+
+        let different_program: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program: OsStr::new("/usr/local/bin/claude"),
+            working_directory: Path::new("/workspace"),
+            args: &base_args,
+        });
+        assert_ne!(base, different_program);
+
+        let unknown_option: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program: OsStr::new("claude"),
+            working_directory: Path::new("/workspace"),
+            args: &args(&["-p", "task", "--model", "haiku", "--future-flag", "value"]),
+        });
+        assert_ne!(base, unknown_option);
+    }
+
+    #[test]
+    fn command_profile_hash_ignores_session_continuity_and_output_shaping_flags() {
+        let base: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program: OsStr::new("claude"),
+            working_directory: Path::new("/workspace"),
+            args: &args(&["-p", "task", "--model", "haiku"]),
+        });
+        let with_continuity_and_output: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program: OsStr::new("claude"),
+            working_directory: Path::new("/workspace"),
+            args: &args(&[
+                "-p",
+                "task",
+                "--model",
+                "haiku",
+                "--session-id",
+                "abc-123",
+                "--resume",
+                "def-456",
+                "--continue",
+                "--fork-session",
+                "--output-format",
+                "json",
+            ]),
+        });
+        assert_eq!(base, with_continuity_and_output);
+    }
+
+    #[test]
+    fn command_profile_hash_excludes_opt_value_and_opt_equals_value_forms_alike() {
+        let no_flag: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program: OsStr::new("claude"),
+            working_directory: Path::new("/workspace"),
+            args: &args(&["-p", "task", "--model", "haiku"]),
+        });
+        let space_form: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program: OsStr::new("claude"),
+            working_directory: Path::new("/workspace"),
+            args: &args(&["-p", "task", "--model", "haiku", "--output-format", "json"]),
+        });
+        let equals_form: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program: OsStr::new("claude"),
+            working_directory: Path::new("/workspace"),
+            args: &args(&["-p", "task", "--model", "haiku", "--output-format=json"]),
+        });
+        assert_eq!(no_flag, space_form);
+        assert_eq!(no_flag, equals_form);
     }
 
     #[test]

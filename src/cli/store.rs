@@ -3,8 +3,11 @@
 //! Scope in this build covers the `workspaces`, `supervisor_sessions`, and
 //! `pairs` tables from the design's minimum schema, plus the invocation and
 //! exchange ledger (`invocations`, `exchange_messages`) needed to record one
-//! managed run's request/response pair transactionally. `workspace_memories`,
-//! `child_sessions`, and `summaries` are not implemented yet.
+//! managed run's request/response pair transactionally, and the additive
+//! `child_sessions` storage substrate described below. `workspace_memories`
+//! and `summaries` are not implemented yet. No runtime path spawns, resumes,
+//! or reads a `child_sessions` row yet: every method touching that table is
+//! inert until a later increment calls it.
 //!
 //! Security posture, per `docs/design.md` section 10 and section 15:
 //! directories this build owns are created `0700`; the database file (and
@@ -22,6 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 
+use super::child::COMMAND_PROFILE_SCHEMA_VERSION;
 use super::id::SubagentId;
 use super::pair_key::PairKey;
 use super::supervisor::Provider;
@@ -37,8 +41,10 @@ use super::workspace::WorkspaceRef;
 /// Version 2 additively introduces `invocations` and `exchange_messages`
 /// without altering any version 1 table or row. Version 3 additively
 /// introduces `pair_inheritance` without altering any version 1 or version 2
-/// table or row.
-pub(crate) const LEDGER_SCHEMA_VERSION: i64 = 3;
+/// table or row. Version 4 additively introduces `child_sessions` and a
+/// nullable `invocations.child_session_id` back-link, without altering any
+/// version 1, 2, or 3 table or row; no runtime path writes to either yet.
+pub(crate) const LEDGER_SCHEMA_VERSION: i64 = 4;
 
 const DB_FILE_NAME: &str = "ledger.sqlite3";
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -161,6 +167,70 @@ CREATE TABLE pair_inheritance (
 CREATE INDEX pair_inheritance_source_pair_id_idx ON pair_inheritance (source_pair_id);
 ";
 
+/// Additive version 3 -> 4 migration: the inert `child_sessions` storage
+/// substrate (`docs/design.md:485`) plus a nullable back-link from
+/// `invocations`. Nothing in this build writes to either yet; see the
+/// module-level doc comment.
+///
+/// `child_sessions.pair_id` cascades exactly like `invocations.pair_id`, so
+/// [`Store::delete_pair`] removes a pair's child sessions with no new
+/// statement. `invocations.child_session_id` is `ON DELETE SET NULL` rather
+/// than cascading, so garbage-collecting a child session row never orphans
+/// (deletes) the invocation that used it.
+///
+/// State machine enforced by the row-level `CHECK` below: `assigned` (minted
+/// and persisted before spawn, not yet confirmed by the provider) and
+/// `active` (at least one invocation completed against it) are the two live
+/// states; `retired` (deliberately superseded) and `invalid` (the provider
+/// rejected or lost it) are terminal. The partial unique index only spans
+/// the two live states, so at most one live row exists per
+/// `(pair_id, child_kind, profile_hash, profile_schema_version)`, while
+/// retired and invalid rows stay for audit and never block a replacement.
+/// Multiple live rows per pair are legal when their profile hashes differ.
+const SCHEMA_SQL_V4_ADDITIONS: &str = "
+CREATE TABLE child_sessions (
+    id INTEGER PRIMARY KEY,
+    pair_id INTEGER NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+    child_kind TEXT NOT NULL CHECK (child_kind IN ('claude', 'codex')),
+    profile_hash BLOB NOT NULL CHECK (length(profile_hash) = 32),
+    profile_schema_version INTEGER NOT NULL CHECK (profile_schema_version > 0),
+    native_id TEXT NOT NULL
+        CHECK (length(native_id) BETWEEN 1 AND 256)
+        CHECK (child_kind <> 'claude' OR length(native_id) = 36),
+    status TEXT NOT NULL
+        CHECK (status IN ('assigned', 'active', 'retired', 'invalid')),
+    created_at INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    retired_at INTEGER,
+    retired_reason TEXT
+        CHECK (retired_reason IS NULL OR retired_reason IN
+            ('fresh_requested', 'profile_changed', 'superseded', 'provider_rejected')),
+    UNIQUE (child_kind, native_id),
+    CHECK (last_seen >= created_at),
+    CHECK (retired_at IS NULL OR retired_at >= created_at),
+    CHECK (
+        (status IN ('assigned', 'active')
+            AND retired_at IS NULL AND retired_reason IS NULL)
+        OR (status = 'retired'
+            AND retired_at IS NOT NULL
+            AND retired_reason IN ('fresh_requested', 'profile_changed', 'superseded'))
+        OR (status = 'invalid'
+            AND retired_at IS NOT NULL
+            AND retired_reason = 'provider_rejected')
+    )
+);
+
+CREATE INDEX child_sessions_pair_id_idx ON child_sessions (pair_id);
+
+CREATE UNIQUE INDEX child_sessions_live_profile_idx
+    ON child_sessions (pair_id, child_kind, profile_hash, profile_schema_version)
+    WHERE status IN ('assigned', 'active');
+
+ALTER TABLE invocations
+    ADD COLUMN child_session_id INTEGER
+    REFERENCES child_sessions(id) ON DELETE SET NULL;
+";
+
 #[derive(Debug)]
 pub(crate) enum StoreError {
     Io(std::io::Error),
@@ -208,6 +278,33 @@ pub(crate) enum StoreError {
         existing_source: PairKey,
         requested_source: PairKey,
     },
+    /// [`Store::mark_child_session_active`] or [`Store::retire_child_session`]
+    /// expected exactly one matching row with `status IN ('assigned',
+    /// 'active')` and found none, either because `native_id` does not exist
+    /// or because it already left the live states.
+    #[allow(dead_code)]
+    ChildSessionNotLive(String),
+    /// [`Store::link_invocation_child_session`] was given a `native_id` that
+    /// names no `child_sessions` row at all.
+    #[allow(dead_code)]
+    ChildSessionNotFound(String),
+    #[allow(dead_code)]
+    ChildSessionPairMismatch {
+        invocation_id: String,
+        native_id: String,
+    },
+    #[allow(dead_code)]
+    CorruptChildSessionStatus(String),
+    #[allow(dead_code)]
+    CorruptChildSessionRetirement(String),
+    #[allow(dead_code)]
+    CorruptChildSessionLifecycle,
+    #[allow(dead_code)]
+    CorruptProfileSchemaVersion(i64),
+    /// A child-session native ID is empty, too long, or, for Claude, does not
+    /// parse as a UUID.
+    #[allow(dead_code)]
+    CorruptChildSessionNativeId(String),
 }
 
 #[derive(Debug)]
@@ -323,6 +420,42 @@ impl fmt::Display for StoreError {
                 f,
                 "pair {target} already inherits from {existing_source}; cannot also declare \
                  inheritance from {requested_source} without first removing the existing edge"
+            ),
+            StoreError::ChildSessionNotLive(native_id) => write!(
+                f,
+                "no live child session {native_id:?} found to update; it may not exist or may \
+                 already be retired or invalid"
+            ),
+            StoreError::ChildSessionNotFound(native_id) => {
+                write!(f, "no child session {native_id:?} found")
+            }
+            StoreError::ChildSessionPairMismatch {
+                invocation_id,
+                native_id,
+            } => write!(
+                f,
+                "child session {native_id:?} belongs to a different pair than invocation \
+                 {invocation_id:?}"
+            ),
+            StoreError::CorruptChildSessionStatus(text) => write!(
+                f,
+                "state store contains an unrecognized child session status {text:?}"
+            ),
+            StoreError::CorruptChildSessionRetirement(text) => write!(
+                f,
+                "state store contains an unrecognized child session retirement reason {text:?}"
+            ),
+            StoreError::CorruptChildSessionLifecycle => write!(
+                f,
+                "state store contains an inconsistent child session lifecycle"
+            ),
+            StoreError::CorruptProfileSchemaVersion(version) => write!(
+                f,
+                "state store contains an invalid child session profile schema version {version}"
+            ),
+            StoreError::CorruptChildSessionNativeId(text) => write!(
+                f,
+                "state store contains a malformed child session native id {text:?}"
             ),
         }
     }
@@ -561,10 +694,11 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         0 => {
             // A brand-new database reaches the current version in one
             // transaction: there is no observable intermediate state at
-            // version 1 or version 2.
+            // version 1, version 2, or version 3.
             transaction.execute_batch(SCHEMA_SQL_V1)?;
             transaction.execute_batch(SCHEMA_SQL_V2_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V3_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -573,14 +707,24 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             // version 1 row is untouched, and only the new tables appear.
             transaction.execute_batch(SCHEMA_SQL_V2_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V3_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
         2 => {
             // An existing version 2 database is migrated additively: every
             // version 1 and version 2 row is untouched, and only
-            // `pair_inheritance` appears.
+            // `pair_inheritance` and `child_sessions` appear.
             transaction.execute_batch(SCHEMA_SQL_V3_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
+            transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+        3 => {
+            // An existing version 3 database is migrated additively: every
+            // version 1, 2, and 3 row is untouched, and only
+            // `child_sessions` and `invocations.child_session_id` appear.
+            transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -877,6 +1021,104 @@ pub(crate) struct CompletedExchange {
 pub(crate) struct InheritanceEdge {
     pub source_pair_key: PairKey,
     pub source_subagent_id: String,
+}
+
+/// A `child_sessions.status` value. See [`SCHEMA_SQL_V4_ADDITIONS`] for the
+/// state machine this enum's variants encode.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildSessionStatus {
+    Assigned,
+    Active,
+    Retired,
+    Invalid,
+}
+
+impl ChildSessionStatus {
+    fn parse(raw: &str) -> Option<ChildSessionStatus> {
+        match raw {
+            "assigned" => Some(ChildSessionStatus::Assigned),
+            "active" => Some(ChildSessionStatus::Active),
+            "retired" => Some(ChildSessionStatus::Retired),
+            "invalid" => Some(ChildSessionStatus::Invalid),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ChildSessionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text: &str = match self {
+            ChildSessionStatus::Assigned => "assigned",
+            ChildSessionStatus::Active => "active",
+            ChildSessionStatus::Retired => "retired",
+            ChildSessionStatus::Invalid => "invalid",
+        };
+        f.write_str(text)
+    }
+}
+
+/// A `child_sessions.retired_reason` value, present only once `status` has
+/// left the live states. [`Store::retire_child_session`] derives the
+/// resulting `status` from this reason: `ProviderRejected` always becomes
+/// `invalid`; every other reason becomes `retired`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildSessionRetirement {
+    FreshRequested,
+    ProfileChanged,
+    Superseded,
+    ProviderRejected,
+}
+
+impl ChildSessionRetirement {
+    fn parse(raw: &str) -> Option<ChildSessionRetirement> {
+        match raw {
+            "fresh_requested" => Some(ChildSessionRetirement::FreshRequested),
+            "profile_changed" => Some(ChildSessionRetirement::ProfileChanged),
+            "superseded" => Some(ChildSessionRetirement::Superseded),
+            "provider_rejected" => Some(ChildSessionRetirement::ProviderRejected),
+            _ => None,
+        }
+    }
+
+    fn resulting_status(self) -> ChildSessionStatus {
+        match self {
+            ChildSessionRetirement::ProviderRejected => ChildSessionStatus::Invalid,
+            ChildSessionRetirement::FreshRequested
+            | ChildSessionRetirement::ProfileChanged
+            | ChildSessionRetirement::Superseded => ChildSessionStatus::Retired,
+        }
+    }
+}
+
+impl fmt::Display for ChildSessionRetirement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text: &str = match self {
+            ChildSessionRetirement::FreshRequested => "fresh_requested",
+            ChildSessionRetirement::ProfileChanged => "profile_changed",
+            ChildSessionRetirement::Superseded => "superseded",
+            ChildSessionRetirement::ProviderRejected => "provider_rejected",
+        };
+        f.write_str(text)
+    }
+}
+
+/// One `child_sessions` row, fully validated on read. Deliberately omits
+/// the internal `pair_id`, matching [`InvocationRecord`]'s posture against
+/// exposing more than a command needs.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildSessionRecord {
+    pub native_id: String,
+    pub child_kind: ChildKind,
+    pub profile_hash: [u8; 32],
+    pub profile_schema_version: i64,
+    pub status: ChildSessionStatus,
+    pub created_at_unix: i64,
+    pub last_seen_unix: i64,
+    pub retired_at_unix: Option<i64>,
+    pub retired_reason: Option<ChildSessionRetirement>,
 }
 
 /// The result of a read-only store open, since a missing state root or
@@ -1627,6 +1869,262 @@ impl Store {
             source_subagent_id,
         }))
     }
+
+    /// Looks up the live (`assigned` or `active`) child session for
+    /// `pair_key`, `child_kind`, and `profile_hash`, if any. Only rows
+    /// written by the current [`COMMAND_PROFILE_SCHEMA_VERSION`] are
+    /// eligible: a row from a different hashing algorithm version is never
+    /// reused, even if its bytes happen to match. Returns `None` (not an
+    /// error) both when `pair_key` names no pair and when no live row
+    /// matches.
+    #[allow(dead_code)]
+    pub(crate) fn live_child_session(
+        &self,
+        pair_key: &PairKey,
+        child_kind: ChildKind,
+        profile_hash: &[u8; 32],
+    ) -> Result<Option<ChildSessionRecord>, StoreError> {
+        let Some(pair_id) = find_pair_id(&self.conn, pair_key)? else {
+            return Ok(None);
+        };
+        let row: Option<ChildSessionRow> = self
+            .conn
+            .query_row(
+                "SELECT native_id, child_kind, profile_hash, profile_schema_version, status,
+                        created_at, last_seen, retired_at, retired_reason
+                 FROM child_sessions
+                 WHERE pair_id = ?1 AND child_kind = ?2 AND profile_hash = ?3
+                   AND profile_schema_version = ?4 AND status IN ('assigned', 'active')",
+                params![
+                    pair_id,
+                    child_kind.to_string(),
+                    profile_hash.as_slice(),
+                    i64::from(COMMAND_PROFILE_SCHEMA_VERSION),
+                ],
+                child_session_row,
+            )
+            .optional()?;
+        row.map(child_session_record_from_row).transpose()
+    }
+
+    /// Idempotently ensures a live child session exists for `pair_key`,
+    /// `child_kind`, and `profile_hash`, under one `IMMEDIATE` transaction
+    /// (as [`Store::begin_invocation`]) so two racing callers can never both
+    /// insert a live row for the same profile: the partial unique index
+    /// `child_sessions_live_profile_idx` backs this up at the database
+    /// level.
+    ///
+    /// If a live row already matches, it is returned unchanged and
+    /// `native_id` is discarded. Otherwise a new row is inserted with
+    /// `status = 'assigned'` using the given `native_id`.
+    ///
+    /// Fails with [`StoreError::PairNotFound`] if `pair_key` is stale.
+    #[allow(dead_code)]
+    pub(crate) fn ensure_child_session(
+        &mut self,
+        pair_key: &PairKey,
+        child_kind: ChildKind,
+        profile_hash: &[u8; 32],
+        native_id: &str,
+    ) -> Result<ChildSessionRecord, StoreError> {
+        validate_child_session_native_id(child_kind, native_id)?;
+        let now: i64 = unix_now();
+        let tx: rusqlite::Transaction<'_> = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pair_id: i64 = find_pair_id(&tx, pair_key)?.ok_or(StoreError::PairNotFound)?;
+
+        let existing: Option<ChildSessionRow> = tx
+            .query_row(
+                "SELECT native_id, child_kind, profile_hash, profile_schema_version, status,
+                        created_at, last_seen, retired_at, retired_reason
+                 FROM child_sessions
+                 WHERE pair_id = ?1 AND child_kind = ?2 AND profile_hash = ?3
+                   AND profile_schema_version = ?4 AND status IN ('assigned', 'active')",
+                params![
+                    pair_id,
+                    child_kind.to_string(),
+                    profile_hash.as_slice(),
+                    i64::from(COMMAND_PROFILE_SCHEMA_VERSION),
+                ],
+                child_session_row,
+            )
+            .optional()?;
+        if let Some(row) = existing {
+            tx.commit()?;
+            secure_sidecars(&self.db_path)?;
+            return child_session_record_from_row(row);
+        }
+
+        tx.execute(
+            "INSERT INTO child_sessions (
+                 pair_id, child_kind, profile_hash, profile_schema_version, native_id,
+                 status, created_at, last_seen
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'assigned', ?6, ?6)",
+            params![
+                pair_id,
+                child_kind.to_string(),
+                profile_hash.as_slice(),
+                i64::from(COMMAND_PROFILE_SCHEMA_VERSION),
+                native_id,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        secure_sidecars(&self.db_path)?;
+
+        Ok(ChildSessionRecord {
+            native_id: native_id.to_string(),
+            child_kind,
+            profile_hash: *profile_hash,
+            profile_schema_version: i64::from(COMMAND_PROFILE_SCHEMA_VERSION),
+            status: ChildSessionStatus::Assigned,
+            created_at_unix: now,
+            last_seen_unix: now,
+            retired_at_unix: None,
+            retired_reason: None,
+        })
+    }
+
+    /// Marks a live child session as `active`, meaning at least one
+    /// invocation has now completed against it. `last_seen` is clamped to
+    /// never move backward under concurrent updates.
+    ///
+    /// Fails with [`StoreError::ChildSessionNotLive`] if `native_id` does
+    /// not currently name a row for `pair_key` with `status IN ('assigned',
+    /// 'active')`.
+    #[allow(dead_code)]
+    pub(crate) fn mark_child_session_active(
+        &mut self,
+        pair_key: &PairKey,
+        native_id: &str,
+    ) -> Result<(), StoreError> {
+        let now: i64 = unix_now();
+        let pair_id: i64 = find_pair_id(&self.conn, pair_key)?.ok_or(StoreError::PairNotFound)?;
+        let rows: usize = self.conn.execute(
+            "UPDATE child_sessions SET status = 'active', last_seen = MAX(?1, last_seen)
+             WHERE pair_id = ?2 AND native_id = ?3 AND status IN ('assigned', 'active')",
+            params![now, pair_id, native_id],
+        )?;
+        secure_sidecars(&self.db_path)?;
+        if rows == 0 {
+            return Err(StoreError::ChildSessionNotLive(native_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Terminally retires a live child session. The resulting `status` is
+    /// derived from `reason` (see [`ChildSessionRetirement::resulting_status`]):
+    /// `provider_rejected` becomes `invalid`, every other reason becomes
+    /// `retired`. `retired_at` is clamped to be no earlier than
+    /// `created_at`.
+    ///
+    /// Fails with [`StoreError::ChildSessionNotLive`] if `native_id` does
+    /// not currently name a row for `pair_key` with `status IN ('assigned',
+    /// 'active')`; retirement is one-way, so an already-terminal row is
+    /// rejected rather than silently re-retired.
+    #[allow(dead_code)]
+    pub(crate) fn retire_child_session(
+        &mut self,
+        pair_key: &PairKey,
+        native_id: &str,
+        reason: ChildSessionRetirement,
+    ) -> Result<(), StoreError> {
+        let now: i64 = unix_now();
+        let status: ChildSessionStatus = reason.resulting_status();
+        let pair_id: i64 = find_pair_id(&self.conn, pair_key)?.ok_or(StoreError::PairNotFound)?;
+        let rows: usize = self.conn.execute(
+            "UPDATE child_sessions
+             SET status = ?1, retired_at = MAX(?2, created_at), retired_reason = ?3
+             WHERE pair_id = ?4 AND native_id = ?5 AND status IN ('assigned', 'active')",
+            params![
+                status.to_string(),
+                now,
+                reason.to_string(),
+                pair_id,
+                native_id
+            ],
+        )?;
+        secure_sidecars(&self.db_path)?;
+        if rows == 0 {
+            return Err(StoreError::ChildSessionNotLive(native_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Lists every child session recorded for `pair_key`, newest first,
+    /// live and terminal alike. Unlike [`Store::live_child_session`], this
+    /// includes rows written by a different `profile_schema_version`, for
+    /// diagnostics.
+    #[allow(dead_code)]
+    pub(crate) fn list_child_sessions(
+        &self,
+        pair_key: &PairKey,
+    ) -> Result<Vec<ChildSessionRecord>, StoreError> {
+        let Some(pair_id) = find_pair_id(&self.conn, pair_key)? else {
+            return Ok(Vec::new());
+        };
+        let mut statement: rusqlite::Statement<'_> = self.conn.prepare(
+            "SELECT native_id, child_kind, profile_hash, profile_schema_version, status,
+                    created_at, last_seen, retired_at, retired_reason
+             FROM child_sessions WHERE pair_id = ?1 ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = statement.query_map(params![pair_id], child_session_row)?;
+        let mut records: Vec<ChildSessionRecord> = Vec::new();
+        for row in rows {
+            records.push(child_session_record_from_row(row?)?);
+        }
+        Ok(records)
+    }
+
+    /// Links a still-`pending` invocation to the child session named by
+    /// `native_id`, mirroring [`Store::attach_capsule`]'s guarded-update
+    /// pattern.
+    ///
+    /// Fails with [`StoreError::ChildSessionNotFound`] if `native_id` names
+    /// no `child_sessions` row at all (live or terminal), and with
+    /// [`StoreError::InvocationNotPending`] if `invocation_id` is not
+    /// currently pending.
+    #[allow(dead_code)]
+    pub(crate) fn link_invocation_child_session(
+        &mut self,
+        invocation_id: &str,
+        native_id: &str,
+    ) -> Result<(), StoreError> {
+        let tx: rusqlite::Transaction<'_> = self.conn.transaction()?;
+        let invocation_pair_id: i64 = tx
+            .query_row(
+                "SELECT pair_id FROM invocations WHERE id = ?1 AND status = 'pending'",
+                params![invocation_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::InvocationNotPending(invocation_id.to_string()))?;
+        let (child_session_id, child_session_pair_id): (i64, i64) = tx
+            .query_row(
+                "SELECT id, pair_id FROM child_sessions WHERE native_id = ?1",
+                params![native_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::ChildSessionNotFound(native_id.to_string()))?;
+        if child_session_pair_id != invocation_pair_id {
+            return Err(StoreError::ChildSessionPairMismatch {
+                invocation_id: invocation_id.to_string(),
+                native_id: native_id.to_string(),
+            });
+        }
+        let rows: usize = tx.execute(
+            "UPDATE invocations SET child_session_id = ?1 WHERE id = ?2 AND status = 'pending'",
+            params![child_session_id, invocation_id],
+        )?;
+        if rows == 0 {
+            return Err(StoreError::InvocationNotPending(invocation_id.to_string()));
+        }
+        tx.commit()?;
+        secure_sidecars(&self.db_path)?;
+        Ok(())
+    }
 }
 
 fn find_pair_id(conn: &Connection, pair_key: &PairKey) -> Result<Option<i64>, StoreError> {
@@ -1660,6 +2158,131 @@ fn find_pair_key_and_subagent_id(
 
 fn digest_to_blob(digest: [u8; 32]) -> Vec<u8> {
     digest.to_vec()
+}
+
+/// The raw columns of one `child_sessions` row, in the order every query
+/// against that table in this module selects them.
+#[allow(dead_code)]
+type ChildSessionRow = (
+    String,         // native_id
+    String,         // child_kind
+    Vec<u8>,        // profile_hash
+    i64,            // profile_schema_version
+    String,         // status
+    i64,            // created_at
+    i64,            // last_seen
+    Option<i64>,    // retired_at
+    Option<String>, // retired_reason
+);
+
+#[allow(dead_code)]
+fn child_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChildSessionRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    ))
+}
+
+/// Validates one raw `child_sessions` row into a [`ChildSessionRecord`].
+/// Never coerces or defaults an unrecognized `status`/`retired_reason`, a
+/// non-32-byte `profile_hash`, or (for `child_kind = 'claude'`) a
+/// non-UUID `native_id`: each is a typed [`StoreError`] instead, matching
+/// [`Store::invocation`]'s corruption posture.
+#[allow(dead_code)]
+fn child_session_record_from_row(row: ChildSessionRow) -> Result<ChildSessionRecord, StoreError> {
+    let (
+        native_id,
+        child_kind_text,
+        profile_hash_bytes,
+        profile_schema_version,
+        status_text,
+        created_at,
+        last_seen,
+        retired_at,
+        retired_reason_text,
+    ) = row;
+
+    let child_kind: ChildKind =
+        ChildKind::parse(&child_kind_text).ok_or(StoreError::CorruptChildKind(child_kind_text))?;
+    validate_child_session_native_id(child_kind, &native_id)?;
+    let profile_hash: [u8; 32] = profile_hash_bytes
+        .try_into()
+        .map_err(|_| StoreError::CorruptDigest("profile_hash"))?;
+    if profile_schema_version <= 0 {
+        return Err(StoreError::CorruptProfileSchemaVersion(
+            profile_schema_version,
+        ));
+    }
+    let status: ChildSessionStatus = ChildSessionStatus::parse(&status_text)
+        .ok_or(StoreError::CorruptChildSessionStatus(status_text))?;
+    let retired_reason: Option<ChildSessionRetirement> = retired_reason_text
+        .map(|text: String| {
+            ChildSessionRetirement::parse(&text)
+                .ok_or(StoreError::CorruptChildSessionRetirement(text))
+        })
+        .transpose()?;
+    let lifecycle_is_valid: bool = match status {
+        ChildSessionStatus::Assigned | ChildSessionStatus::Active => {
+            retired_at.is_none() && retired_reason.is_none()
+        }
+        ChildSessionStatus::Retired => {
+            retired_at.is_some()
+                && matches!(
+                    retired_reason,
+                    Some(
+                        ChildSessionRetirement::FreshRequested
+                            | ChildSessionRetirement::ProfileChanged
+                            | ChildSessionRetirement::Superseded
+                    )
+                )
+        }
+        ChildSessionStatus::Invalid => {
+            retired_at.is_some() && retired_reason == Some(ChildSessionRetirement::ProviderRejected)
+        }
+    };
+    if !lifecycle_is_valid
+        || last_seen < created_at
+        || retired_at.is_some_and(|timestamp: i64| timestamp < created_at)
+    {
+        return Err(StoreError::CorruptChildSessionLifecycle);
+    }
+
+    Ok(ChildSessionRecord {
+        native_id,
+        child_kind,
+        profile_hash,
+        profile_schema_version,
+        status,
+        created_at_unix: created_at,
+        last_seen_unix: last_seen,
+        retired_at_unix: retired_at,
+        retired_reason,
+    })
+}
+
+#[allow(dead_code)]
+fn validate_child_session_native_id(
+    child_kind: ChildKind,
+    native_id: &str,
+) -> Result<(), StoreError> {
+    if native_id.is_empty() || native_id.len() > 256 {
+        return Err(StoreError::CorruptChildSessionNativeId(
+            native_id.to_string(),
+        ));
+    }
+    if child_kind == ChildKind::Claude {
+        Uuid::parse_str(native_id).map_err(|_error: uuid::Error| {
+            StoreError::CorruptChildSessionNativeId(native_id.to_string())
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2082,7 +2705,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_reaches_version_3_with_a_usable_ledger() {
+    fn fresh_database_reaches_version_4_with_a_usable_ledger() {
         let root = tempfile::tempdir().unwrap();
         let state_root = root.path().join("state");
         let store = Store::open_for_write(&state_root).unwrap();
@@ -2092,7 +2715,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, LEDGER_SCHEMA_VERSION);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 3);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 4);
 
         let invocation_count: i64 = store
             .conn
@@ -2113,12 +2736,17 @@ mod tests {
             })
             .unwrap();
         assert_eq!(inheritance_count, 0);
+        let child_session_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM child_sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(child_session_count, 0);
     }
 
     /// Builds an on-disk version 1 database by hand (the exact schema the
     /// pair-identity-store increment shipped, `SCHEMA_SQL_V1`) with one
     /// pre-existing pair, so the migration path exercised here is the real
-    /// version 1 -> 3 upgrade (through version 2) rather than a stand-in.
+    /// version 1 -> 4 upgrade (through versions 2 and 3) rather than a stand-in.
     #[test]
     fn opening_a_v1_fixture_migrates_to_the_current_version_and_preserves_its_pair() {
         let root = tempfile::tempdir().unwrap();
@@ -2224,14 +2852,24 @@ mod tests {
                 source_subagent_id: "reviewer".to_string(),
             })
         );
+
+        let session: ChildSessionRecord = store
+            .ensure_child_session(
+                &pair_key,
+                ChildKind::Claude,
+                &[3u8; 32],
+                "018f0000-0000-7000-8000-000000000003",
+            )
+            .unwrap();
+        assert_eq!(session.status, ChildSessionStatus::Assigned);
     }
 
     /// Builds an on-disk version 2 database by hand (`SCHEMA_SQL_V1` plus
     /// `SCHEMA_SQL_V2_ADDITIONS`) with a pre-existing pair and a completed
     /// invocation, so the migration path exercised here is the real version
-    /// 2 -> 3 upgrade rather than a stand-in.
+    /// 2 -> 4 upgrade rather than a stand-in.
     #[test]
-    fn opening_a_v2_fixture_migrates_to_v3_and_preserves_its_invocations() {
+    fn opening_a_v2_fixture_migrates_to_v4_and_preserves_its_invocations() {
         let root = tempfile::tempdir().unwrap();
         let state_root = root.path().join("state");
         let workspace_dir = tempfile::tempdir().unwrap();
@@ -2318,6 +2956,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(invocation.status, InvocationStatus::Completed);
+        let child_session_id: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT child_session_id FROM invocations WHERE id = ?1",
+                params!["018f0000-0000-7000-8000-000000000000"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_session_id, None);
 
         // The version 3 addition works too.
         let second_pair: EnsuredPair = store
@@ -2337,6 +2984,477 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn opening_a_v3_fixture_migrates_to_v4_and_preserves_all_prior_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let state_root: PathBuf = root.path().join("state");
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let workspace_ref: WorkspaceRef = workspace(workspace_dir.path());
+        let identity_bytes: Vec<u8> = workspace_ref.identity_bytes();
+        let source_key: PairKey = PairKey::compute(
+            &identity_bytes,
+            Provider::Codex,
+            "session-1",
+            &id("reviewer"),
+        );
+        let target_key: PairKey = PairKey::compute(
+            &identity_bytes,
+            Provider::Codex,
+            "session-1",
+            &id("implementer"),
+        );
+
+        std::fs::create_dir(&state_root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let db_path: PathBuf = state_root.join(DB_FILE_NAME);
+        {
+            let fixture_conn: Connection = Connection::open(&db_path).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V1).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V2_ADDITIONS).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V3_ADDITIONS).unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO workspaces (canonical_path, identity_kind, created_at)
+                     VALUES (?1, 'path', 1000)",
+                    params![identity_bytes],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO supervisor_sessions
+                         (provider, native_id, workspace_id, first_seen, last_seen)
+                     VALUES ('codex', 'session-1', 1, 1000, 1000)",
+                    [],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO pairs
+                         (pair_key, workspace_id, supervisor_session_id, subagent_id,
+                          created_at, last_seen)
+                     VALUES (?1, 1, 1, 'reviewer', 1000, 1000),
+                            (?2, 1, 1, 'implementer', 1001, 1001)",
+                    params![
+                        source_key.as_bytes().as_slice(),
+                        target_key.as_bytes().as_slice()
+                    ],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO invocations (
+                         id, pair_id, sequence, status, started_at, completed_at,
+                         wrapper_pid, command_digest, program_name, child_kind,
+                         exit_kind, exit_code, context_provenance
+                     ) VALUES (
+                         '018f0000-0000-7000-8000-000000000004', 1, 1, 'completed',
+                         1000, 1001, 42, ?1, 'codex', 'codex', 'exited', 7, 'v3-fixture'
+                     )",
+                    params![vec![4u8; 32]],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO exchange_messages (
+                         invocation_id, direction, body, body_encoding, truncated,
+                         redaction_count, redaction_classes, created_at
+                     ) VALUES
+                         ('018f0000-0000-7000-8000-000000000004', 'request',
+                          X'72657175657374', 'utf8', 0, 0, '[]', 1000),
+                         ('018f0000-0000-7000-8000-000000000004', 'response',
+                          X'726573706f6e7365', 'utf8', 0, 0, '[]', 1001)",
+                    [],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO pair_inheritance
+                         (target_pair_id, source_pair_id, declared_at)
+                     VALUES (2, 1, 1001)",
+                    [],
+                )
+                .unwrap();
+            fixture_conn
+                .pragma_update(None, "user_version", 3i64)
+                .unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let store: Store = Store::open_for_write(&state_root).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        let invocation: InvocationRecord = store
+            .invocation("018f0000-0000-7000-8000-000000000004")
+            .unwrap()
+            .unwrap();
+        assert_eq!(invocation.command_digest, [4u8; 32]);
+        assert_eq!(invocation.exit, Some(ExitOutcome::Exited { code: 7 }));
+        let exchanges: Vec<CompletedExchange> =
+            store.list_completed_exchanges(&source_key, None).unwrap();
+        assert_eq!(exchanges.len(), 2);
+        assert_eq!(exchanges[0].body, b"request");
+        assert_eq!(exchanges[1].body, b"response");
+        assert_eq!(
+            store.inheritance_for(&target_key).unwrap(),
+            Some(InheritanceEdge {
+                source_pair_key: source_key,
+                source_subagent_id: "reviewer".to_string(),
+            })
+        );
+        let child_session_id: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT child_session_id FROM invocations WHERE id = ?1",
+                params!["018f0000-0000-7000-8000-000000000004"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_session_id, None);
+    }
+
+    #[test]
+    fn child_session_lifecycle_is_profile_scoped_idempotent_and_terminal() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let mut store: Store = Store::open_for_write(&root.path().join("state")).unwrap();
+        let workspace_ref: WorkspaceRef = workspace(workspace_dir.path());
+        let pair: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer"),
+            )
+            .unwrap();
+        let profile_a: [u8; 32] = [10u8; 32];
+        let profile_b: [u8; 32] = [11u8; 32];
+        let native_a: &str = "018f0000-0000-7000-8000-000000000010";
+        let native_a_discarded: &str = "018f0000-0000-7000-8000-000000000011";
+        let native_b: &str = "018f0000-0000-7000-8000-000000000012";
+        let native_a_replacement: &str = "018f0000-0000-7000-8000-000000000013";
+
+        let first: ChildSessionRecord = store
+            .ensure_child_session(&pair.pair_key, ChildKind::Claude, &profile_a, native_a)
+            .unwrap();
+        let repeated: ChildSessionRecord = store
+            .ensure_child_session(
+                &pair.pair_key,
+                ChildKind::Claude,
+                &profile_a,
+                native_a_discarded,
+            )
+            .unwrap();
+        assert_eq!(first, repeated);
+        assert_eq!(repeated.native_id, native_a);
+
+        let different_profile: ChildSessionRecord = store
+            .ensure_child_session(&pair.pair_key, ChildKind::Claude, &profile_b, native_b)
+            .unwrap();
+        assert_eq!(different_profile.native_id, native_b);
+        store
+            .mark_child_session_active(&pair.pair_key, native_a)
+            .unwrap();
+        assert_eq!(
+            store
+                .live_child_session(&pair.pair_key, ChildKind::Claude, &profile_a)
+                .unwrap()
+                .unwrap()
+                .status,
+            ChildSessionStatus::Active
+        );
+
+        store
+            .retire_child_session(
+                &pair.pair_key,
+                native_a,
+                ChildSessionRetirement::ProfileChanged,
+            )
+            .unwrap();
+        assert!(
+            store
+                .live_child_session(&pair.pair_key, ChildKind::Claude, &profile_a)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            store
+                .mark_child_session_active(&pair.pair_key, native_a)
+                .unwrap_err(),
+            StoreError::ChildSessionNotLive(id) if id == native_a
+        ));
+        let replacement: ChildSessionRecord = store
+            .ensure_child_session(
+                &pair.pair_key,
+                ChildKind::Claude,
+                &profile_a,
+                native_a_replacement,
+            )
+            .unwrap();
+        assert_eq!(replacement.native_id, native_a_replacement);
+
+        store
+            .retire_child_session(
+                &pair.pair_key,
+                native_b,
+                ChildSessionRetirement::ProviderRejected,
+            )
+            .unwrap();
+        let sessions: Vec<ChildSessionRecord> = store.list_child_sessions(&pair.pair_key).unwrap();
+        assert_eq!(sessions.len(), 3);
+        assert!(sessions.iter().any(|session: &ChildSessionRecord| {
+            session.native_id == native_a
+                && session.status == ChildSessionStatus::Retired
+                && session.retired_reason == Some(ChildSessionRetirement::ProfileChanged)
+        }));
+        assert!(sessions.iter().any(|session: &ChildSessionRecord| {
+            session.native_id == native_b
+                && session.status == ChildSessionStatus::Invalid
+                && session.retired_reason == Some(ChildSessionRetirement::ProviderRejected)
+        }));
+
+        let malformed_error: StoreError = store
+            .ensure_child_session(
+                &pair.pair_key,
+                ChildKind::Claude,
+                &[12u8; 32],
+                "not-a-uuid-but-exactly-36-characters!",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            malformed_error,
+            StoreError::CorruptChildSessionNativeId(_)
+        ));
+        assert_eq!(store.list_child_sessions(&pair.pair_key).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn child_session_link_is_pending_and_pair_scoped_and_pair_delete_cascades() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let mut store: Store = Store::open_for_write(&root.path().join("state")).unwrap();
+        let workspace_ref: WorkspaceRef = workspace(workspace_dir.path());
+        let pair_a: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer-a"),
+            )
+            .unwrap();
+        let pair_b: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer-b"),
+            )
+            .unwrap();
+        let native_a: &str = "018f0000-0000-7000-8000-000000000020";
+        store
+            .ensure_child_session(&pair_a.pair_key, ChildKind::Claude, &[20u8; 32], native_a)
+            .unwrap();
+        assert!(matches!(
+            store
+                .mark_child_session_active(&pair_b.pair_key, native_a)
+                .unwrap_err(),
+            StoreError::ChildSessionNotLive(id) if id == native_a
+        ));
+        let invocation_a: BegunInvocation = store
+            .begin_invocation(
+                &pair_a.pair_key,
+                42,
+                [20u8; 32],
+                "claude",
+                ChildKind::Claude,
+                "test",
+                sample_body(b"request-a"),
+            )
+            .unwrap();
+        let invocation_b: BegunInvocation = store
+            .begin_invocation(
+                &pair_b.pair_key,
+                42,
+                [21u8; 32],
+                "claude",
+                ChildKind::Claude,
+                "test",
+                sample_body(b"request-b"),
+            )
+            .unwrap();
+
+        store
+            .link_invocation_child_session(&invocation_a.invocation_id, native_a)
+            .unwrap();
+        assert!(matches!(
+            store
+                .link_invocation_child_session(&invocation_b.invocation_id, native_a)
+                .unwrap_err(),
+            StoreError::ChildSessionPairMismatch {
+                invocation_id,
+                native_id,
+            } if invocation_id == invocation_b.invocation_id && native_id == native_a
+        ));
+        assert!(matches!(
+            store
+                .link_invocation_child_session(
+                    &invocation_b.invocation_id,
+                    "018f0000-0000-7000-8000-000000000099",
+                )
+                .unwrap_err(),
+            StoreError::ChildSessionNotFound(_)
+        ));
+
+        store
+            .complete_invocation(
+                &invocation_a.invocation_id,
+                ExitOutcome::Exited { code: 0 },
+                sample_body(b"response-a"),
+            )
+            .unwrap();
+        assert!(matches!(
+            store
+                .link_invocation_child_session(&invocation_a.invocation_id, native_a)
+                .unwrap_err(),
+            StoreError::InvocationNotPending(id) if id == invocation_a.invocation_id
+        ));
+
+        assert!(store.delete_pair(&pair_a.pair_key).unwrap());
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM child_sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(store.contains_pair(&pair_b.pair_key).unwrap());
+    }
+
+    #[test]
+    fn incompatible_profile_versions_are_listed_but_never_reused() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let mut store: Store = Store::open_for_write(&root.path().join("state")).unwrap();
+        let workspace_ref: WorkspaceRef = workspace(workspace_dir.path());
+        let pair: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer"),
+            )
+            .unwrap();
+        let pair_id: i64 = find_pair_id(&store.conn, &pair.pair_key).unwrap().unwrap();
+        let profile_hash: [u8; 32] = [30u8; 32];
+        store
+            .conn
+            .execute(
+                "INSERT INTO child_sessions (
+                     pair_id, child_kind, profile_hash, profile_schema_version,
+                     native_id, status, created_at, last_seen
+                 ) VALUES (?1, 'claude', ?2, 99, ?3, 'active', 1000, 1000)",
+                params![
+                    pair_id,
+                    profile_hash.as_slice(),
+                    "018f0000-0000-7000-8000-000000000030",
+                ],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .live_child_session(&pair.pair_key, ChildKind::Claude, &profile_hash)
+                .unwrap()
+                .is_none()
+        );
+        let listed: Vec<ChildSessionRecord> = store.list_child_sessions(&pair.pair_key).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].profile_schema_version, 99);
+
+        let current: ChildSessionRecord = store
+            .ensure_child_session(
+                &pair.pair_key,
+                ChildKind::Claude,
+                &profile_hash,
+                "018f0000-0000-7000-8000-000000000031",
+            )
+            .unwrap();
+        assert_eq!(
+            current.profile_schema_version,
+            i64::from(COMMAND_PROFILE_SCHEMA_VERSION)
+        );
+        assert_eq!(store.list_child_sessions(&pair.pair_key).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn child_session_rows_fail_closed_on_corrupt_typed_fields() {
+        fn row() -> ChildSessionRow {
+            (
+                "018f0000-0000-7000-8000-000000000040".to_string(),
+                "claude".to_string(),
+                vec![40u8; 32],
+                i64::from(COMMAND_PROFILE_SCHEMA_VERSION),
+                "assigned".to_string(),
+                1000,
+                1000,
+                None,
+                None,
+            )
+        }
+
+        let mut bad_status: ChildSessionRow = row();
+        bad_status.4 = "mystery".to_string();
+        assert!(matches!(
+            child_session_record_from_row(bad_status).unwrap_err(),
+            StoreError::CorruptChildSessionStatus(status) if status == "mystery"
+        ));
+
+        let mut bad_reason: ChildSessionRow = row();
+        bad_reason.4 = "retired".to_string();
+        bad_reason.7 = Some(1001);
+        bad_reason.8 = Some("mystery".to_string());
+        assert!(matches!(
+            child_session_record_from_row(bad_reason).unwrap_err(),
+            StoreError::CorruptChildSessionRetirement(reason) if reason == "mystery"
+        ));
+
+        let mut bad_hash: ChildSessionRow = row();
+        bad_hash.2 = vec![40u8; 31];
+        assert!(matches!(
+            child_session_record_from_row(bad_hash).unwrap_err(),
+            StoreError::CorruptDigest("profile_hash")
+        ));
+
+        let mut bad_native_id: ChildSessionRow = row();
+        bad_native_id.0 = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".to_string();
+        assert!(matches!(
+            child_session_record_from_row(bad_native_id).unwrap_err(),
+            StoreError::CorruptChildSessionNativeId(_)
+        ));
+
+        let mut bad_version: ChildSessionRow = row();
+        bad_version.3 = 0;
+        assert!(matches!(
+            child_session_record_from_row(bad_version).unwrap_err(),
+            StoreError::CorruptProfileSchemaVersion(0)
+        ));
+
+        let mut bad_lifecycle: ChildSessionRow = row();
+        bad_lifecycle.8 = Some("profile_changed".to_string());
+        assert!(matches!(
+            child_session_record_from_row(bad_lifecycle).unwrap_err(),
+            StoreError::CorruptChildSessionLifecycle
+        ));
     }
 
     #[test]
