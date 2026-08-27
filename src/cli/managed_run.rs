@@ -75,6 +75,14 @@ pub(crate) fn execute(
                 return wrapper_error_exit();
             }
         };
+    if !passthrough
+        && let Some(kind) = child_kind
+        && let Err(adapter_error) =
+            child::validate_managed_task_input(kind, request.args, request.caller_stdin)
+    {
+        let _ = writeln!(err, "subagent: {adapter_error}");
+        return wrapper_error_exit();
+    }
 
     let max_context_bytes: u64 = request
         .max_context_bytes

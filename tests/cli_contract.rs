@@ -173,10 +173,47 @@ fn fake_child_is_never_spawned_during_dry_run() {
 }
 
 #[cfg(unix)]
+#[test]
+fn ambiguous_claude_prompt_after_provider_option_fails_before_spawn() {
+    let state_dir = isolated_state_dir();
+    let temp_dir = isolated_state_dir();
+    let canary_path: PathBuf = temp_dir.path().join("canary");
+    let script_path: PathBuf = write_named_canary_script(temp_dir.path(), &canary_path, "claude");
+
+    subagent_with_resolvable_supervisor(state_dir.path())
+        .arg("--id")
+        .arg("claude-haiku-reviewer")
+        .arg("--")
+        .arg(&script_path)
+        .args([
+            "-p",
+            "--model",
+            "haiku",
+            "--allowedTools",
+            "Read",
+            "review the current diff",
+        ])
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("immediately after `-p`"));
+
+    assert!(
+        !canary_path.exists(),
+        "ambiguous Claude invocation reached the child process"
+    );
+}
+
+#[cfg(unix)]
 fn write_canary_script(dir: &Path, canary_path: &Path) -> PathBuf {
+    write_named_canary_script(dir, canary_path, "fake-child.sh")
+}
+
+#[cfg(unix)]
+fn write_named_canary_script(dir: &Path, canary_path: &Path, name: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
-    let script_path = dir.join("fake-child.sh");
+    let script_path: PathBuf = dir.join(name);
     fs::write(
         &script_path,
         format!("#!/bin/sh\ntouch '{}'\n", canary_path.display()),

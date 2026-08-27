@@ -19,6 +19,7 @@ const COMMAND_DIGEST_DOMAIN: &[u8] = b"subagent.command.v1\n";
 pub(crate) enum ChildAdapterError {
     UnsupportedProgram(OsString),
     ClaudeRequiresPrintMode,
+    ClaudePromptPlacementAmbiguous,
     NativeSessionContinuityUnavailable(&'static str),
     CodexRequiresExec,
     CodexExecSubcommandUnsupported(&'static str),
@@ -37,6 +38,12 @@ impl fmt::Display for ChildAdapterError {
                 f,
                 "managed Claude execution requires `claude -p` or `claude --print`; \
                  interactive Claude mode is not supported"
+            ),
+            ChildAdapterError::ClaudePromptPlacementAmbiguous => write!(
+                f,
+                "managed Claude execution requires the task immediately after \
+                 `-p`/`--print`, after an explicit `--`, or through caller stdin; \
+                 a trailing task after provider options is ambiguous"
             ),
             ChildAdapterError::NativeSessionContinuityUnavailable(flag) => write!(
                 f,
@@ -75,6 +82,27 @@ pub(crate) fn recognize_managed_child(
             program.to_os_string(),
         ))
     }
+}
+
+/// Rejects Claude argv that require guessing where provider option values end
+/// and the task begins. Caller stdin is unambiguous and remains valid.
+///
+/// This validation is for managed execution only. Explicit no-context,
+/// no-record passthrough deliberately preserves provider behavior unchanged.
+pub(crate) fn validate_managed_task_input(
+    kind: ChildKind,
+    args: &[OsString],
+    caller_stdin: &[u8],
+) -> Result<(), ChildAdapterError> {
+    if kind != ChildKind::Claude || !caller_stdin.is_empty() {
+        return Ok(());
+    }
+    if claude_prompt_immediately_after_print(args).is_some()
+        || explicit_separator_prompt(args, 0).is_some()
+    {
+        return Ok(());
+    }
+    Err(ChildAdapterError::ClaudePromptPlacementAmbiguous)
 }
 
 /// Projects the user-authored task text from a recognized provider command.
@@ -123,13 +151,18 @@ fn likely_positional_prompt(kind: ChildKind, args: &[OsString]) -> Option<&OsStr
         return None;
     }
 
-    if let Some(separator_index) = args[first_index..]
-        .iter()
-        .position(|argument: &OsString| argument == OsStr::new("--"))
+    if kind == ChildKind::Claude
+        && let Some(prompt) = claude_prompt_immediately_after_print(args)
     {
-        return args
-            .get(first_index + separator_index + 1)
-            .map(OsString::as_os_str);
+        return Some(prompt);
+    }
+
+    if let Some(prompt) = explicit_separator_prompt(args, first_index) {
+        return Some(prompt);
+    }
+
+    if kind == ChildKind::Claude {
+        return None;
     }
 
     let mut index: usize = args.len();
@@ -146,6 +179,26 @@ fn likely_positional_prompt(kind: ChildKind, args: &[OsString]) -> Option<&OsStr
         return Some(argument);
     }
     None
+}
+
+fn claude_prompt_immediately_after_print(args: &[OsString]) -> Option<&OsStr> {
+    let print_index: usize = args.iter().position(|argument: &OsString| {
+        argument == OsStr::new("-p") || argument == OsStr::new("--print")
+    })?;
+    let candidate: &OsStr = args.get(print_index + 1)?.as_os_str();
+    if candidate == OsStr::new("-") || looks_like_option(candidate) {
+        None
+    } else {
+        Some(candidate)
+    }
+}
+
+fn explicit_separator_prompt(args: &[OsString], first_index: usize) -> Option<&OsStr> {
+    let separator_index: usize = args[first_index..]
+        .iter()
+        .position(|argument: &OsString| argument == OsStr::new("--"))?;
+    args.get(first_index + separator_index + 1)
+        .map(OsString::as_os_str)
 }
 
 fn looks_like_option(argument: &OsStr) -> bool {
@@ -165,7 +218,9 @@ fn option_takes_value(kind: ChildKind, option: &OsStr) -> bool {
                     | "--fallback-model"
                     | "--tools"
                     | "--allowedTools"
+                    | "--allowed-tools"
                     | "--disallowedTools"
+                    | "--disallowed-tools"
                     | "--permission-mode"
                     | "--permission-prompt-tool"
                     | "--output-format"
@@ -370,10 +425,10 @@ mod tests {
             ChildKind::Claude,
             &args(&[
                 "-p",
+                "review the current diff",
                 "--model",
                 "haiku",
                 "--no-session-persistence",
-                "review the current diff",
             ]),
             &[],
         );
@@ -393,6 +448,99 @@ mod tests {
             &[],
         );
         assert_eq!(codex, b"summarize these findings");
+    }
+
+    #[test]
+    fn projects_claude_prompt_before_variadic_tool_options() {
+        let claude: Vec<u8> = project_task_request(
+            ChildKind::Claude,
+            &args(&[
+                "-p",
+                "review the current diff",
+                "--model",
+                "haiku",
+                "--tools",
+                "Read,Bash",
+                "--allowedTools",
+                "Read",
+                "Bash(rg *)",
+                "--disallowedTools",
+                "Edit",
+                "Write",
+            ]),
+            &[],
+        );
+        assert_eq!(claude, b"review the current diff");
+    }
+
+    #[test]
+    fn rejects_ambiguous_claude_prompt_after_provider_options() {
+        let arguments: Vec<OsString> = args(&[
+            "-p",
+            "--model",
+            "haiku",
+            "--allowedTools",
+            "Read",
+            "review the current diff",
+        ]);
+        assert_eq!(
+            validate_managed_task_input(ChildKind::Claude, &arguments, &[]),
+            Err(ChildAdapterError::ClaudePromptPlacementAmbiguous)
+        );
+        assert_eq!(
+            project_task_request(ChildKind::Claude, &arguments, &[]),
+            b"[request text unavailable; exact child command retained only as a digest]"
+        );
+
+        let alias_arguments: Vec<OsString> =
+            args(&["-p", "--allowed-tools", "Read", "review the current diff"]);
+        assert_eq!(
+            validate_managed_task_input(ChildKind::Claude, &alias_arguments, &[]),
+            Err(ChildAdapterError::ClaudePromptPlacementAmbiguous)
+        );
+
+        let future_option_arguments: Vec<OsString> = args(&[
+            "-p",
+            "--future-variadic-option",
+            "value",
+            "review the current diff",
+        ]);
+        assert_eq!(
+            validate_managed_task_input(ChildKind::Claude, &future_option_arguments, &[]),
+            Err(ChildAdapterError::ClaudePromptPlacementAmbiguous)
+        );
+    }
+
+    #[test]
+    fn caller_stdin_is_unambiguous_with_claude_provider_options() {
+        let arguments: Vec<OsString> = args(&["-p", "--model", "haiku", "--allowedTools", "Read"]);
+        assert_eq!(
+            validate_managed_task_input(ChildKind::Claude, &arguments, b"review the current diff"),
+            Ok(())
+        );
+        assert_eq!(
+            project_task_request(ChildKind::Claude, &arguments, b"review the current diff"),
+            b"review the current diff"
+        );
+    }
+
+    #[test]
+    fn explicit_separator_makes_trailing_claude_prompt_unambiguous() {
+        let arguments: Vec<OsString> = args(&[
+            "-p",
+            "--allowedTools",
+            "Read",
+            "--",
+            "review the current diff",
+        ]);
+        assert_eq!(
+            validate_managed_task_input(ChildKind::Claude, &arguments, &[]),
+            Ok(())
+        );
+        assert_eq!(
+            project_task_request(ChildKind::Claude, &arguments, &[]),
+            b"review the current diff"
+        );
     }
 
     #[test]

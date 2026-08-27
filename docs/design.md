@@ -26,7 +26,7 @@ For example:
 
 ```sh
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
-subagent --id claude-opus-architect -- claude -p --model opus "Review this design"
+subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
 ```
 
 The CLI gives a subordinate access to:
@@ -656,6 +656,24 @@ profile hash includes provider, executable identity, model selection, working
 directory, persistent system-prompt options, and relevant permission mode. A
 profile change starts a new child runtime session while retaining pair history.
 
+### 13.4 Claude prompt placement
+
+Several Claude Code options accept variable-length value lists, including tool,
+directory, beta, file, and MCP configuration options in the currently installed
+CLI. A positional task after provider options is therefore ambiguous and may be
+consumed as another option value. The canonical direct and managed form places
+the task immediately after `-p`/`--print`, before provider options. Caller stdin
+is the alternative when no positional task is used.
+
+Managed execution validates this invariant before persistence or child spawn.
+It accepts only a task immediately after `-p`/`--print`, a task after an
+explicit `--`, or caller stdin; it does not infer a Claude task from a trailing
+argument after provider options. This stricter grammar remains safe when Claude
+adds another variadic option. An ambiguous form fails with wrapper exit `125`;
+explicit `--context none --no-record` passthrough retains the provider's native
+parsing behavior. Implementations construct child commands as argument vectors
+and do not reconstruct a shell command string.
+
 ## 14. Process and output semantics
 
 Before spawn, wrapper errors use exit status `125`. In required context mode,
@@ -782,21 +800,30 @@ fallback rate, and summary usefulness. FreeToken/Qwen support follows the
 provider-neutral, implementation-deferred decision in
 [ADR 0001](adr/0001-freetoken-openai-compatible-local-inference.md).
 
-### Slice 2: history adapters
+### Slice 2: Claude runtime continuity
 
-- Codex app-server `thread/read` adapter (implemented);
-- Claude Code hook registry and transcript adapter;
+- schema migration adding provider-native child sessions;
+- command-profile compatibility hashing;
+- caller-assigned Claude session IDs and exact resume;
+- explicit `--fresh` recovery with no silent same-invocation fallback; and
+- continuity provenance on every invocation.
+
+### Slice 3: remaining history and nested delegation
+
+- Claude Code exact-session transcript adapter;
 - normalized projection, redaction, cursoring, and provenance;
+- managed-child ancestor environment cleanup;
+- nested managed delegation manifests; and
 - corrupt, partial, and unknown-format fixtures.
 
-### Slice 3: runtime continuity
+### Slice 4: durability and recovery
 
-- Claude Code assigned-session and resume path;
-- command-profile compatibility;
-- nested managed delegation manifests;
-- crash recovery for pending invocations.
+- crash recovery for pending invocations;
+- orphan capsule garbage collection and retention;
+- completion-failure provenance; and
+- redaction hardening, including non-UTF-8 bodies.
 
-### Slice 4: app-server-managed Codex execution
+### Slice 5: app-server-managed Codex execution
 
 - app-server-driven child thread start/resume;
 - exact child thread observation;
@@ -805,7 +832,7 @@ provider-neutral, implementation-deferred decision in
 The provider-neutral MVP already supports the compatibility `codex exec` path;
 this slice is specifically the native app-server resume and observation layer.
 
-### Slice 5: optional model summaries
+### Slice 6: optional model summaries
 
 - tool-free configurable summarizer command;
 - incremental structured summaries;
@@ -847,3 +874,22 @@ this slice is specifically the native app-server resume and observation layer.
 Provider adapters must be checked against the installed CLI version at runtime.
 The output of `--help` is capability evidence for that installation, not a
 permanent substitute for the provider's documented interface.
+
+## 20. Release targets
+
+Version 0.2 is the usable continuity release. It requires Linux and macOS CI,
+Claude assigned-session resume with explicit failure recovery, and supervisor
+history for both Codex and Claude supervisors. No accepted CLI flag may remain
+inert. Exact Codex child resume remains documented as unavailable in the
+compatibility execution path.
+
+Version 0.5 is the durability beta. It adds immediate-supervisor selection for
+nested delegation, verified capsule reachability, crash recovery, garbage
+collection, and schema migration coverage from every previously released
+version.
+
+Version 1.0 freezes the CLI, pair-key, ledger, capsule, report, and exit-status
+contracts. It includes the security hardening acceptance matrix and an opt-in
+app-server Codex execution mode for exact native child resume, while preserving
+the byte-transparent `codex exec` compatibility mode as the default. Model
+summarization remains optional and is not a release gate.

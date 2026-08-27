@@ -39,6 +39,12 @@ and native resume. The Claude reference replaces the separate
 `claude-code-subagent` skill without forcing Claude-specific details into every
 use of this skill.
 
+When invoking Claude Code, put the task immediately after `-p`/`--print`, after
+an explicit `--`, or send it through stdin. Never put a positional task after
+provider options: several current options accept variable-length lists, and a
+future option may do the same. Construct argv as separate arguments rather than
+concatenating one shell command string.
+
 ## Decide whether it helps
 
 Prefer `subagent` when at least one of these is true:
@@ -120,7 +126,7 @@ the historical boundary with an explicit one-way handoff:
 ```sh
 subagent --id claude-haiku-architect \
   --inherit-from gpt-luna-architect -- \
-  claude -p --model haiku "Continue the architecture work"
+  claude -p "Continue the architecture work" --model haiku
 ```
 
 The source must already exist in the same workspace and immediate supervisor
@@ -139,7 +145,7 @@ command as an argument vector:
 
 ```sh
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
-subagent --id claude-opus-architect -- claude -p --model opus "Review this design"
+subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
 ```
 
 For interface inspection without starting the child:
@@ -157,7 +163,7 @@ For an actual managed run, use only the recognized MVP shapes:
 
 ```sh
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
-subagent --id claude-opus-architect -- claude -p --model opus "Review this design"
+subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
 ```
 
 The wrapper preserves provider argv and prepends the capsule location plus a

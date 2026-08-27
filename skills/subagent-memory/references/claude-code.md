@@ -41,6 +41,45 @@ agent, default to `--output-format json`. Read the answer from `result`,
 schema-constrained data from `structured_output`, and the resumable identifier
 from `session_id`. Check the process exit status as well as the JSON payload.
 
+### Construct argv without losing the prompt
+
+Put a positional task immediately after `-p`/`--print`, before all other
+options. In the currently installed CLI, `--add-dir`,
+`--allowedTools`/`--allowed-tools`, `--betas`,
+`--disallowedTools`/`--disallowed-tools`, `--file`, `--mcp-config`, and
+`--tools` accept variable-length lists. A task placed after one of them can be
+consumed as another list value, leaving print mode with no prompt. Do not depend
+on this list remaining complete; the immediate form, an explicit `--`, or stdin
+avoids guessing when provider flags change.
+
+Safe:
+
+```sh
+claude -p "Review the current diff" \
+  --model opus \
+  --output-format json \
+  --tools "Read,Bash" \
+  --allowedTools "Read" "Bash(rg *)"
+```
+
+Unsafe:
+
+```sh
+# "Review the current diff" may be parsed as another allowed-tool pattern.
+claude -p \
+  --model opus \
+  --allowedTools "Read" "Bash(rg *)" \
+  "Review the current diff"
+```
+
+Caller stdin is the safe alternative when the task should not be a process
+argument. When constructing a command programmatically, pass an argv array
+(`std::process::Command::args`, `execve` arguments, or a shell array); do not
+join quoted fragments into one shell string. Treat an argument-parsing error as
+a failed invocation with no resumable child session, and never invent or reuse
+a session ID unless the provider actually returned or was assigned that exact
+ID.
+
 Use `--json-schema` when downstream logic requires validated fields. Use
 `stream-json` only for genuinely incremental consumers and treat its final
 result event as completion.
@@ -55,26 +94,26 @@ Read-only example:
 
 ```sh
 claude -p \
+  "Review the current changes. Do not modify the workspace. Cite file paths and verification evidence." \
   --model opus \
   --output-format json \
   --permission-mode dontAsk \
   --tools "Read,Bash" \
   --allowedTools "Read" "Bash(rg *)" "Bash(git status *)" "Bash(git diff *)" \
-  --disallowedTools "Edit" "Write" "Bash(git push *)" "Bash(git reset *)" "Bash(rm *)" "mcp__*" \
-  "Review the current changes. Do not modify the workspace. Cite file paths and verification evidence."
+  --disallowedTools "Edit" "Write" "Bash(git push *)" "Bash(git reset *)" "Bash(rm *)" "mcp__*"
 ```
 
 Bounded implementation example, only after edit authority is established:
 
 ```sh
 claude -p \
+  "Implement only the requested change, preserve unrelated work, run the allowed checks, and report changed files and risks. Do not commit or push." \
   --model sonnet \
   --output-format json \
   --permission-mode dontAsk \
   --tools "Read,Edit,Write,Bash" \
   --allowedTools "Read" "Edit" "Write" "Bash(git status *)" "Bash(git diff *)" "Bash(cargo test *)" \
-  --disallowedTools "Bash(git push *)" "Bash(git reset *)" "Bash(rm *)" "mcp__*" \
-  "Implement only the requested change, preserve unrelated work, run the allowed checks, and report changed files and risks. Do not commit or push."
+  --disallowedTools "Bash(git push *)" "Bash(git reset *)" "Bash(rm *)" "mcp__*"
 ```
 
 `--tools` limits available built-in tools. `--allowedTools` pre-approves matching

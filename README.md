@@ -27,7 +27,7 @@ lives alongside equivalent Codex guidance under this repository.
 ```sh
 # GPT-family examples first by project convention
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
-subagent --id claude-opus-architect -- claude -p --model opus "Review this design"
+subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
 ```
 
 The same `--id`, canonical working directory, and supervisor conversation reuse
@@ -67,12 +67,35 @@ conversation; the edge persists, so later calls need only the new ID:
 ```sh
 subagent --id claude-haiku-architect \
   --inherit-from gpt-luna-architect -- \
-  claude -p --model haiku "Continue the architecture work"
+  claude -p "Continue the architecture work" --model haiku
 ```
 
 Everything after the first literal `--` is passed to the provider CLI without
 wrapper parsing. Managed mode currently recognizes `codex exec` and
 `claude -p`/`claude --print`.
+
+### Claude Code argument safety
+
+Place the Claude task immediately after `-p`/`--print`, before any provider
+options:
+
+```sh
+claude -p "Review the current diff" \
+  --model opus \
+  --output-format json \
+  --tools "Read,Bash" \
+  --allowedTools "Read" "Bash(rg *)"
+```
+
+Do not put the task after provider options. In particular, `--add-dir`,
+`--allowedTools`/`--allowed-tools`, `--betas`,
+`--disallowedTools`/`--disallowed-tools`, `--file`, `--mcp-config`, and
+`--tools` accept variable-length lists in the currently installed Claude Code
+CLI and may consume the task as another list entry. Managed `subagent` runs do
+not guess against this evolving grammar: they accept the immediate form above,
+an explicit `--` separator, or caller stdin, and reject other trailing-task
+forms before starting Claude. Programmatic callers should build an argument
+vector rather than one shell command string.
 
 Pair history records the task prompt and caller stdin, not provider launch flags.
 The exact child command remains correlatable through a digest without repeatedly
@@ -87,7 +110,7 @@ subagent --id gpt-luna-reviewer --summarizer luna -- \
 
 subagent --id claude-haiku-reviewer --summarizer haiku \
   --summarize-above-bytes 32768 -- \
-  claude -p --model haiku "Continue the review"
+  claude -p "Continue the review" --model haiku
 ```
 
 The summarizer receives redacted historical text. Short history never starts a
