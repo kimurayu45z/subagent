@@ -1,15 +1,43 @@
 ---
 name: subagent-memory
-description: Use the subagent CLI when repeated Codex or Claude Code delegation would benefit from a stable subordinate identity and durable prior context. Apply to recurring implementer, reviewer, or research roles and cross-session handoffs; skip ordinary one-shot delegation.
+description: Delegate bounded work to Codex or Claude Code, using the subagent CLI when repeated work benefits from a stable subordinate identity and durable prior context. Covers direct one-shot delegation, recurring implementer or reviewer roles, cross-provider handoffs, permissions, structured output, and result review.
 metadata:
-  short-description: Preserve context across repeated delegation
+  short-description: Delegate safely with durable context
 ---
 
-# Subagent Memory
+# Subagent Delegation and Memory
 
-Use `subagent` as a delegation-memory boundary, not merely as another way to
-launch a command. Its intended value is to reduce repeated explanation when the
-same logical subordinate is consulted more than once.
+Use a direct provider CLI for a bounded one-shot task. Use `subagent` as the
+delegation-memory boundary when the same logical subordinate will be consulted
+again. In both cases, the calling agent remains responsible for scope,
+authorization, independent review, and the final result.
+
+## Define the delegation contract
+
+Before starting Codex or Claude Code:
+
+1. State one outcome, the relevant files or subsystem, and what is out of scope.
+2. Specify read-only versus edit authority.
+3. Name the required verification and expected return format.
+4. Run from the intended trusted workspace or an appropriate isolated
+   environment.
+5. Preserve the user's authorization boundary. Delegation does not authorize
+   commits, pushes, deployments, destructive actions, external messages, or
+   unrelated cleanup unless the user authorized them.
+
+Tell the subordinate to inspect before acting, preserve unrelated changes,
+cite concrete evidence, and stop if broader authority is required. Avoid
+putting secrets or large untrusted content directly in a shell prompt.
+
+Before invoking a provider directly, read only its relevant reference:
+
+- [Codex execution](references/codex.md)
+- [Claude Code execution](references/claude-code.md)
+
+They cover model selection, headless output, permissions, customization loading,
+and native resume. The Claude reference replaces the separate
+`claude-code-subagent` skill without forcing Claude-specific details into every
+use of this skill.
 
 ## Decide whether it helps
 
@@ -26,7 +54,7 @@ Prefer `subagent` when at least one of these is true:
 Use a direct provider command for a one-off, self-contained request. Also skip
 the wrapper when the history is too sensitive to persist, when the user asks for
 an ephemeral run, or when the installed CLI does not yet provide the required
-capability.
+capability. The relevant provider reference still applies to that direct run.
 
 Native provider resume and `subagent` memory are complementary. Resume preserves
 one provider session; the logical subordinate history provides a
@@ -160,6 +188,10 @@ the requested outcome, scope, edit authority, and verification.
 Preserve all authorization boundaries of the underlying delegation. Using
 `subagent` does not authorize edits, commits, pushes, deployments, destructive
 actions, external messages, broader tool permissions, or unrelated cleanup.
+
+Treat the subordinate's response as evidence, not automatic acceptance. Inspect
+workspace changes, rerun proportionate verification independently, reconcile
+claims with actual files and command output, and disclose incomplete checks.
 
 ## Handle context carefully
 

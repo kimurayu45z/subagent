@@ -10,6 +10,18 @@ cargo install --path .
 subagent doctor
 ```
 
+Install the bundled Codex skill for safe one-shot delegation and durable
+repeated-subagent memory:
+
+```sh
+npx skills add kimurayu45z/subagent -g --agent codex \
+  --skill subagent-memory -y --copy
+```
+
+This skill supersedes the former `claude-code-subagent` skill from
+`kimurayu45z/codex-claude-subagent`; its Claude Code execution guidance now
+lives alongside equivalent Codex guidance under this repository.
+
 ## Run
 
 ```sh
