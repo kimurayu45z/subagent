@@ -2,7 +2,7 @@
 
 Status: Draft, canonical
 
-Implementation milestone: managed Claude workstream continuity
+Implementation milestone: managed Codex and Claude workstream continuity
 
 This document is the current normative design for `subagent`. Dated discussion,
 alternatives, and decision history belong under `docs/meeting-notes/` and do not
@@ -146,13 +146,13 @@ disabled.
 `ChildRuntimeSession` is a provider-native session handle used for `--resume`
 or the equivalent API. It may rotate without changing `SubagentId`.
 
-Managed Claude resume requires an explicit `WorkstreamId`, representing
-one intentional chain of follow-up assignments. `WorkstreamId` does not enter
+Managed native resume requires an explicit `WorkstreamId`, representing one
+intentional chain of follow-up assignments. `WorkstreamId` does not enter
 `PairKey`: the pair remains the durable role-level audit boundary, while the
 resume key is `(pair, workstream, child kind, profile schema version, profile
 hash)`. The live uniqueness key is `(pair, child kind, workstream)`; profile
 schema and hash are compatibility checks rather than parallel live lanes. A
-Claude invocation without a workstream uses untracked provider continuity. A
+provider invocation without a workstream uses untracked native continuity. A
 workstream must select exactly one of `--fresh` or `--resume`. A resume request
 whose exact active compatible session cannot be proved fails closed before
 spawn; it never silently starts a fresh session in the same invocation.
@@ -363,12 +363,15 @@ For each managed run, `subagent` performs the following sequence:
 6. Redact and normalize all context before persistence or injection.
 7. Build or update the selected summary artifact.
 8. Materialize a per-run context capsule.
-9. Resolve an exact active child runtime session for `--resume`, or allocate and
-   persist a caller-assigned session for `--fresh`.
+9. Resolve an exact active child runtime session for `--resume`. For `--fresh`,
+   assign Claude's caller-controlled ID before spawn or observe Codex's native
+   thread ID after the child starts.
 10. Record and link the pending invocation, then spawn the child.
-11. Forward signals and stream child stdout and stderr without adding wrapper
-    output to stdout.
-12. Promote a successful fresh Claude session from `assigned` to `active`.
+11. Forward signals and stderr. Stream ordinary stdout; for a tracked Codex
+    workstream, buffer bounded JSONL and render its final agent message unless
+    the caller explicitly requested raw `--json`.
+12. Promote a successfully confirmed native session from `assigned` to
+    `active`.
 13. Record the final response, exit state, duration, context provenance, and
     child runtime handle in one completion transaction.
 
@@ -379,11 +382,11 @@ stdin, without provider executable names or launch flags. The exact child argv
 is represented only by its command digest. A pending invocation is excluded
 from its own context capsule.
 
-Codex supervisor-history reading is implemented for step 5, and managed Claude
-assigned-session start/resume is implemented for steps 9, 10, and 12. Cached
-incremental summaries and managed Codex native runtime resume remain
-unavailable. For a Codex
-supervisor, `--context all` enriches pair history on a best-effort basis;
+Codex supervisor-history reading is implemented for step 5. Managed Claude
+assigned-session start/resume and managed Codex observed-thread start/resume are
+implemented for steps 9 through 12. Cached incremental summaries remain
+unavailable. For a Codex supervisor, `--context all` enriches pair history on a
+best-effort basis;
 `--context supervisor --context-mode required` fails before spawning the
 delegated child when the exact thread cannot be read safely. Claude supervisor
 history remains explicitly unavailable until its transcript adapter lands.
@@ -684,13 +687,39 @@ row transactionally. Dry-run never assigns, retires, links, or spawns.
 
 The MVP recognizes `codex exec` and injects the bootstrap through stdin, which
 Codex appends as a distinct input block when a positional prompt is present.
-Caller-provided stdin is preserved after an explicit delimiter.
+Caller-provided stdin is preserved after an explicit delimiter. Without a
+workstream, this compatibility path retains the ordinary streaming stdout and
+caller argv contract and does not infer native continuity.
 
-Native Codex continuity requires an exact observed thread ID. Managed execution
-through app-server is the preferred long-term implementation. Until that is
-implemented, the pair ledger and context capsule provide provider-independent
-continuity, and the runtime session is reported as `unavailable`; the adapter
-must not guess by filesystem recency.
+With `--workstream ID --fresh` or `--resume`, the managed adapter requires the
+task immediately after `exec`, after an explicit `--`, or through caller stdin.
+It rejects `--ephemeral`. It adds `--json` unless the caller already supplied
+it, captures at most 32 MiB of JSONL transport, validates the UUID in
+`thread.started`, and requires a completed, non-failed turn with a final agent
+message before marking continuity active. Fresh persists the observed thread ID
+only after the child runs. Resume passes the exact stored ID to `codex exec
+resume` and rejects any observed mismatch by invalidating the stored row. The
+adapter never selects a session by recency.
+
+When the wrapper owns `--json`, stdout is buffered until the child finishes and
+the last agent message is rendered with one trailing newline. Caller-owned
+`--json` remains raw JSONL. Malformed, non-UTF-8, conflicting, truncated, or
+missing-thread transport emits a warning and cannot establish a live session;
+captured output and the child's exit status are preserved. A resumed native ID
+mismatch invalidates that session as `provider_rejected`. `CODEX_THREAD_ID`,
+`CLAUDE_CODE_SESSION_ID`, and `SUBAGENT_SELF_REF` are removed from the tracked
+Codex child's environment so inherited supervisor identity cannot alter child
+selection.
+
+The installed Codex CLI has asymmetric fresh and resume grammars. Persistent
+fresh-only flags (`--oss`, local provider, profile, sandbox/approval mode, and
+working root/additional directory) remain in the caller-derived command profile
+but are omitted from resume argv, allowing Codex to reuse the persisted thread
+configuration. Fresh-only color is also omitted from resume and remains an
+output-shaping profile exclusion under section 13.3. Unknown flags remain
+default-included in the profile and are forwarded. Full app-server-driven child
+execution remains an optional future mode for streaming and richer
+cancellation; exact native resume does not depend on it.
 
 ### 13.3 Command profiles
 
@@ -852,15 +881,16 @@ SQLite pair/exchange ledger and workstream-scoped child-session substrate,
 common-credential redaction, deterministic recent
 history summaries, explicit one-way same-conversation pair inheritance,
 owner-only context capsules with explicit pointer/inline delivery, raw stream
-forwarding, signal propagation, and
+forwarding for ordinary runs, bounded tracked-Codex rendering, signal
+propagation, and
 actual `claude -p` / `codex exec` child execution. `context`,
 `log`, `pairs`, `forget`, and `doctor` are operational. Managed-parent manifest
 resolution, hook-registry detection, the Claude supervisor-history adapter,
-workspace memory, managed Codex native resume, configured agent aliases, and
-cached incremental summarization remain deferred and fail explicitly where
-requested. Managed Claude assigned-session start and exact active-session resume
-are implemented. The Codex app-server supervisor-history adapter is implemented
-with bounded, read-only, allowlisted projection.
+workspace memory, configured agent aliases, and cached incremental
+summarization remain deferred and fail explicitly where requested. Managed
+Claude assigned-session start and managed Codex observed-thread start both
+support exact active-session resume. The Codex app-server supervisor-history
+adapter is implemented with bounded, read-only, allowlisted projection.
 
 Repository CI runs formatting, Clippy with warnings denied, and all-target,
 all-feature tests on Linux and macOS. End-to-end contract tests execute the
@@ -900,14 +930,17 @@ provider-neutral, implementation-deferred decision in
 - completion-failure provenance; and
 - redaction hardening, including non-UTF-8 bodies.
 
-### Slice 5: app-server-managed Codex execution
+### Slice 5: managed Codex runtime continuity
 
-- app-server-driven child thread start/resume;
-- exact child thread observation;
-- output compatibility and cancellation handling.
+- compatibility `codex exec` JSONL thread start/resume (implemented);
+- exact child thread observation and mismatch invalidation (implemented);
+- caller-JSON and child-exit output compatibility (implemented); and
+- optional app-server-driven streaming execution and richer cancellation.
 
-The provider-neutral MVP already supports the compatibility `codex exec` path;
-this slice is specifically the native app-server resume and observation layer.
+The exact-resume release uses the installed stable CLI interface. App-server
+execution is no longer a prerequisite for native continuity and may be added as
+an opt-in transport only when its streaming/cancellation benefit justifies the
+larger compatibility surface.
 
 ### Slice 6: optional model summaries
 
@@ -955,10 +988,9 @@ permanent substitute for the provider's documented interface.
 ## 20. Release targets
 
 Version 0.2 is the usable continuity release. It requires Linux and macOS CI,
-Claude assigned-session resume with explicit failure recovery, and supervisor
-history for both Codex and Claude supervisors. No accepted CLI flag may remain
-inert. Exact Codex child resume remains documented as unavailable in the
-compatibility execution path.
+Claude assigned-session resume, Codex observed-thread resume, explicit failure
+recovery, and supervisor history for both Codex and Claude supervisors. No
+accepted CLI flag may remain inert.
 
 Version 0.5 is the durability beta. It adds immediate-supervisor selection for
 nested delegation, verified capsule reachability, crash recovery, garbage
@@ -966,7 +998,7 @@ collection, and schema migration coverage from every previously released
 version.
 
 Version 1.0 freezes the CLI, pair-key, ledger, capsule, report, and exit-status
-contracts. It includes the security hardening acceptance matrix and an opt-in
-app-server Codex execution mode for exact native child resume, while preserving
-the byte-transparent `codex exec` compatibility mode as the default. Model
+contracts. It includes the security hardening acceptance matrix and may include
+an opt-in app-server Codex execution mode for streaming/cancellation, while
+preserving untracked byte-transparent `codex exec` as the default. Model
 summarization remains optional and is not a release gate.

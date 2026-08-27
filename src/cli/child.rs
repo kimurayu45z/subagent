@@ -1,9 +1,9 @@
 //! Recognition of the deliberately small managed-child surface.
 //!
-//! The adapter never rewrites provider arguments. Both supported installed
-//! CLIs accept additional stdin alongside a positional prompt, so the runner
-//! can inject a context bootstrap through stdin while preserving the caller's
-//! original `OsString` argv byte-for-byte.
+//! Ordinary managed calls preserve provider arguments. Explicit workstreams
+//! additionally inject wrapper-owned native continuity arguments after task
+//! projection, command digesting, and profile hashing have consumed the
+//! caller's original `OsString` argv.
 //!
 //! The command-profile hashing substrate below ([`ProfileHash`],
 //! [`CommandProfile`], [`command_profile_hash`]) gates wrapper-managed Claude
@@ -33,11 +33,19 @@ pub(crate) enum ClaudeSessionMode {
     Resume,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexSessionMode<'a> {
+    Fresh,
+    Resume(&'a str),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChildAdapterError {
     UnsupportedProgram(OsString),
     ClaudeRequiresPrintMode,
     ClaudePromptPlacementAmbiguous,
+    CodexPromptPlacementAmbiguous,
+    CodexWorkstreamOptionUnsupported(&'static str),
     NativeSessionContinuityUnavailable(&'static str),
     CodexRequiresExec,
     CodexExecSubcommandUnsupported(&'static str),
@@ -62,6 +70,15 @@ impl fmt::Display for ChildAdapterError {
                 "managed Claude execution requires the task immediately after \
                  `-p`/`--print`, after an explicit `--`, or through caller stdin; \
                  a trailing task after provider options is ambiguous"
+            ),
+            ChildAdapterError::CodexPromptPlacementAmbiguous => write!(
+                f,
+                "managed Codex workstreams require the task immediately after `exec`, after an \
+                 explicit `--`, or through caller stdin"
+            ),
+            ChildAdapterError::CodexWorkstreamOptionUnsupported(flag) => write!(
+                f,
+                "Codex option {flag} cannot be combined with a managed workstream"
             ),
             ChildAdapterError::NativeSessionContinuityUnavailable(flag) => write!(
                 f,
@@ -122,6 +139,32 @@ pub(crate) fn validate_managed_task_input(
         return Ok(());
     }
     Err(ChildAdapterError::ClaudePromptPlacementAmbiguous)
+}
+
+/// Applies the stricter input contract required when the wrapper must rewrite
+/// provider argv for exact native continuity. Ordinary untracked `codex exec`
+/// retains the broader byte-transparent compatibility grammar.
+pub(crate) fn validate_managed_continuity_input(
+    kind: ChildKind,
+    args: &[OsString],
+    caller_stdin: &[u8],
+) -> Result<(), ChildAdapterError> {
+    if kind == ChildKind::Claude {
+        return validate_managed_task_input(kind, args, caller_stdin);
+    }
+    for argument in codex_provider_arguments(args) {
+        let name: Option<&str> = profile_excluded_option_name(argument.as_os_str());
+        if name == Some("--ephemeral") {
+            return Err(ChildAdapterError::CodexWorkstreamOptionUnsupported(
+                "--ephemeral",
+            ));
+        }
+    }
+    if !caller_stdin.is_empty() || profile_task_index(kind, args).is_some() {
+        Ok(())
+    } else {
+        Err(ChildAdapterError::CodexPromptPlacementAmbiguous)
+    }
 }
 
 /// Projects the user-authored task text from a recognized provider command.
@@ -396,6 +439,106 @@ pub(crate) fn inject_claude_session_args(
     spawn_args.push(OsString::from(native_id));
     spawn_args.extend_from_slice(caller_args);
     spawn_args
+}
+
+/// Builds the Codex argv used for a managed workstream. The wrapper-owned
+/// `--json` transport is never part of task projection, command digesting, or
+/// profile hashing. Resume inserts the exact stored thread ID as the first
+/// positional argument, including after an explicit provider `--` separator.
+pub(crate) fn inject_codex_session_args(
+    caller_args: &[OsString],
+    mode: CodexSessionMode<'_>,
+) -> Vec<OsString> {
+    debug_assert_eq!(
+        caller_args.first().map(OsString::as_os_str),
+        Some(OsStr::new("exec"))
+    );
+    match mode {
+        CodexSessionMode::Fresh => {
+            let mut spawn_args: Vec<OsString> =
+                Vec::with_capacity(caller_args.len().saturating_add(1));
+            spawn_args.push(OsString::from("exec"));
+            if !codex_json_requested(caller_args) {
+                spawn_args.push(OsString::from("--json"));
+            }
+            spawn_args.extend_from_slice(&caller_args[1..]);
+            spawn_args
+        }
+        CodexSessionMode::Resume(native_id) => {
+            let separator_index: Option<usize> = caller_args[1..]
+                .iter()
+                .position(|argument: &OsString| argument == OsStr::new("--"))
+                .map(|index: usize| index + 1);
+            let mut spawn_args: Vec<OsString> =
+                Vec::with_capacity(caller_args.len().saturating_add(3));
+            spawn_args.extend([OsString::from("exec"), OsString::from("resume")]);
+            if !codex_json_requested(caller_args) {
+                spawn_args.push(OsString::from("--json"));
+            }
+            match separator_index {
+                Some(index) => {
+                    append_codex_resume_compatible_args(&mut spawn_args, &caller_args[1..index]);
+                    spawn_args.push(OsString::from("--"));
+                    spawn_args.push(OsString::from(native_id));
+                    spawn_args.extend_from_slice(&caller_args[index + 1..]);
+                }
+                None if profile_task_index(ChildKind::Codex, caller_args) == Some(1) => {
+                    spawn_args.push(OsString::from(native_id));
+                    append_codex_resume_compatible_args(&mut spawn_args, &caller_args[1..]);
+                }
+                None => {
+                    append_codex_resume_compatible_args(&mut spawn_args, &caller_args[1..]);
+                    spawn_args.push(OsString::from(native_id));
+                    spawn_args.push(OsString::from("-"));
+                }
+            }
+            spawn_args
+        }
+    }
+}
+
+pub(crate) fn codex_json_requested(args: &[OsString]) -> bool {
+    codex_provider_arguments(args).any(|argument: &OsString| {
+        profile_excluded_option_name(argument.as_os_str()) == Some("--json")
+    })
+}
+
+fn codex_provider_arguments(args: &[OsString]) -> impl Iterator<Item = &OsString> {
+    let end: usize = args
+        .iter()
+        .position(|argument: &OsString| argument == OsStr::new("--"))
+        .unwrap_or(args.len());
+    args[..end].iter()
+}
+
+/// Codex 0.149 persists these launch settings on `exec` but does not accept
+/// them in the `exec resume` grammar. Configuration-affecting values remain in
+/// the caller-derived command profile so changes fail closed before spawn;
+/// output-only color remains excluded by the profile policy.
+fn append_codex_resume_compatible_args(target: &mut Vec<OsString>, source: &[OsString]) {
+    let mut index: usize = 0;
+    while index < source.len() {
+        let argument: &OsString = &source[index];
+        let name: Option<&str> = profile_excluded_option_name(argument.as_os_str());
+        let unsupported_value_arity: Option<usize> = name.and_then(|value: &str| match value {
+            "--oss" | "--approve-for-me" => Some(0),
+            "--local-provider" | "--profile" | "-p" | "--sandbox" | "-s" | "--cd" | "-C"
+            | "--add-dir" | "--color" => Some(1),
+            _ => None,
+        });
+        if let Some(value_arity) = unsupported_value_arity {
+            let uses_equals_form: bool = argument
+                .to_str()
+                .is_some_and(|text: &str| text.contains('='));
+            index = index.saturating_add(1);
+            if value_arity == 1 && !uses_equals_form && index < source.len() {
+                index = index.saturating_add(1);
+            }
+            continue;
+        }
+        target.push(argument.clone());
+        index = index.saturating_add(1);
+    }
 }
 
 fn write_framed(hasher: &mut Sha256, bytes: &[u8]) {
@@ -867,6 +1010,112 @@ mod tests {
             args: &injected,
         });
         assert_eq!(caller_hash, injected_hash);
+    }
+
+    #[test]
+    fn wrapper_injected_codex_args_preserve_canonical_task_shapes() {
+        let immediate: Vec<OsString> = args(&["exec", "task", "--model", "gpt-luna"]);
+        assert_eq!(
+            inject_codex_session_args(&immediate, CodexSessionMode::Fresh),
+            args(&["exec", "--json", "task", "--model", "gpt-luna"])
+        );
+        assert_eq!(
+            inject_codex_session_args(&immediate, CodexSessionMode::Resume("thread-id")),
+            args(&[
+                "exec",
+                "resume",
+                "--json",
+                "thread-id",
+                "task",
+                "--model",
+                "gpt-luna"
+            ])
+        );
+
+        let separated: Vec<OsString> = args(&["exec", "--model", "gpt-luna", "--", "task"]);
+        assert_eq!(
+            inject_codex_session_args(&separated, CodexSessionMode::Resume("thread-id")),
+            args(&[
+                "exec",
+                "resume",
+                "--json",
+                "--model",
+                "gpt-luna",
+                "--",
+                "thread-id",
+                "task"
+            ])
+        );
+
+        let caller_json: Vec<OsString> = args(&["exec", "task", "--json"]);
+        assert_eq!(
+            inject_codex_session_args(&caller_json, CodexSessionMode::Fresh),
+            caller_json
+        );
+        assert_eq!(
+            inject_codex_session_args(&caller_json, CodexSessionMode::Resume("thread-id")),
+            args(&["exec", "resume", "thread-id", "task", "--json"])
+        );
+
+        let fresh_only_options: Vec<OsString> = args(&[
+            "exec",
+            "task",
+            "--sandbox",
+            "read-only",
+            "--profile=isolated",
+            "--cd",
+            "/workspace",
+            "--model",
+            "gpt-luna",
+        ]);
+        assert_eq!(
+            inject_codex_session_args(&fresh_only_options, CodexSessionMode::Resume("thread-id")),
+            args(&[
+                "exec",
+                "resume",
+                "--json",
+                "thread-id",
+                "task",
+                "--model",
+                "gpt-luna"
+            ])
+        );
+
+        let json_as_task: Vec<OsString> = args(&["exec", "--", "--json"]);
+        assert_eq!(
+            inject_codex_session_args(&json_as_task, CodexSessionMode::Fresh),
+            args(&["exec", "--json", "--", "--json"])
+        );
+    }
+
+    #[test]
+    fn codex_workstream_validation_rejects_ambiguous_or_unresumable_forms() {
+        assert!(matches!(
+            validate_managed_continuity_input(
+                ChildKind::Codex,
+                &args(&["exec", "--model", "gpt-luna", "task"]),
+                &[]
+            ),
+            Err(ChildAdapterError::CodexPromptPlacementAmbiguous)
+        ));
+        assert!(matches!(
+            validate_managed_continuity_input(
+                ChildKind::Codex,
+                &args(&["exec", "task", "--ephemeral"]),
+                &[]
+            ),
+            Err(ChildAdapterError::CodexWorkstreamOptionUnsupported(
+                "--ephemeral"
+            ))
+        ));
+        assert!(
+            validate_managed_continuity_input(
+                ChildKind::Codex,
+                &args(&["exec", "--model", "gpt-luna"]),
+                b"task on stdin"
+            )
+            .is_ok()
+        );
     }
 
     #[test]

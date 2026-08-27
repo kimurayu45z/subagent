@@ -56,9 +56,33 @@ not a guarantee that host-injected tool, skill, or MCP context is absent.
 
 Keep the native Codex session identity separate from the logical `subagent` ID.
 Resume or fork an exact native session with the installed `codex exec resume` or
-`codex exec fork` interface when appropriate. Do not put these native
-subcommands behind the current managed `subagent` adapter: managed native
-resume/fork is not implemented yet.
+`codex exec fork` interface when invoking Codex directly.
+
+For wrapper-managed exact resume, first require
+`child-session-resume-codex: implemented` from `subagent doctor`, then use a
+workstream rather than passing `codex exec resume` yourself:
+
+```sh
+subagent --id gpt-luna-implementer --workstream issue-42 --fresh -- \
+  codex exec "Implement the first slice" --model gpt-5.6-luna \
+  --sandbox workspace-write
+subagent --id gpt-luna-implementer --workstream issue-42 --resume -- \
+  codex exec "Fix the failing test" --model gpt-5.6-luna \
+  --sandbox workspace-write
+```
+
+The managed task must be immediately after `exec`, after an explicit `--`, or
+on stdin. Do not combine a workstream with `--ephemeral`. The wrapper adds
+`--json`, observes and verifies `thread.started`, and normally renders the last
+completed agent message after Codex exits. If the caller explicitly requests
+`--json`, raw JSONL remains on stdout. Observation errors preserve the child
+exit status and captured output but do not establish resumable continuity.
+
+The installed `codex exec resume` grammar may omit flags accepted by fresh
+`exec`. The adapter keeps known fresh-only launch settings such as sandbox,
+profile, local provider, and working root in the compatibility hash, while
+omitting them from resume argv so the provider can reuse the persisted thread
+configuration. Re-run local help after a Codex upgrade.
 
 Treat Codex output as evidence, not acceptance. Inspect any workspace diff, run
 proportionate checks independently, and reconcile claims with actual files and

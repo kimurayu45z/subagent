@@ -67,7 +67,13 @@ pub(crate) struct ChildRunRequest<'a> {
     pub cwd: &'a Path,
     pub stdin_bytes: Vec<u8>,
     pub env_overrides: Vec<(OsString, OsString)>,
+    pub env_removals: Vec<OsString>,
     pub max_capture_bytes: usize,
+    /// Whether raw child stdout is forwarded while it is captured. Managed
+    /// Codex workstreams set this to false because their JSONL transport is
+    /// parsed and rendered back to ordinary final-message stdout by the
+    /// adapter after the child exits.
+    pub forward_stdout: bool,
     pub forward_signals: bool,
     pub timeout: Option<Duration>,
 }
@@ -90,6 +96,9 @@ pub(crate) fn run_child(
         .stderr(Stdio::piped());
     for (name, value) in &request.env_overrides {
         command.env(name, value);
+    }
+    for name in &request.env_removals {
+        command.env_remove(name);
     }
 
     #[cfg(unix)]
@@ -150,6 +159,7 @@ pub(crate) fn run_child(
                 err,
                 &mut stdout_capture,
                 request.max_capture_bytes,
+                request.forward_stdout,
                 &mut stdout_truncated,
                 &mut forwarding_errors,
                 &mut stdout_closed,
@@ -282,6 +292,7 @@ fn handle_stream_event(
     err: &mut dyn Write,
     stdout_capture: &mut Vec<u8>,
     max_capture_bytes: usize,
+    forward_stdout: bool,
     stdout_truncated: &mut bool,
     forwarding_errors: &mut Vec<String>,
     stdout_closed: &mut bool,
@@ -289,7 +300,7 @@ fn handle_stream_event(
 ) {
     match event {
         StreamEvent::Bytes(StreamKind::Stdout, bytes) => {
-            if let Err(error) = out.write_all(&bytes).and_then(|()| out.flush()) {
+            if forward_stdout && let Err(error) = out.write_all(&bytes).and_then(|()| out.flush()) {
                 push_forwarding_error(
                     forwarding_errors,
                     format!("child stdout forwarding failed: {error}"),
@@ -419,7 +430,9 @@ mod tests {
             cwd: Path::new("/"),
             stdin_bytes,
             env_overrides: Vec::new(),
+            env_removals: Vec::new(),
             max_capture_bytes: 1024,
+            forward_stdout: true,
             forward_signals: false,
             timeout: None,
         }
@@ -455,6 +468,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn capture_only_mode_keeps_transport_bytes_off_stdout() {
+        let mut request: ChildRunRequest<'_> = shell_request("printf 'jsonl'", Vec::new());
+        request.forward_stdout = false;
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let outcome: ChildOutcome = run_child(request, &mut out, &mut err).unwrap();
+        assert!(out.is_empty());
+        assert_eq!(outcome.stdout_capture, b"jsonl");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn timeout_terminates_the_child_process_group() {
         let mut request: ChildRunRequest<'_> = shell_request("sleep 5", Vec::new());
         request.timeout = Some(Duration::from_millis(50));
@@ -475,7 +500,9 @@ mod tests {
             cwd: Path::new("/"),
             stdin_bytes: Vec::new(),
             env_overrides: Vec::new(),
+            env_removals: Vec::new(),
             max_capture_bytes: 1024,
+            forward_stdout: true,
             forward_signals: false,
             timeout: None,
         };

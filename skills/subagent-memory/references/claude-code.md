@@ -140,9 +140,11 @@ ambiguous `--continue`. Repeat model and permission controls when
 reproducibility matters. Use `--fork-session` when resumed work should branch,
 and `--no-session-persistence` only when no follow-up or audit trail is needed.
 
-The current managed `subagent` adapter intentionally rejects Claude native
-resume/fork flags. Use native resume directly until managed continuity is
-implemented.
+The managed `subagent` adapter intentionally rejects caller-supplied Claude
+native resume/fork flags so its ledger cannot disagree with provider argv. When
+`subagent doctor` reports `child-session-resume-claude: implemented`, use
+wrapper `--workstream` with exactly one of `--fresh` or `--resume`; otherwise
+use the exact direct native resume form.
 
 Treat Claude Code output as evidence, not acceptance. Inspect any workspace
 diff, run proportionate checks independently, and reconcile claims with actual

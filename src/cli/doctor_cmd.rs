@@ -116,6 +116,11 @@ fn capabilities() -> Vec<Capability> {
             "Claude Code supports explicit --workstream with exactly one of --fresh or --resume; exact active-session and profile matching fail closed before spawn",
         ),
         capability(
+            "child-session-resume-codex",
+            CapabilityState::Implemented,
+            "Codex supports explicit --workstream with exactly one of --fresh or --resume; JSONL observation persists and verifies the exact native thread ID",
+        ),
+        capability(
             "task-request-projection",
             CapabilityState::Implemented,
             "request memory keeps the positional task prompt and caller stdin while excluding provider launch flags",
@@ -158,12 +163,12 @@ fn capabilities() -> Vec<Capability> {
         capability(
             "child-adapter-codex",
             CapabilityState::Implemented,
-            "codex exec is supported with argument-preserving stdin bootstrap injection; native resume is intentionally deferred",
+            "codex exec is supported with argument-preserving stdin bootstrap injection; tracked workstreams add a bounded JSONL observation transport and exact native resume",
         ),
         capability(
             "child-spawn",
             CapabilityState::Implemented,
-            "stdout/stderr are forwarded as raw bytes, stdout capture is bounded, and child exit status is preserved",
+            "stdout/stderr forwarding and capture are bounded; tracked Codex JSONL is rendered after completion, while observation failures preserve captured output and child exit status",
         ),
     ]
 }
@@ -249,6 +254,16 @@ mod tests {
         let managed_resume: &Capability = capabilities
             .iter()
             .find(|capability| capability.name == "child-session-resume-claude")
+            .unwrap();
+        assert_eq!(managed_resume.state, CapabilityState::Implemented);
+    }
+
+    #[test]
+    fn managed_codex_resume_capability_is_implemented() {
+        let capabilities: Vec<Capability> = capabilities();
+        let managed_resume: &Capability = capabilities
+            .iter()
+            .find(|capability| capability.name == "child-session-resume-codex")
             .unwrap();
         assert_eq!(managed_resume.state, CapabilityState::Implemented);
     }

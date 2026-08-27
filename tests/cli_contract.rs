@@ -308,6 +308,256 @@ fn managed_claude_workstream_fresh_then_resume_reuses_the_exact_session() {
 
 #[cfg(unix)]
 #[test]
+fn managed_codex_workstream_observes_and_resumes_the_exact_thread() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let codex_path: PathBuf = workspace.path().join("codex");
+    let thread_id: &str = "019d300d-5f1b-7000-8000-000000000042";
+    fs::write(
+        &codex_path,
+        "#!/bin/sh\n\
+         test -z \"$CODEX_THREAD_ID\" || exit 69\n\
+         test \"$1\" = exec || exit 70\n\
+         case \"$2\" in\n\
+           --json) test \"$3\" = 'first task' || exit 71; message=FRESH_CODEX ;;\n\
+           resume) test \"$3\" = --json || exit 72; test \"$4\" = \"$THREAD_ID\" || exit 73; test \"$5\" = 'second task' || exit 74; message=RESUME_CODEX ;;\n\
+           *) exit 75 ;;\n\
+         esac\n\
+         printf '{\"type\":\"thread.started\",\"thread_id\":\"%s\"}\\n' \"$THREAD_ID\"\n\
+         printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"%s\"}}\\n' \"$message\"\n\
+         printf '{\"type\":\"turn.completed\"}\\n'\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&codex_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&codex_path, permissions).unwrap();
+
+    let run = |flag: &str, task: &str| -> std::process::Output {
+        subagent_with_clean_supervisor_env(state_dir.path())
+            .current_dir(workspace.path())
+            .env("CODEX_THREAD_ID", "must-be-scrubbed")
+            .env("THREAD_ID", thread_id)
+            .args([
+                "--id",
+                "gpt-luna-implementer",
+                "--supervisor",
+                "claude:codex-workstream-contract",
+                "--context",
+                "pair",
+                "--workstream",
+                "issue-84",
+                flag,
+                "--quiet",
+                "--",
+            ])
+            .arg(&codex_path)
+            .args(["exec", task, "--model", "gpt-luna"])
+            .output()
+            .unwrap()
+    };
+
+    let fresh: std::process::Output = run("--fresh", "first task");
+    assert!(
+        fresh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+    assert_eq!(fresh.stdout, b"FRESH_CODEX\n");
+
+    let resumed: std::process::Output = run("--resume", "second task");
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(resumed.stdout, b"RESUME_CODEX\n");
+
+    let connection: rusqlite::Connection =
+        rusqlite::Connection::open(state_dir.path().join("ledger.sqlite3")).unwrap();
+    let (native_id, kind, status): (String, String, String) = connection
+        .query_row(
+            "SELECT native_id, child_kind, status FROM child_sessions WHERE workstream_id = 'issue-84'",
+            [],
+            |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(native_id, thread_id);
+    assert_eq!(kind, "codex");
+    assert_eq!(status, "active");
+    let linked_invocations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM invocations WHERE child_session_id = (SELECT id FROM child_sessions WHERE native_id = ?1)",
+            [thread_id],
+            |row: &rusqlite::Row<'_>| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(linked_invocations, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_codex_preserves_caller_json_and_child_exit_on_observation_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let codex_path: PathBuf = workspace.path().join("codex");
+    let thread_id: &str = "019d300d-5f1b-7000-8000-000000000043";
+    let valid_jsonl: String = format!(
+        "{{\"type\":\"thread.started\",\"thread_id\":\"{thread_id}\"}}\n\
+         {{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"JSON_OK\"}}}}\n\
+         {{\"type\":\"turn.completed\"}}\n"
+    );
+    fs::write(
+        &codex_path,
+        "#!/bin/sh\n\
+         case \"$2:$3\" in\n\
+           json-task:--json) test \"$4\" != --json || exit 71; printf '%s' \"$VALID_JSONL\" ;;\n\
+           --json:malformed-task) printf 'not-json\\n'; exit 42 ;;\n\
+           --json:malformed-success) printf 'still-not-json\\n' ;;\n\
+           *) exit 72 ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&codex_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&codex_path, permissions).unwrap();
+
+    let base = |workstream: &str, task: &str| -> Command {
+        let mut command: Command = subagent_with_clean_supervisor_env(state_dir.path());
+        command
+            .current_dir(workspace.path())
+            .env("VALID_JSONL", &valid_jsonl)
+            .args([
+                "--id",
+                "gpt-luna-reviewer",
+                "--supervisor",
+                "claude:codex-json-contract",
+                "--context",
+                "pair",
+                "--workstream",
+                workstream,
+                "--fresh",
+                "--quiet",
+                "--",
+            ])
+            .arg(&codex_path)
+            .args(["exec", task]);
+        command
+    };
+
+    base("caller-json", "json-task")
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(predicate::eq(valid_jsonl.clone()));
+
+    base("malformed", "malformed-task")
+        .assert()
+        .code(42)
+        .stdout("not-json\n")
+        .stderr(predicate::str::contains(
+            "could not confirm Codex native continuity",
+        ));
+
+    base("malformed-success", "malformed-success")
+        .assert()
+        .success()
+        .stdout("still-not-json\n")
+        .stderr(predicate::str::contains(
+            "could not confirm Codex native continuity",
+        ));
+
+    let connection: rusqlite::Connection =
+        rusqlite::Connection::open(state_dir.path().join("ledger.sqlite3")).unwrap();
+    let live_sessions: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM child_sessions WHERE status IN ('assigned', 'active')",
+            [],
+            |row: &rusqlite::Row<'_>| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(live_sessions, 1, "malformed output created a live session");
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_codex_resume_invalidates_a_mismatched_native_thread() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let codex_path: PathBuf = workspace.path().join("codex");
+    let original_thread: &str = "019d300d-5f1b-7000-8000-000000000044";
+    let mismatched_thread: &str = "019d300d-5f1b-7000-8000-000000000045";
+    fs::write(
+        &codex_path,
+        "#!/bin/sh\n\
+         test \"$1\" = exec || exit 70\n\
+         case \"$2\" in\n\
+           --json) thread=\"$ORIGINAL_THREAD\"; message=FRESH_OK ;;\n\
+           resume) test \"$3\" = --json || exit 71; test \"$4\" = \"$ORIGINAL_THREAD\" || exit 72; thread=\"$MISMATCHED_THREAD\"; message=WRONG_THREAD ;;\n\
+           *) exit 73 ;;\n\
+         esac\n\
+         printf '{\"type\":\"thread.started\",\"thread_id\":\"%s\"}\\n' \"$thread\"\n\
+         printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"%s\"}}\\n' \"$message\"\n\
+         printf '{\"type\":\"turn.completed\"}\\n'\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&codex_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&codex_path, permissions).unwrap();
+
+    let run = |flag: &str, task: &str| -> std::process::Output {
+        subagent_with_clean_supervisor_env(state_dir.path())
+            .current_dir(workspace.path())
+            .env("ORIGINAL_THREAD", original_thread)
+            .env("MISMATCHED_THREAD", mismatched_thread)
+            .args([
+                "--id",
+                "gpt-luna-auditor",
+                "--supervisor",
+                "claude:codex-mismatch-contract",
+                "--context",
+                "pair",
+                "--workstream",
+                "mismatch",
+                flag,
+                "--quiet",
+                "--",
+            ])
+            .arg(&codex_path)
+            .args(["exec", task])
+            .output()
+            .unwrap()
+    };
+
+    let fresh: std::process::Output = run("--fresh", "first");
+    assert!(fresh.status.success());
+    assert_eq!(fresh.stdout, b"FRESH_OK\n");
+
+    let resumed: std::process::Output = run("--resume", "second");
+    assert!(resumed.status.success());
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains(mismatched_thread));
+    assert!(String::from_utf8_lossy(&resumed.stderr).contains("requires"));
+
+    let connection: rusqlite::Connection =
+        rusqlite::Connection::open(state_dir.path().join("ledger.sqlite3")).unwrap();
+    let (status, reason): (String, String) = connection
+        .query_row(
+            "SELECT status, retired_reason FROM child_sessions WHERE native_id = ?1",
+            [original_thread],
+            |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "invalid");
+    assert_eq!(reason, "provider_rejected");
+}
+
+#[cfg(unix)]
+#[test]
 fn resume_missing_or_profile_mismatched_session_fails_before_spawn() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -483,6 +733,7 @@ fn invalid_workstream_flag_combinations_fail_before_state_or_spawn() {
     let state_root: PathBuf = temp_dir.path().join("state");
     let canary_path: PathBuf = temp_dir.path().join("continuity-canary");
     let claude_path: PathBuf = write_named_canary_script(temp_dir.path(), &canary_path, "claude");
+    let codex_path: PathBuf = write_named_canary_script(temp_dir.path(), &canary_path, "codex");
 
     let cases: Vec<Vec<OsString>> = vec![
         vec![
@@ -526,8 +777,22 @@ fn invalid_workstream_flag_combinations_fail_before_state_or_spawn() {
             "lane".into(),
             "--fresh".into(),
             "--".into(),
-            "codex".into(),
+            codex_path.as_os_str().to_os_string(),
             "exec".into(),
+            "task".into(),
+            "--ephemeral".into(),
+        ],
+        vec![
+            "--id".into(),
+            "worker".into(),
+            "--workstream".into(),
+            "lane".into(),
+            "--fresh".into(),
+            "--".into(),
+            codex_path.as_os_str().to_os_string(),
+            "exec".into(),
+            "--model".into(),
+            "gpt-luna".into(),
             "task".into(),
         ],
     ];

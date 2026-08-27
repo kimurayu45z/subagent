@@ -88,7 +88,8 @@ child adapter to be `implemented` before claiming durable conversational memory
 is active. Require `pair-inheritance` before using an ID handoff and
 `summarizer-model` before selecting `haiku` or `luna`. Require
 `child-session-resume-claude` before relying on wrapper-managed Claude native
-continuity.
+continuity, and require `child-session-resume-codex` before relying on
+wrapper-managed Codex native continuity.
 
 If the desired capability is reported as planned or unavailable:
 
@@ -128,8 +129,8 @@ does not need to be renamed to comply.
 
 The ID identifies a role, not a work chain. A new request to the same reviewer
 may be a separate assignment and must not be presented as "continue" merely
-because the ID matches. Wrapper-managed Claude native resume uses a separate,
-explicit workstream identity for one intentional follow-up chain.
+because the ID matches. Wrapper-managed native resume uses a separate, explicit
+workstream identity for one intentional follow-up chain.
 
 When an intentional model change also changes the model-prefixed ID, preserve
 the historical boundary with an explicit one-way handoff:
@@ -177,11 +178,13 @@ subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
 subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
 ```
 
-The wrapper preserves provider argv and prepends the capsule location through
-stdin. The default `--context-delivery pointer` does not paste historical bodies
-into the prompt; the child may read `summary.md` or a history file when the
-current assignment makes that relevant. Recorded request memory contains the
-task prompt and caller stdin rather than provider launch flags.
+The wrapper preserves caller argv for task projection, audit digesting, and
+profile compatibility, and prepends the capsule location through stdin. A
+tracked workstream may then add provider-native continuity arguments to the
+spawn argv. The default `--context-delivery pointer` does not paste historical
+bodies into the prompt; the child may read `summary.md` or a history file when
+the current assignment makes that relevant. Recorded request memory contains
+the task prompt and caller stdin rather than provider launch flags.
 
 Select `--context-delivery inline` only for an intentional continuation, or
 when the child needs continuity but its tool configuration or sandbox cannot
@@ -189,10 +192,18 @@ read the capsule path. Inline delivery pushes the bounded summary into the
 bootstrap, so stale conclusions can bias a separate assignment.
 
 Do not combine managed mode with caller-supplied provider-native resume, fork,
-or session-ID flags. When `child-session-resume-claude` is implemented, start
-and resume one intentional Claude chain with wrapper options:
+or session-ID flags. When the corresponding doctor capability is implemented,
+start and resume one intentional chain with wrapper options. Put GPT examples
+before Claude examples:
 
 ```sh
+subagent --id gpt-luna-implementer --workstream issue-42 --fresh -- \
+  codex exec "Implement the first slice" --model gpt-5.6-luna \
+  --sandbox workspace-write
+subagent --id gpt-luna-implementer --workstream issue-42 --resume -- \
+  codex exec "Fix the failing test" --model gpt-5.6-luna \
+  --sandbox workspace-write
+
 subagent --id claude-haiku-implementer --workstream issue-42 --fresh -- \
   claude -p "Implement the first slice" --model haiku
 subagent --id claude-haiku-implementer --workstream issue-42 --resume -- \
@@ -203,11 +214,13 @@ Use exactly one of `--fresh` or `--resume` with `--workstream`. Resume must find
 the active session for the same pair and workstream with an identical command
 profile; otherwise it fails before spawn and must not be replaced implicitly.
 Use `--fresh` deliberately when changing model, tools, MCP configuration,
-permissions, executable, or canonical working directory. A managed Claude run
-without a workstream is untracked native continuity. Managed Codex native resume
-remains unavailable until doctor says otherwise; use its exact direct resume
-form from the provider reference. Unknown programs are allowed only as explicit
-`--memory none --context none --no-record` passthrough.
+permissions, executable, or canonical working directory. A managed provider run
+without a workstream is untracked native continuity. For tracked Codex, place
+the task immediately after `exec`, after an explicit `--`, or on stdin; do not
+use `--ephemeral`. The wrapper captures bounded JSONL to observe the exact
+thread ID and normally restores only the final agent message to stdout. An
+explicit caller `--json` keeps raw JSONL output. Unknown programs are allowed
+only as explicit `--memory none --context none --no-record` passthrough.
 
 Inspect and manage durable state with:
 

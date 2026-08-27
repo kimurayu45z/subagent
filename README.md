@@ -17,7 +17,16 @@ repeated-subagent memory:
 
 ```sh
 npx skills add kimurayu45z/subagent -g --agent codex \
-  --skill subagent-memory -y --copy
+  -y --copy
+```
+
+`--skill` is unnecessary while this repository exposes only
+`subagent-memory`; omitting it installs the repository's complete skill set. To
+migrate from the retired skill explicitly:
+
+```sh
+npx skills remove claude-code-subagent -g --agent codex -y
+npx skills add kimurayu45z/subagent -g --agent codex -y --copy
 ```
 
 This skill supersedes the former `claude-code-subagent` skill from
@@ -73,9 +82,11 @@ subagent --id claude-haiku-architect \
   claude -p "Continue the architecture work" --model haiku
 ```
 
-Everything after the first literal `--` is passed to the provider CLI without
-wrapper parsing. Managed mode currently recognizes `codex exec` and
-`claude -p`/`claude --print`.
+Everything after the first literal `--` belongs to the provider command and is
+never interpreted as another wrapper option. Managed mode recognizes
+`codex exec` and `claude -p`/`claude --print`; an explicit workstream validates
+the supported task shape and adds wrapper-owned native continuity arguments
+only after hashing the caller command.
 
 ### Claude Code argument safety
 
@@ -127,10 +138,21 @@ Accepted product decisions should live in version-controlled design files,
 ADRs, issues, or pull requests. The SQLite ledger is operational evidence and a
 recovery/indexing aid, not the canonical product specification.
 
-For an intentional Claude Code continuation, give the chain its own workstream.
-Start it explicitly, then resume that exact provider session:
+For an intentional native continuation, give the chain its own workstream.
+Start it explicitly, then resume that exact provider session. GPT-family
+examples come first by project convention:
 
 ```sh
+subagent --id gpt-luna-implementer \
+  --workstream issue-42 --fresh -- \
+  codex exec "Implement the first slice" --model gpt-5.6-luna \
+  --sandbox workspace-write
+
+subagent --id gpt-luna-implementer \
+  --workstream issue-42 --resume -- \
+  codex exec "Fix the failing test from that slice" --model gpt-5.6-luna \
+  --sandbox workspace-write
+
 subagent --id claude-haiku-implementer \
   --workstream issue-42 --fresh -- \
   claude -p "Implement the first slice" --model haiku
@@ -141,14 +163,23 @@ subagent --id claude-haiku-implementer \
 ```
 
 `--workstream` must be paired with exactly one of `--fresh` or `--resume`.
-Resume requires one active session with the same pair, Claude adapter, and
+Resume requires one active session with the same pair, child adapter, and
 command profile; a model, tool, MCP, permission, executable, or working-directory
 change fails before spawn and asks for `--fresh`. It never silently starts a new
-session. A managed Claude call without a workstream retains the ordinary
-untracked behavior. Caller-supplied Claude continuity flags remain rejected so
-the wrapper cannot disagree with its ledger. Managed Codex native resume remains
-deferred; use its direct provider-native resume form when exact continuity is
-required.
+session. A managed call without a workstream retains ordinary untracked native
+continuity. Caller-supplied native resume/fork/session flags remain rejected so
+the wrapper cannot disagree with its ledger.
+
+Tracked Codex requires its prompt immediately after `exec`, after an explicit
+`--`, or through stdin, and rejects `--ephemeral` because there would be no
+thread to resume. The wrapper observes Codex JSONL in a bounded buffer, stores
+the exact `thread.started` ID, and renders the final agent message after the
+child exits. If the caller explicitly supplies `--json`, raw JSONL remains the
+stdout contract. Malformed or mismatched observation never replaces the child
+exit code; the captured output is preserved and an unsafe session is not made
+resumable. Current `codex exec resume` does not accept several fresh-only flags,
+including sandbox, profile, and working-root options, so the wrapper retains
+them in compatibility hashing but omits them from the provider resume argv.
 
 Deterministic summary artifacts remain the offline default. Under pointer
 delivery they stay in the capsule for pull-based reading; they are not pasted

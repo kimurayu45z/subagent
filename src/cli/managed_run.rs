@@ -11,7 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use super::capsule::{self, Capsule, CapsuleRequest, InheritedHistory};
-use super::child::{self, ClaudeSessionMode, CommandProfile, ProfileHash};
+use super::child::{self, ClaudeSessionMode, CodexSessionMode, CommandProfile, ProfileHash};
+use super::codex_json;
 use super::history::{self, SupervisorHistory};
 use super::id::SubagentId;
 use super::process::{self, ChildExit, ChildOutcome, ChildRunRequest};
@@ -35,6 +36,7 @@ const MAX_MAX_CONTEXT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STDIN_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RECORDED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECORDED_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_CODEX_JSON_TRANSPORT_BYTES: usize = 32 * 1024 * 1024;
 const STALE_PENDING_AFTER_SECONDS: i64 = 24 * 60 * 60;
 
 pub(crate) struct ManagedRunRequest<'a> {
@@ -84,13 +86,16 @@ pub(crate) fn execute(
                 return wrapper_error_exit();
             }
         };
-    if !passthrough
-        && let Some(kind) = child_kind
-        && let Err(adapter_error) =
+    if !passthrough && let Some(kind) = child_kind {
+        let validation: Result<(), child::ChildAdapterError> = if request.workstream.is_some() {
+            child::validate_managed_continuity_input(kind, request.args, request.caller_stdin)
+        } else {
             child::validate_managed_task_input(kind, request.args, request.caller_stdin)
-    {
-        let _ = writeln!(err, "subagent: {adapter_error}");
-        return wrapper_error_exit();
+        };
+        if let Err(adapter_error) = validation {
+            let _ = writeln!(err, "subagent: {adapter_error}");
+            return wrapper_error_exit();
+        }
     }
 
     let max_context_bytes: u64 = request
@@ -175,14 +180,6 @@ pub(crate) fn execute(
         );
         return wrapper_error_exit();
     };
-    if request.workstream.is_some() && kind != ChildKind::Claude {
-        let _ = writeln!(
-            err,
-            "subagent: managed native continuity currently supports only Claude Code"
-        );
-        return wrapper_error_exit();
-    }
-
     let state_root: PathBuf = match state_dir::resolve_state_root(request.state_dir_override) {
         Ok(path) => path,
         Err(error) => {
@@ -262,8 +259,9 @@ pub(crate) fn execute(
         }
     };
 
-    let native_session: Option<ChildSessionRecord> = match request.native_continuity {
+    let mut native_session: Option<ChildSessionRecord> = match request.native_continuity {
         NativeContinuity::Untracked => None,
+        NativeContinuity::Fresh if kind == ChildKind::Codex => None,
         NativeContinuity::Fresh => {
             let workstream: &WorkstreamId = request
                 .workstream
@@ -333,26 +331,63 @@ pub(crate) fn execute(
     }
 
     let stdin_bytes: Vec<u8> = prepare_child_stdin(capsule.as_ref(), request.caller_stdin);
-    let spawn_args_storage: Option<Vec<OsString>> =
-        native_session.as_ref().map(|session: &ChildSessionRecord| {
+    let tracked_codex: bool = kind == ChildKind::Codex && request.workstream.is_some();
+    let caller_requested_codex_json: bool =
+        tracked_codex && child::codex_json_requested(request.args);
+    let spawn_args_storage: Option<Vec<OsString>> = match (kind, request.native_continuity) {
+        (ChildKind::Claude, NativeContinuity::Fresh | NativeContinuity::Resume) => {
+            let session: &ChildSessionRecord = native_session
+                .as_ref()
+                .expect("tracked Claude continuity assigns or resolves a session before spawn");
             let mode: ClaudeSessionMode = match request.native_continuity {
                 NativeContinuity::Fresh => ClaudeSessionMode::Assign,
                 NativeContinuity::Resume => ClaudeSessionMode::Resume,
-                NativeContinuity::Untracked => {
-                    unreachable!("an untracked invocation has no native session")
-                }
+                NativeContinuity::Untracked => unreachable!(),
             };
-            child::inject_claude_session_args(request.args, mode, &session.native_id)
-        });
+            Some(child::inject_claude_session_args(
+                request.args,
+                mode,
+                &session.native_id,
+            ))
+        }
+        (ChildKind::Codex, NativeContinuity::Fresh) => Some(child::inject_codex_session_args(
+            request.args,
+            CodexSessionMode::Fresh,
+        )),
+        (ChildKind::Codex, NativeContinuity::Resume) => {
+            let session: &ChildSessionRecord = native_session
+                .as_ref()
+                .expect("tracked Codex resume resolves a session before spawn");
+            Some(child::inject_codex_session_args(
+                request.args,
+                CodexSessionMode::Resume(&session.native_id),
+            ))
+        }
+        (_, NativeContinuity::Untracked) => None,
+    };
     let spawn_args: &[OsString] = spawn_args_storage.as_deref().unwrap_or(request.args);
-    let outcome: ChildOutcome = match process::run_child(
+    let mut outcome: ChildOutcome = match process::run_child(
         ChildRunRequest {
             program: request.program,
             args: spawn_args,
             cwd: request.cwd,
             stdin_bytes,
             env_overrides: Vec::new(),
-            max_capture_bytes: MAX_RECORDED_RESPONSE_BYTES,
+            env_removals: if tracked_codex {
+                vec![
+                    OsString::from("CODEX_THREAD_ID"),
+                    OsString::from("CLAUDE_CODE_SESSION_ID"),
+                    OsString::from("SUBAGENT_SELF_REF"),
+                ]
+            } else {
+                Vec::new()
+            },
+            max_capture_bytes: if tracked_codex {
+                MAX_CODEX_JSON_TRANSPORT_BYTES
+            } else {
+                MAX_RECORDED_RESPONSE_BYTES
+            },
+            forward_stdout: !tracked_codex || caller_requested_codex_json,
             forward_signals: request.forward_signals,
             timeout: None,
         },
@@ -377,6 +412,156 @@ pub(crate) fn execute(
     };
 
     report_forwarding_errors(&outcome, err);
+    let mut native_session_confirmed: bool = child_exit_succeeded(outcome.exit);
+    if tracked_codex {
+        let expected_thread_id: Option<&str> =
+            if request.native_continuity == NativeContinuity::Resume {
+                native_session
+                    .as_ref()
+                    .map(|session: &ChildSessionRecord| session.native_id.as_str())
+            } else {
+                None
+            };
+        let observation: codex_json::Observation = match codex_json::observe(
+            &outcome.stdout_capture,
+            outcome.stdout_truncated,
+            expected_thread_id,
+        ) {
+            Ok(observation) => observation,
+            Err(protocol_error) => {
+                let _ = writeln!(
+                    err,
+                    "subagent: warning: could not confirm Codex native continuity: {protocol_error}"
+                );
+                if matches!(
+                    protocol_error,
+                    codex_json::ProtocolError::ThreadMismatch { .. }
+                ) && let Some(session) = &native_session
+                {
+                    let _ = ledger.retire_child_session(
+                        &pair.pair_key,
+                        &session.native_id,
+                        ChildSessionRetirement::ProviderRejected,
+                    );
+                }
+                if !caller_requested_codex_json
+                    && let Err(error) = out
+                        .write_all(&outcome.stdout_capture)
+                        .and_then(|()| out.flush())
+                {
+                    let _ = writeln!(
+                        err,
+                        "subagent: warning: fallback Codex stdout forwarding failed: {error}"
+                    );
+                }
+                let diagnostic: String =
+                    format!("[Codex continuity unconfirmed: {protocol_error}]");
+                outcome.stdout_capture = diagnostic.into_bytes();
+                return complete_and_return(
+                    &mut ledger,
+                    &begun.invocation_id,
+                    outcome,
+                    None,
+                    pair,
+                    err,
+                    request.forward_signals,
+                );
+            }
+        };
+
+        native_session_confirmed = child_exit_succeeded(outcome.exit)
+            && observation.turn_completed
+            && !observation.turn_failed
+            && observation.final_message.is_some();
+        if child_exit_succeeded(outcome.exit) && !native_session_confirmed {
+            let _ = writeln!(
+                err,
+                "subagent: warning: Codex exited successfully without a completed turn and final agent message; native continuity remains unconfirmed"
+            );
+        }
+
+        if request.native_continuity == NativeContinuity::Fresh {
+            let workstream: &WorkstreamId = request
+                .workstream
+                .expect("tracked Codex fresh has a workstream");
+            let profile_hash: ProfileHash =
+                profile_hash.expect("tracked continuity always computes a profile hash");
+            let assigned: Option<ChildSessionRecord> = match ledger.assign_fresh_child_session(
+                &pair.pair_key,
+                kind,
+                workstream.as_str(),
+                profile_hash.as_bytes(),
+                &observation.thread_id,
+            ) {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    let _ = writeln!(
+                        err,
+                        "subagent: warning: child finished but its observed Codex thread could not be persisted: {error}"
+                    );
+                    native_session_confirmed = false;
+                    None
+                }
+            };
+            if let Some(assigned) = assigned {
+                if let Err(error) =
+                    ledger.link_invocation_child_session(&begun.invocation_id, &assigned.native_id)
+                {
+                    let _ = writeln!(
+                        err,
+                        "subagent: warning: child finished but its observed Codex thread could not be linked: {error}"
+                    );
+                    native_session_confirmed = false;
+                }
+                native_session = Some(assigned);
+            }
+        }
+
+        let rendered: Vec<u8> = observation.final_message.unwrap_or_default();
+        if !caller_requested_codex_json
+            && !rendered.is_empty()
+            && let Err(error) = out.write_all(&rendered).and_then(|()| {
+                if rendered.ends_with(b"\n") {
+                    Ok(())
+                } else {
+                    out.write_all(b"\n")
+                }
+            })
+        {
+            let _ = writeln!(
+                err,
+                "subagent: warning: child stdout forwarding failed: {error}"
+            );
+        }
+        outcome.stdout_capture = rendered;
+        outcome.stdout_truncated = false;
+    }
+
+    let session_to_activate: Option<&ChildSessionRecord> = if native_session_confirmed {
+        native_session.as_ref()
+    } else {
+        None
+    };
+    complete_and_return(
+        &mut ledger,
+        &begun.invocation_id,
+        outcome,
+        session_to_activate,
+        pair,
+        err,
+        request.forward_signals,
+    )
+}
+
+fn complete_and_return(
+    ledger: &mut store::Store,
+    invocation_id: &str,
+    outcome: ChildOutcome,
+    session_to_activate: Option<&ChildSessionRecord>,
+    pair: &store::EnsuredPair,
+    err: &mut dyn Write,
+    forward_signals: bool,
+) -> ExitCode {
     let response_redaction: RedactionResult =
         redaction::redact(&outcome.stdout_capture, MAX_RECORDED_RESPONSE_BYTES);
     let response: ExchangeBody = ExchangeBody {
@@ -386,8 +571,7 @@ pub(crate) fn execute(
         redaction_classes: response_redaction.redaction_classes,
     };
     let exit_outcome: ExitOutcome = store_exit(outcome.exit);
-    if child_exit_succeeded(outcome.exit)
-        && let Some(session) = &native_session
+    if let Some(session) = session_to_activate
         && let Err(error) = ledger.mark_child_session_active(&pair.pair_key, &session.native_id)
     {
         let _ = writeln!(
@@ -395,13 +579,13 @@ pub(crate) fn execute(
             "subagent: warning: child succeeded but its native session could not be activated: {error}"
         );
     }
-    if let Err(error) = ledger.complete_invocation(&begun.invocation_id, exit_outcome, response) {
+    if let Err(error) = ledger.complete_invocation(invocation_id, exit_outcome, response) {
         let _ = writeln!(
             err,
             "subagent: warning: child finished but its response could not be recorded: {error}"
         );
     }
-    reproduce_signal_if_needed(outcome.exit, request.forward_signals);
+    reproduce_signal_if_needed(outcome.exit, forward_signals);
     child_exit_code(outcome.exit)
 }
 
@@ -470,7 +654,9 @@ fn execute_unrecorded(
             cwd: request.cwd,
             stdin_bytes,
             env_overrides: Vec::new(),
+            env_removals: Vec::new(),
             max_capture_bytes: 0,
+            forward_stdout: true,
             forward_signals: request.forward_signals,
             timeout: None,
         },

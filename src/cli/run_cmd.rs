@@ -496,14 +496,7 @@ fn execute_with_env(
                     return wrapper_error_exit();
                 }
             };
-        if continuity_kind != store::ChildKind::Claude {
-            let _ = writeln!(
-                err,
-                "subagent: managed native continuity currently supports only Claude Code; Codex workstreams are not implemented"
-            );
-            return wrapper_error_exit();
-        }
-        if let Err(adapter_error) = super::child::validate_managed_task_input(
+        if let Err(adapter_error) = super::child::validate_managed_continuity_input(
             continuity_kind,
             &child_tokens[1..],
             caller_stdin,
@@ -630,9 +623,12 @@ fn execute_with_env(
                 return wrapper_error_exit();
             }
         };
+        let child_kind: store::ChildKind =
+            super::child::recognize_managed_child(&plan.program, &plan.args)
+                .expect("tracked continuity child was validated while building the plan");
         let profile_hash: super::child::ProfileHash =
             super::child::command_profile_hash(&super::child::CommandProfile {
-                child_kind: store::ChildKind::Claude,
+                child_kind,
                 program: &plan.program,
                 working_directory: &pair.workspace,
                 args: &plan.args,
@@ -640,7 +636,7 @@ fn execute_with_env(
         if let Err(message) = super::managed_run::resolve_resume_session(
             &ledger,
             &pair.pair_key,
-            store::ChildKind::Claude,
+            child_kind,
             workstream,
             profile_hash,
         ) {

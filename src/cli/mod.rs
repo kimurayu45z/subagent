@@ -12,6 +12,7 @@ use std::process::ExitCode;
 mod agent_cmd;
 mod capsule;
 mod child;
+mod codex_json;
 mod context_cmd;
 mod doctor_cmd;
 mod forget_cmd;
@@ -90,8 +91,9 @@ GLOBAL OPTIONS:
     -h, --help                     Print help
     -V, --version                  Print version
 
-Everything after the first literal `--` is passed to the child command
-verbatim, as an OS string, and is never interpreted as a wrapper option.
+Everything after the first literal `--` belongs to the caller's child command
+and is never interpreted as a wrapper option. Managed workstreams may adapt
+provider-native continuity argv after recording the caller command.
 ";
 
 /// Parses and dispatches the full argument vector (excluding argv[0]).
