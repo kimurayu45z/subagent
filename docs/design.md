@@ -793,6 +793,11 @@ cached incremental summarization remain deferred and fail explicitly where
 requested. The Codex app-server supervisor-history adapter is implemented with
 bounded, read-only, allowlisted projection.
 
+Repository CI runs formatting, Clippy with warnings denied, and all-target,
+all-feature tests on Linux and macOS. End-to-end contract tests execute the
+compiled wrapper and verify binary stdout, stderr, exit code `42`, and Unix
+signal reproduction using isolated state and fake provider executables.
+
 Before starting the Claude history-adapter or cached/incremental-summary
 slices, use the current managed-run implementation in real delegations and
 record enough evidence to judge invocation frequency, app-server latency,

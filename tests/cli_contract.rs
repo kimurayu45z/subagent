@@ -360,18 +360,68 @@ fn ordinary_run_report_reflects_a_resolved_managed_plan() {
 
 #[cfg(unix)]
 fn write_fake_claude(dir: &Path, response: &str) -> PathBuf {
+    let script: String = format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{}'\n", response);
+    write_fake_claude_script(dir, &script)
+}
+
+#[cfg(unix)]
+fn write_fake_claude_script(dir: &Path, script: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
     let script_path: PathBuf = dir.join("claude");
-    fs::write(
-        &script_path,
-        format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{}'\n", response),
-    )
-    .unwrap();
+    fs::write(&script_path, script).unwrap();
     let mut permissions: fs::Permissions = fs::metadata(&script_path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&script_path, permissions).unwrap();
     script_path
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_child_preserves_binary_stdout_stderr_and_exit_42() {
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let claude_path: PathBuf = write_fake_claude_script(
+        workspace.path(),
+        "#!/bin/sh\ncat >/dev/null\nprintf '\\001\\002\\377A'\nprintf 'child-error' >&2\nexit 42\n",
+    );
+
+    let output: std::process::Output = subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args(["--id", "claude-haiku-exit-contract", "--quiet", "--"])
+        .arg(&claude_path)
+        .args(["-p", "exercise the process contract"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(42));
+    assert_eq!(output.stdout, [0x01_u8, 0x02_u8, 0xff_u8, b'A']);
+    assert_eq!(output.stderr, b"child-error");
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_child_signal_is_reproduced_by_the_wrapper() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let claude_path: PathBuf = write_fake_claude_script(
+        workspace.path(),
+        "#!/bin/sh\ncat >/dev/null\nkill -TERM $$\n",
+    );
+
+    let output: std::process::Output = subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args(["--id", "claude-haiku-signal-contract", "--quiet", "--"])
+        .arg(&claude_path)
+        .args(["-p", "exercise the signal contract"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.signal(), Some(libc::SIGTERM));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
 }
 
 #[cfg(unix)]
