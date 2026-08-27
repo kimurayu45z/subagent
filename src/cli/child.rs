@@ -5,11 +5,10 @@
 //! can inject a context bootstrap through stdin while preserving the caller's
 //! original `OsString` argv byte-for-byte.
 //!
-//! Scope note: the command-profile hashing substrate below
-//! ([`ProfileHash`], [`CommandProfile`], [`command_profile_hash`]) is
-//! additive and inert in this build. No runtime path spawns a child through
-//! a profile or persists its hash yet; only this module's own tests
-//! exercise it until a later increment wires it into `managed_run`.
+//! The command-profile hashing substrate below ([`ProfileHash`],
+//! [`CommandProfile`], [`command_profile_hash`]) gates wrapper-managed Claude
+//! workstream resume. The wrapper hashes caller argv, then injects its native
+//! session arguments only into the final spawn argv.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -27,6 +26,12 @@ const COMMAND_DIGEST_DOMAIN: &[u8] = b"subagent.command.v1\n";
 /// later change here never silently reinterprets an old hash.
 pub(crate) const COMMAND_PROFILE_SCHEMA_VERSION: u32 = 1;
 const COMMAND_PROFILE_DOMAIN: &[u8] = b"subagent.command-profile.v1\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeSessionMode {
+    Assign,
+    Resume,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChildAdapterError {
@@ -60,8 +65,9 @@ impl fmt::Display for ChildAdapterError {
             ),
             ChildAdapterError::NativeSessionContinuityUnavailable(flag) => write!(
                 f,
-                "Claude native session option {flag} is not supported by the managed adapter \
-                 yet; remove it or use --context none --no-record passthrough"
+                "caller-supplied Claude native session option {flag} is not accepted by the \
+                 managed adapter; use wrapper --workstream with --fresh/--resume, or use \
+                 --context none --no-record passthrough"
             ),
             ChildAdapterError::CodexRequiresExec => write!(
                 f,
@@ -373,6 +379,25 @@ pub(crate) fn command_digest(program: &OsStr, args: &[OsString]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Builds the exact Claude argv used for managed native continuity. Validation,
+/// task projection, command digesting, and profile hashing must all happen on
+/// the caller argv before this wrapper-owned pair is prepended.
+pub(crate) fn inject_claude_session_args(
+    caller_args: &[OsString],
+    mode: ClaudeSessionMode,
+    native_id: &str,
+) -> Vec<OsString> {
+    let flag: &str = match mode {
+        ClaudeSessionMode::Assign => "--session-id",
+        ClaudeSessionMode::Resume => "--resume",
+    };
+    let mut spawn_args: Vec<OsString> = Vec::with_capacity(caller_args.len().saturating_add(2));
+    spawn_args.push(OsString::from(flag));
+    spawn_args.push(OsString::from(native_id));
+    spawn_args.extend_from_slice(caller_args);
+    spawn_args
+}
+
 fn write_framed(hasher: &mut Sha256, bytes: &[u8]) {
     let length: u64 = bytes.len() as u64;
     hasher.update(length.to_le_bytes());
@@ -386,10 +411,6 @@ fn write_framed(hasher: &mut Sha256, bytes: &[u8]) {
 pub(crate) struct ProfileHash([u8; 32]);
 
 impl ProfileHash {
-    // `as_bytes`, `from_bytes`, and `to_hex` are the accessors a later
-    // increment needs to persist and display a profile hash; nothing calls
-    // them yet because `command_profile_hash` itself is not wired into
-    // `managed_run` in this build. See the module-level scope note.
     #[allow(dead_code)]
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
@@ -414,8 +435,6 @@ impl ProfileHash {
 /// everything about a child invocation except its task text and caller
 /// stdin, both of which vary every run and are already recorded as exchange
 /// history.
-// See this module's scope note: exercised only by this module's own tests
-// until a later increment spawns a child through this profile.
 #[allow(dead_code)]
 pub(crate) struct CommandProfile<'a> {
     pub child_kind: ChildKind,
@@ -437,8 +456,6 @@ pub(crate) struct CommandProfile<'a> {
 /// The `profile_schema_version` accompanying a stored hash pins it to
 /// [`COMMAND_PROFILE_SCHEMA_VERSION`], so a later change to this function's
 /// byte layout never gets reused across algorithm versions.
-// See this module's scope note: exercised only by this module's own tests
-// until a later increment wires this into `managed_run`.
 #[allow(dead_code)]
 pub(crate) fn command_profile_hash(profile: &CommandProfile<'_>) -> ProfileHash {
     let excluded: Vec<bool> = excluded_profile_token_mask(profile.child_kind, profile.args);
@@ -470,8 +487,6 @@ pub(crate) fn command_profile_hash(profile: &CommandProfile<'_>) -> ProfileHash 
 /// [`option_takes_value`]). A token whose text cannot be decoded as UTF-8
 /// never matches an exclusion rule and is therefore always retained,
 /// matching the default-include posture.
-// Reachable only from `command_profile_hash`, which is itself unwired; see
-// this module's scope note.
 #[allow(dead_code)]
 fn excluded_profile_token_mask(kind: ChildKind, args: &[OsString]) -> Vec<bool> {
     let mut excluded: Vec<bool> = vec![false; args.len()];
@@ -549,8 +564,6 @@ fn profile_task_index(kind: ChildKind, args: &[OsString]) -> Option<usize> {
 /// The option name portion of an argv token, splitting off a `--opt=value`
 /// suffix so `--opt=value` and `--opt value` are recognized as the same
 /// option name for exclusion purposes. `None` for non-UTF-8 tokens.
-// Reachable only from `excluded_profile_token_mask`, which is itself
-// unwired; see this module's scope note.
 #[allow(dead_code)]
 fn profile_excluded_option_name(token: &OsStr) -> Option<&str> {
     let text: &str = token.to_str()?;
@@ -558,12 +571,10 @@ fn profile_excluded_option_name(token: &OsStr) -> Option<&str> {
 }
 
 /// The exclusion list from the command-profile hash design: session-
-/// continuity options (injected by the wrapper in a later increment),
+/// continuity options (injected by the wrapper after hashing),
 /// output-shaping/telemetry options, and per-run budget knobs. Each entry is
 /// a known single-token or `--opt value` pair; arity is resolved separately
 /// via [`option_takes_value`].
-// Reachable only from `excluded_profile_token_mask`, which is itself
-// unwired; see this module's scope note.
 #[allow(dead_code)]
 fn is_excluded_profile_option_name(name: &str) -> bool {
     matches!(
@@ -829,6 +840,33 @@ mod tests {
             ]),
         });
         assert_eq!(base, with_continuity_and_output);
+    }
+
+    #[test]
+    fn wrapper_injected_claude_session_args_preserve_profile_and_prompt_adjacency() {
+        let caller: Vec<OsString> = args(&["-p", "review the current diff", "--model", "haiku"]);
+        let injected: Vec<OsString> = inject_claude_session_args(
+            &caller,
+            ClaudeSessionMode::Assign,
+            "018f4e5c-5d6a-7b8c-9d0e-123456789abc",
+        );
+        assert_eq!(injected[0], "--session-id");
+        assert_eq!(injected[2], "-p");
+        assert_eq!(injected[3], "review the current diff");
+
+        let caller_hash: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program: OsStr::new("claude"),
+            working_directory: Path::new("/workspace"),
+            args: &caller,
+        });
+        let injected_hash: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Claude,
+            program: OsStr::new("claude"),
+            working_directory: Path::new("/workspace"),
+            args: &injected,
+        });
+        assert_eq!(caller_hash, injected_hash);
     }
 
     #[test]

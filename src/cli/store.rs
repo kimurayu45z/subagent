@@ -3,11 +3,11 @@
 //! Scope in this build covers the `workspaces`, `supervisor_sessions`, and
 //! `pairs` tables from the design's minimum schema, plus the invocation and
 //! exchange ledger (`invocations`, `exchange_messages`) needed to record one
-//! managed run's request/response pair transactionally, and the additive
-//! `child_sessions` storage substrate described below. `workspace_memories`
-//! and `summaries` are not implemented yet. No runtime path spawns, resumes,
-//! or reads a `child_sessions` row yet: every method touching that table is
-//! inert until a later increment calls it.
+//! managed run's request/response pair transactionally, and the
+//! workstream-scoped `child_sessions` store described below.
+//! `workspace_memories` and `summaries` are not implemented yet. Managed
+//! Claude fresh/resume reads and writes `child_sessions`; managed Codex
+//! native continuity remains deferred.
 //!
 //! Security posture, per `docs/design.md` section 10 and section 15:
 //! directories this build owns are created `0700`; the database file (and
@@ -26,7 +26,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use uuid::Uuid;
 
 use super::child::COMMAND_PROFILE_SCHEMA_VERSION;
-use super::id::SubagentId;
+use super::id::{MAX_ID_LEN, SubagentId, is_valid_logical_name};
 use super::pair_key::PairKey;
 use super::supervisor::Provider;
 use super::workspace::WorkspaceRef;
@@ -43,8 +43,12 @@ use super::workspace::WorkspaceRef;
 /// introduces `pair_inheritance` without altering any version 1 or version 2
 /// table or row. Version 4 additively introduces `child_sessions` and a
 /// nullable `invocations.child_session_id` back-link, without altering any
-/// version 1, 2, or 3 table or row; no runtime path writes to either yet.
-pub(crate) const LEDGER_SCHEMA_VERSION: i64 = 4;
+/// version 1, 2, or 3 table or row.
+/// Version 5 additively introduces a nullable `child_sessions.workstream_id`
+/// label, replacing `child_sessions_live_profile_idx` with a partial unique
+/// index on `(pair_id, child_kind, workstream_id)`, without altering any
+/// version 1, 2, 3, or 4 row; see [`SCHEMA_SQL_V5_ADDITIONS`].
+pub(crate) const LEDGER_SCHEMA_VERSION: i64 = 5;
 
 const DB_FILE_NAME: &str = "ledger.sqlite3";
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -167,10 +171,9 @@ CREATE TABLE pair_inheritance (
 CREATE INDEX pair_inheritance_source_pair_id_idx ON pair_inheritance (source_pair_id);
 ";
 
-/// Additive version 3 -> 4 migration: the inert `child_sessions` storage
-/// substrate (`docs/design.md:485`) plus a nullable back-link from
-/// `invocations`. Nothing in this build writes to either yet; see the
-/// module-level doc comment.
+/// Additive version 3 -> 4 migration: the `child_sessions` storage substrate
+/// plus a nullable back-link from `invocations`. Version 5 adds the
+/// workstream label and changes live uniqueness before runtime consumption.
 ///
 /// `child_sessions.pair_id` cascades exactly like `invocations.pair_id`, so
 /// [`Store::delete_pair`] removes a pair's child sessions with no new
@@ -229,6 +232,37 @@ CREATE UNIQUE INDEX child_sessions_live_profile_idx
 ALTER TABLE invocations
     ADD COLUMN child_session_id INTEGER
     REFERENCES child_sessions(id) ON DELETE SET NULL;
+";
+
+/// Additive version 4 -> 5 migration: a nullable `workstream_id` label on
+/// `child_sessions`, and a replacement for `child_sessions_live_profile_idx`.
+///
+/// A workstream is a caller-chosen label (opaque to this store) naming one
+/// continuous lane of child sessions for a pair and child kind, independent
+/// of any one `profile_hash`: [`Store::assign_fresh_child_session`] always
+/// retires the workstream's current live row (whatever its profile) before
+/// inserting the new one, so a profile change never leaves two live rows
+/// racing for the same workstream. `child_sessions_live_workstream_idx`
+/// backs that up at the database level, scoped to `(pair_id, child_kind,
+/// workstream_id)` and only for non-null `workstream_id`, so legacy rows
+/// written before this slice (and any future row deliberately left
+/// unlabeled) never collide with each other or with a labeled row.
+///
+/// Dropping `child_sessions_live_profile_idx` means the pre-existing
+/// profile-scoped live rows (`Store::ensure_child_session`,
+/// `Store::live_child_session`) no longer have a dedicated database-level
+/// uniqueness backstop; they still cannot race in practice because every
+/// write to `child_sessions` takes an `IMMEDIATE` transaction, which SQLite
+/// itself serializes against every other writer on the same database file.
+const SCHEMA_SQL_V5_ADDITIONS: &str = "
+ALTER TABLE child_sessions ADD COLUMN workstream_id TEXT
+    CHECK (workstream_id IS NULL OR length(workstream_id) BETWEEN 1 AND 64);
+
+DROP INDEX child_sessions_live_profile_idx;
+
+CREATE UNIQUE INDEX child_sessions_live_workstream_idx
+    ON child_sessions (pair_id, child_kind, workstream_id)
+    WHERE status IN ('assigned', 'active') AND workstream_id IS NOT NULL;
 ";
 
 #[derive(Debug)]
@@ -305,6 +339,9 @@ pub(crate) enum StoreError {
     /// parse as a UUID.
     #[allow(dead_code)]
     CorruptChildSessionNativeId(String),
+    /// A child-session `workstream_id` violates the logical-name grammar.
+    #[allow(dead_code)]
+    CorruptChildSessionWorkstreamId(String),
 }
 
 #[derive(Debug)]
@@ -456,6 +493,10 @@ impl fmt::Display for StoreError {
             StoreError::CorruptChildSessionNativeId(text) => write!(
                 f,
                 "state store contains a malformed child session native id {text:?}"
+            ),
+            StoreError::CorruptChildSessionWorkstreamId(text) => write!(
+                f,
+                "state store contains a malformed child session workstream id {text:?}"
             ),
         }
     }
@@ -694,11 +735,12 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         0 => {
             // A brand-new database reaches the current version in one
             // transaction: there is no observable intermediate state at
-            // version 1, version 2, or version 3.
+            // version 1, version 2, version 3, or version 4.
             transaction.execute_batch(SCHEMA_SQL_V1)?;
             transaction.execute_batch(SCHEMA_SQL_V2_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V3_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -708,6 +750,7 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             transaction.execute_batch(SCHEMA_SQL_V2_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V3_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -717,6 +760,7 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             // `pair_inheritance` and `child_sessions` appear.
             transaction.execute_batch(SCHEMA_SQL_V3_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -725,6 +769,17 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             // version 1, 2, and 3 row is untouched, and only
             // `child_sessions` and `invocations.child_session_id` appear.
             transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
+            transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+        4 => {
+            // An existing version 4 database is migrated additively: every
+            // version 1, 2, 3, and 4 row is untouched (every existing
+            // `child_sessions` row keeps `workstream_id = NULL`), and only
+            // `child_sessions.workstream_id` and
+            // `child_sessions_live_workstream_idx` appear.
+            transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -1119,6 +1174,13 @@ pub(crate) struct ChildSessionRecord {
     pub last_seen_unix: i64,
     pub retired_at_unix: Option<i64>,
     pub retired_reason: Option<ChildSessionRetirement>,
+    /// The caller-chosen workstream label, if any. `None` for every row
+    /// written before the version 5 workstream slice existed (a "legacy"
+    /// row); such a row is never returned by
+    /// [`Store::live_child_session_for_workstream`] or replaced by
+    /// [`Store::assign_fresh_child_session`], but stays visible via
+    /// [`Store::list_child_sessions`] for audit.
+    pub workstream_id: Option<String>,
 }
 
 /// The result of a read-only store open, since a missing state root or
@@ -1891,7 +1953,7 @@ impl Store {
             .conn
             .query_row(
                 "SELECT native_id, child_kind, profile_hash, profile_schema_version, status,
-                        created_at, last_seen, retired_at, retired_reason
+                        created_at, last_seen, retired_at, retired_reason, workstream_id
                  FROM child_sessions
                  WHERE pair_id = ?1 AND child_kind = ?2 AND profile_hash = ?3
                    AND profile_schema_version = ?4 AND status IN ('assigned', 'active')",
@@ -1907,16 +1969,56 @@ impl Store {
         row.map(child_session_record_from_row).transpose()
     }
 
+    /// Looks up the live (`assigned` or `active`) child session for
+    /// `pair_key`, `child_kind`, and `workstream_id`, if any, regardless of
+    /// its `profile_hash` or `profile_schema_version`: unlike
+    /// [`Store::live_child_session`], this lookup does not filter on
+    /// profile, so the caller can compare the returned record's profile
+    /// against its own and decide whether to reuse it or call
+    /// [`Store::assign_fresh_child_session`] to replace it.
+    ///
+    /// A legacy row with `workstream_id IS NULL` (written before this
+    /// workstream slice existed) is never returned: `workstream_id = ?` in
+    /// SQL never matches `NULL`. Returns `None` (not an error) both when
+    /// `pair_key` names no pair and when no live row matches.
+    #[allow(dead_code)]
+    pub(crate) fn live_child_session_for_workstream(
+        &self,
+        pair_key: &PairKey,
+        child_kind: ChildKind,
+        workstream_id: &str,
+    ) -> Result<Option<ChildSessionRecord>, StoreError> {
+        let Some(pair_id) = find_pair_id(&self.conn, pair_key)? else {
+            return Ok(None);
+        };
+        let row: Option<ChildSessionRow> = self
+            .conn
+            .query_row(
+                "SELECT native_id, child_kind, profile_hash, profile_schema_version, status,
+                        created_at, last_seen, retired_at, retired_reason, workstream_id
+                 FROM child_sessions
+                 WHERE pair_id = ?1 AND child_kind = ?2 AND workstream_id = ?3
+                   AND status IN ('assigned', 'active')",
+                params![pair_id, child_kind.to_string(), workstream_id],
+                child_session_row,
+            )
+            .optional()?;
+        row.map(child_session_record_from_row).transpose()
+    }
+
     /// Idempotently ensures a live child session exists for `pair_key`,
     /// `child_kind`, and `profile_hash`, under one `IMMEDIATE` transaction
     /// (as [`Store::begin_invocation`]) so two racing callers can never both
-    /// insert a live row for the same profile: the partial unique index
-    /// `child_sessions_live_profile_idx` backs this up at the database
-    /// level.
+    /// insert a live row for the same profile: SQLite's own writer
+    /// serialization on that `IMMEDIATE` transaction is now the only
+    /// database-level guard, since `child_sessions_live_profile_idx` was
+    /// dropped by [`SCHEMA_SQL_V5_ADDITIONS`] in favor of a workstream-scoped
+    /// index; see that constant's doc comment.
     ///
     /// If a live row already matches, it is returned unchanged and
     /// `native_id` is discarded. Otherwise a new row is inserted with
-    /// `status = 'assigned'` using the given `native_id`.
+    /// `status = 'assigned'` using the given `native_id` and
+    /// `workstream_id = NULL`.
     ///
     /// Fails with [`StoreError::PairNotFound`] if `pair_key` is stale.
     #[allow(dead_code)]
@@ -1937,7 +2039,7 @@ impl Store {
         let existing: Option<ChildSessionRow> = tx
             .query_row(
                 "SELECT native_id, child_kind, profile_hash, profile_schema_version, status,
-                        created_at, last_seen, retired_at, retired_reason
+                        created_at, last_seen, retired_at, retired_reason, workstream_id
                  FROM child_sessions
                  WHERE pair_id = ?1 AND child_kind = ?2 AND profile_hash = ?3
                    AND profile_schema_version = ?4 AND status IN ('assigned', 'active')",
@@ -1983,6 +2085,83 @@ impl Store {
             last_seen_unix: now,
             retired_at_unix: None,
             retired_reason: None,
+            workstream_id: None,
+        })
+    }
+
+    /// Atomically replaces the live (`assigned` or `active`) child session,
+    /// if any, for `pair_key`, `child_kind`, and `workstream_id`, in one
+    /// `IMMEDIATE` transaction: the workstream's current live row (whatever
+    /// its profile) is retired with
+    /// [`ChildSessionRetirement::FreshRequested`], and a new row is inserted
+    /// with `status = 'assigned'` for the given `profile_hash` and
+    /// `native_id`, labeled with `workstream_id`. Unlike
+    /// [`Store::ensure_child_session`], this never reuses an existing row:
+    /// "fresh" always wins, whether or not a prior live row existed.
+    ///
+    /// A legacy row with `workstream_id IS NULL` (written before this
+    /// workstream slice existed) is never matched by `workstream_id = ?`, so
+    /// it is left untouched and remains in the ledger for audit.
+    /// `child_sessions_live_workstream_idx` backs the atomicity of this
+    /// replacement at the database level, scoped to `(pair_id, child_kind,
+    /// workstream_id)`.
+    ///
+    /// Fails with [`StoreError::PairNotFound`] if `pair_key` is stale.
+    #[allow(dead_code)]
+    pub(crate) fn assign_fresh_child_session(
+        &mut self,
+        pair_key: &PairKey,
+        child_kind: ChildKind,
+        workstream_id: &str,
+        profile_hash: &[u8; 32],
+        native_id: &str,
+    ) -> Result<ChildSessionRecord, StoreError> {
+        validate_workstream_id(workstream_id)?;
+        validate_child_session_native_id(child_kind, native_id)?;
+        let now: i64 = unix_now();
+        let tx: rusqlite::Transaction<'_> = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pair_id: i64 = find_pair_id(&tx, pair_key)?.ok_or(StoreError::PairNotFound)?;
+
+        tx.execute(
+            "UPDATE child_sessions
+             SET status = 'retired', retired_at = MAX(?1, created_at),
+                 retired_reason = 'fresh_requested'
+             WHERE pair_id = ?2 AND child_kind = ?3 AND workstream_id = ?4
+               AND status IN ('assigned', 'active')",
+            params![now, pair_id, child_kind.to_string(), workstream_id],
+        )?;
+
+        tx.execute(
+            "INSERT INTO child_sessions (
+                 pair_id, child_kind, profile_hash, profile_schema_version, native_id,
+                 workstream_id, status, created_at, last_seen
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'assigned', ?7, ?7)",
+            params![
+                pair_id,
+                child_kind.to_string(),
+                profile_hash.as_slice(),
+                i64::from(COMMAND_PROFILE_SCHEMA_VERSION),
+                native_id,
+                workstream_id,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        secure_sidecars(&self.db_path)?;
+
+        Ok(ChildSessionRecord {
+            native_id: native_id.to_string(),
+            child_kind,
+            profile_hash: *profile_hash,
+            profile_schema_version: i64::from(COMMAND_PROFILE_SCHEMA_VERSION),
+            status: ChildSessionStatus::Assigned,
+            created_at_unix: now,
+            last_seen_unix: now,
+            retired_at_unix: None,
+            retired_reason: None,
+            workstream_id: Some(workstream_id.to_string()),
         })
     }
 
@@ -2066,7 +2245,7 @@ impl Store {
         };
         let mut statement: rusqlite::Statement<'_> = self.conn.prepare(
             "SELECT native_id, child_kind, profile_hash, profile_schema_version, status,
-                    created_at, last_seen, retired_at, retired_reason
+                    created_at, last_seen, retired_at, retired_reason, workstream_id
              FROM child_sessions WHERE pair_id = ?1 ORDER BY created_at DESC, id DESC",
         )?;
         let rows = statement.query_map(params![pair_id], child_session_row)?;
@@ -2173,6 +2352,7 @@ type ChildSessionRow = (
     i64,            // last_seen
     Option<i64>,    // retired_at
     Option<String>, // retired_reason
+    Option<String>, // workstream_id
 );
 
 #[allow(dead_code)]
@@ -2187,14 +2367,16 @@ fn child_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChildSessionRo
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
     ))
 }
 
 /// Validates one raw `child_sessions` row into a [`ChildSessionRecord`].
 /// Never coerces or defaults an unrecognized `status`/`retired_reason`, a
-/// non-32-byte `profile_hash`, or (for `child_kind = 'claude'`) a
-/// non-UUID `native_id`: each is a typed [`StoreError`] instead, matching
-/// [`Store::invocation`]'s corruption posture.
+/// non-32-byte `profile_hash`, a malformed `workstream_id`, or (for
+/// `child_kind = 'claude'`) a non-UUID `native_id`: each is a typed
+/// [`StoreError`] instead, matching [`Store::invocation`]'s corruption
+/// posture.
 #[allow(dead_code)]
 fn child_session_record_from_row(row: ChildSessionRow) -> Result<ChildSessionRecord, StoreError> {
     let (
@@ -2207,6 +2389,7 @@ fn child_session_record_from_row(row: ChildSessionRow) -> Result<ChildSessionRec
         last_seen,
         retired_at,
         retired_reason_text,
+        workstream_id,
     ) = row;
 
     let child_kind: ChildKind =
@@ -2228,6 +2411,9 @@ fn child_session_record_from_row(row: ChildSessionRow) -> Result<ChildSessionRec
                 .ok_or(StoreError::CorruptChildSessionRetirement(text))
         })
         .transpose()?;
+    if let Some(workstream_id) = workstream_id.as_deref() {
+        validate_workstream_id(workstream_id)?;
+    }
     let lifecycle_is_valid: bool = match status {
         ChildSessionStatus::Assigned | ChildSessionStatus::Active => {
             retired_at.is_none() && retired_reason.is_none()
@@ -2264,6 +2450,7 @@ fn child_session_record_from_row(row: ChildSessionRow) -> Result<ChildSessionRec
         last_seen_unix: last_seen,
         retired_at_unix: retired_at,
         retired_reason,
+        workstream_id,
     })
 }
 
@@ -2282,6 +2469,21 @@ fn validate_child_session_native_id(
             StoreError::CorruptChildSessionNativeId(native_id.to_string())
         })?;
     }
+    Ok(())
+}
+
+/// Validates one `workstream_id` label against the shared logical-name
+/// grammar. Used both to reject a malformed label before
+/// [`Store::assign_fresh_child_session`] inserts it, and to fail closed if a
+/// stored row somehow violates that constraint anyway.
+#[allow(dead_code)]
+fn validate_workstream_id(workstream_id: &str) -> Result<(), StoreError> {
+    if !is_valid_logical_name(workstream_id) {
+        return Err(StoreError::CorruptChildSessionWorkstreamId(
+            workstream_id.to_string(),
+        ));
+    }
+    debug_assert!(workstream_id.len() <= MAX_ID_LEN);
     Ok(())
 }
 
@@ -2705,7 +2907,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_reaches_version_4_with_a_usable_ledger() {
+    fn fresh_database_reaches_version_5_with_a_usable_ledger() {
         let root = tempfile::tempdir().unwrap();
         let state_root = root.path().join("state");
         let store = Store::open_for_write(&state_root).unwrap();
@@ -2715,7 +2917,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, LEDGER_SCHEMA_VERSION);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 4);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 5);
 
         let invocation_count: i64 = store
             .conn
@@ -2746,7 +2948,8 @@ mod tests {
     /// Builds an on-disk version 1 database by hand (the exact schema the
     /// pair-identity-store increment shipped, `SCHEMA_SQL_V1`) with one
     /// pre-existing pair, so the migration path exercised here is the real
-    /// version 1 -> 4 upgrade (through versions 2 and 3) rather than a stand-in.
+    /// version 1 -> 5 upgrade (through versions 2, 3, and 4) rather than a
+    /// stand-in.
     #[test]
     fn opening_a_v1_fixture_migrates_to_the_current_version_and_preserves_its_pair() {
         let root = tempfile::tempdir().unwrap();
@@ -2867,9 +3070,9 @@ mod tests {
     /// Builds an on-disk version 2 database by hand (`SCHEMA_SQL_V1` plus
     /// `SCHEMA_SQL_V2_ADDITIONS`) with a pre-existing pair and a completed
     /// invocation, so the migration path exercised here is the real version
-    /// 2 -> 4 upgrade rather than a stand-in.
+    /// 2 -> 5 upgrade rather than a stand-in.
     #[test]
-    fn opening_a_v2_fixture_migrates_to_v4_and_preserves_its_invocations() {
+    fn opening_a_v2_fixture_migrates_to_v5_and_preserves_its_invocations() {
         let root = tempfile::tempdir().unwrap();
         let state_root = root.path().join("state");
         let workspace_dir = tempfile::tempdir().unwrap();
@@ -2987,7 +3190,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_v3_fixture_migrates_to_v4_and_preserves_all_prior_rows() {
+    fn opening_a_v3_fixture_migrates_to_v5_and_preserves_all_prior_rows() {
         let root = tempfile::tempdir().unwrap();
         let state_root: PathBuf = root.path().join("state");
         let workspace_dir = tempfile::tempdir().unwrap();
@@ -3095,7 +3298,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, LEDGER_SCHEMA_VERSION);
         let invocation: InvocationRecord = store
             .invocation("018f0000-0000-7000-8000-000000000004")
             .unwrap()
@@ -3397,6 +3600,397 @@ mod tests {
     }
 
     #[test]
+    fn v5_migration_drops_the_profile_index_and_adds_the_workstream_index() {
+        let root = tempfile::tempdir().unwrap();
+        let store: Store = Store::open_for_write(&root.path().join("state")).unwrap();
+
+        let old_index_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                params!["child_sessions_live_profile_idx"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_index_count, 0);
+
+        let new_index_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                params!["child_sessions_live_workstream_idx"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_index_count, 1);
+    }
+
+    /// Builds an on-disk version 4 database by hand (`SCHEMA_SQL_V1` through
+    /// `SCHEMA_SQL_V4_ADDITIONS`) with a pre-existing live child session (no
+    /// `workstream_id` column existed at that version), so the migration
+    /// path exercised here is the real version 4 -> 5 upgrade rather than a
+    /// stand-in, and the legacy row's `workstream_id` reads back as `None`.
+    #[test]
+    fn opening_a_v4_fixture_migrates_to_v5_and_preserves_its_child_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let state_root: PathBuf = root.path().join("state");
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let workspace_ref: WorkspaceRef = workspace(workspace_dir.path());
+        let identity_bytes: Vec<u8> = workspace_ref.identity_bytes();
+        let pair_key: PairKey = PairKey::compute(
+            &identity_bytes,
+            Provider::Codex,
+            "session-1",
+            &id("implementer"),
+        );
+
+        std::fs::create_dir(&state_root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let db_path: PathBuf = state_root.join(DB_FILE_NAME);
+        let legacy_native_id: &str = "018f0000-0000-7000-8000-000000000060";
+        {
+            let fixture_conn: Connection = Connection::open(&db_path).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V1).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V2_ADDITIONS).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V3_ADDITIONS).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V4_ADDITIONS).unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO workspaces (canonical_path, identity_kind, created_at)
+                     VALUES (?1, 'path', 1000)",
+                    params![identity_bytes],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO supervisor_sessions
+                         (provider, native_id, workspace_id, first_seen, last_seen)
+                     VALUES ('codex', 'session-1', 1, 1000, 1000)",
+                    [],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO pairs
+                         (pair_key, workspace_id, supervisor_session_id, subagent_id,
+                          created_at, last_seen)
+                     VALUES (?1, 1, 1, 'implementer', 1000, 1000)",
+                    params![pair_key.as_bytes().as_slice()],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO child_sessions (
+                         pair_id, child_kind, profile_hash, profile_schema_version,
+                         native_id, status, created_at, last_seen
+                     ) VALUES (1, 'claude', ?1, ?2, ?3, 'active', 1000, 1000)",
+                    params![
+                        vec![60u8; 32],
+                        i64::from(COMMAND_PROFILE_SCHEMA_VERSION),
+                        legacy_native_id,
+                    ],
+                )
+                .unwrap();
+            fixture_conn
+                .pragma_update(None, "user_version", 4i64)
+                .unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let store: Store = Store::open_for_write(&state_root).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LEDGER_SCHEMA_VERSION);
+
+        let sessions: Vec<ChildSessionRecord> = store.list_child_sessions(&pair_key).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].native_id, legacy_native_id);
+        assert_eq!(sessions[0].workstream_id, None);
+
+        // The legacy row is still reachable through the pre-existing
+        // profile-scoped lookup...
+        assert_eq!(
+            store
+                .live_child_session(&pair_key, ChildKind::Claude, &[60u8; 32])
+                .unwrap()
+                .unwrap()
+                .native_id,
+            legacy_native_id
+        );
+        // ...but never through the new workstream-scoped lookup, since
+        // `workstream_id = ?` never matches a `NULL` column.
+        assert!(
+            store
+                .live_child_session_for_workstream(&pair_key, ChildKind::Claude, "any-workstream")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parallel_workstreams_can_share_the_same_profile_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let mut store: Store = Store::open_for_write(&root.path().join("state")).unwrap();
+        let workspace_ref: WorkspaceRef = workspace(workspace_dir.path());
+        let pair: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer"),
+            )
+            .unwrap();
+        let shared_profile: [u8; 32] = [50u8; 32];
+
+        let first: ChildSessionRecord = store
+            .assign_fresh_child_session(
+                &pair.pair_key,
+                ChildKind::Claude,
+                "workstream-a",
+                &shared_profile,
+                "018f0000-0000-7000-8000-000000000050",
+            )
+            .unwrap();
+        let second: ChildSessionRecord = store
+            .assign_fresh_child_session(
+                &pair.pair_key,
+                ChildKind::Claude,
+                "workstream-b",
+                &shared_profile,
+                "018f0000-0000-7000-8000-000000000051",
+            )
+            .unwrap();
+
+        assert_eq!(first.status, ChildSessionStatus::Assigned);
+        assert_eq!(second.status, ChildSessionStatus::Assigned);
+        assert_eq!(
+            store
+                .live_child_session_for_workstream(
+                    &pair.pair_key,
+                    ChildKind::Claude,
+                    "workstream-a"
+                )
+                .unwrap()
+                .unwrap()
+                .native_id,
+            first.native_id
+        );
+        assert_eq!(
+            store
+                .live_child_session_for_workstream(
+                    &pair.pair_key,
+                    ChildKind::Claude,
+                    "workstream-b"
+                )
+                .unwrap()
+                .unwrap()
+                .native_id,
+            second.native_id
+        );
+        assert_eq!(store.list_child_sessions(&pair.pair_key).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn assign_fresh_child_session_retires_the_prior_live_workstream_row() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let mut store: Store = Store::open_for_write(&root.path().join("state")).unwrap();
+        let workspace_ref: WorkspaceRef = workspace(workspace_dir.path());
+        let pair: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer"),
+            )
+            .unwrap();
+        let workstream: &str = "reviewer-lane";
+        let original_profile: [u8; 32] = [61u8; 32];
+        let fresh_profile: [u8; 32] = [62u8; 32];
+        let original_native_id: &str = "018f0000-0000-7000-8000-000000000061";
+        let fresh_native_id: &str = "018f0000-0000-7000-8000-000000000062";
+
+        let original: ChildSessionRecord = store
+            .assign_fresh_child_session(
+                &pair.pair_key,
+                ChildKind::Claude,
+                workstream,
+                &original_profile,
+                original_native_id,
+            )
+            .unwrap();
+        store
+            .mark_child_session_active(&pair.pair_key, &original.native_id)
+            .unwrap();
+
+        let fresh: ChildSessionRecord = store
+            .assign_fresh_child_session(
+                &pair.pair_key,
+                ChildKind::Claude,
+                workstream,
+                &fresh_profile,
+                fresh_native_id,
+            )
+            .unwrap();
+        assert_eq!(fresh.status, ChildSessionStatus::Assigned);
+        assert_eq!(fresh.workstream_id.as_deref(), Some(workstream));
+
+        // Only the fresh row is live for the workstream now.
+        let live: ChildSessionRecord = store
+            .live_child_session_for_workstream(&pair.pair_key, ChildKind::Claude, workstream)
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.native_id, fresh_native_id);
+
+        // The original row is retired, not deleted, with the fresh-requested
+        // reason, and stays visible for audit.
+        let sessions: Vec<ChildSessionRecord> = store.list_child_sessions(&pair.pair_key).unwrap();
+        assert_eq!(sessions.len(), 2);
+        let retired: &ChildSessionRecord = sessions
+            .iter()
+            .find(|session: &&ChildSessionRecord| session.native_id == original_native_id)
+            .unwrap();
+        assert_eq!(retired.status, ChildSessionStatus::Retired);
+        assert_eq!(
+            retired.retired_reason,
+            Some(ChildSessionRetirement::FreshRequested)
+        );
+        assert_eq!(retired.workstream_id.as_deref(), Some(workstream));
+    }
+
+    #[test]
+    fn failed_fresh_insert_rolls_back_the_prior_retirement() {
+        let root: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let workspace_dir: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut store: Store = Store::open_for_write(&root.path().join("state")).unwrap();
+        let workspace_ref: WorkspaceRef = workspace(workspace_dir.path());
+        let pair: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer"),
+            )
+            .unwrap();
+        let native_a: &str = "018f0000-0000-7000-8000-000000000070";
+        let native_b: &str = "018f0000-0000-7000-8000-000000000071";
+        store
+            .assign_fresh_child_session(
+                &pair.pair_key,
+                ChildKind::Claude,
+                "lane-a",
+                &[70u8; 32],
+                native_a,
+            )
+            .unwrap();
+        store
+            .assign_fresh_child_session(
+                &pair.pair_key,
+                ChildKind::Claude,
+                "lane-b",
+                &[71u8; 32],
+                native_b,
+            )
+            .unwrap();
+
+        let error: StoreError = store
+            .assign_fresh_child_session(
+                &pair.pair_key,
+                ChildKind::Claude,
+                "lane-a",
+                &[72u8; 32],
+                native_b,
+            )
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Sqlite(_)));
+
+        let live_a: ChildSessionRecord = store
+            .live_child_session_for_workstream(&pair.pair_key, ChildKind::Claude, "lane-a")
+            .unwrap()
+            .unwrap();
+        let live_b: ChildSessionRecord = store
+            .live_child_session_for_workstream(&pair.pair_key, ChildKind::Claude, "lane-b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(live_a.native_id, native_a);
+        assert_eq!(live_b.native_id, native_b);
+        assert_eq!(store.list_child_sessions(&pair.pair_key).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn legacy_null_workstream_rows_are_audited_but_never_match_a_workstream_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let mut store: Store = Store::open_for_write(&root.path().join("state")).unwrap();
+        let workspace_ref: WorkspaceRef = workspace(workspace_dir.path());
+        let pair: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Codex,
+                "session-1",
+                &id("implementer"),
+            )
+            .unwrap();
+
+        // Simulate a row written before this workstream slice existed:
+        // `ensure_child_session` never sets `workstream_id`, so it stays
+        // `NULL`.
+        let legacy: ChildSessionRecord = store
+            .ensure_child_session(
+                &pair.pair_key,
+                ChildKind::Claude,
+                &[63u8; 32],
+                "018f0000-0000-7000-8000-000000000063",
+            )
+            .unwrap();
+        assert_eq!(legacy.workstream_id, None);
+
+        for candidate_workstream in ["any-workstream", "reviewer-lane"] {
+            assert!(
+                store
+                    .live_child_session_for_workstream(
+                        &pair.pair_key,
+                        ChildKind::Claude,
+                        candidate_workstream
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        // Assigning a fresh row for a workstream label does not touch the
+        // unrelated legacy row at all.
+        store
+            .assign_fresh_child_session(
+                &pair.pair_key,
+                ChildKind::Claude,
+                "reviewer-lane",
+                &[64u8; 32],
+                "018f0000-0000-7000-8000-000000000064",
+            )
+            .unwrap();
+        let sessions: Vec<ChildSessionRecord> = store.list_child_sessions(&pair.pair_key).unwrap();
+        assert_eq!(sessions.len(), 2);
+        let legacy_row: &ChildSessionRecord = sessions
+            .iter()
+            .find(|session: &&ChildSessionRecord| session.native_id == legacy.native_id)
+            .unwrap();
+        assert_eq!(legacy_row.status, ChildSessionStatus::Assigned);
+        assert_eq!(legacy_row.workstream_id, None);
+    }
+
+    #[test]
     fn child_session_rows_fail_closed_on_corrupt_typed_fields() {
         fn row() -> ChildSessionRow {
             (
@@ -3407,6 +4001,7 @@ mod tests {
                 "assigned".to_string(),
                 1000,
                 1000,
+                None,
                 None,
                 None,
             )
@@ -3454,6 +4049,13 @@ mod tests {
         assert!(matches!(
             child_session_record_from_row(bad_lifecycle).unwrap_err(),
             StoreError::CorruptChildSessionLifecycle
+        ));
+
+        let mut bad_workstream: ChildSessionRow = row();
+        bad_workstream.9 = Some(String::new());
+        assert!(matches!(
+            child_session_record_from_row(bad_workstream).unwrap_err(),
+            StoreError::CorruptChildSessionWorkstreamId(text) if text.is_empty()
         ));
     }
 

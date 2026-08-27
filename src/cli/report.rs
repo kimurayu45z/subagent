@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,7 +138,7 @@ mod tests {
     fn report_round_trips_through_json() {
         let report = Report::new("test", ReportStatus::Ok, vec![1, 2, 3]);
         let json = report.to_json_pretty();
-        assert!(json.contains("\"schema_version\": 1"));
+        assert!(json.contains("\"schema_version\": 2"));
         assert!(json.contains("\"kind\": \"test\""));
         assert!(json.contains("\"status\": \"ok\""));
     }

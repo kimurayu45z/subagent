@@ -2,7 +2,7 @@
 
 Status: Draft, canonical
 
-Implementation milestone: Codex supervisor-history adapter
+Implementation milestone: managed Claude workstream continuity
 
 This document is the current normative design for `subagent`. Dated discussion,
 alternatives, and decision history belong under `docs/meeting-notes/` and do not
@@ -146,13 +146,16 @@ disabled.
 `ChildRuntimeSession` is a provider-native session handle used for `--resume`
 or the equivalent API. It may rotate without changing `SubagentId`.
 
-Future managed resume also requires an explicit `WorkstreamId`, representing
+Managed Claude resume requires an explicit `WorkstreamId`, representing
 one intentional chain of follow-up assignments. `WorkstreamId` does not enter
 `PairKey`: the pair remains the durable role-level audit boundary, while the
 resume key is `(pair, workstream, child kind, profile schema version, profile
-hash)`. An invocation without a workstream starts a new provider session. A
-resume request whose exact compatible session cannot be proved fails closed;
-it never silently starts a fresh session in the same invocation.
+hash)`. The live uniqueness key is `(pair, child kind, workstream)`; profile
+schema and hash are compatibility checks rather than parallel live lanes. A
+Claude invocation without a workstream uses untracked provider continuity. A
+workstream must select exactly one of `--fresh` or `--resume`. A resume request
+whose exact active compatible session cannot be proved fails closed before
+spawn; it never silently starts a fresh session in the same invocation.
 
 ### 3.4 Pair key
 
@@ -313,7 +316,9 @@ mode and do not receive managed session behavior.
 --summarizer deterministic|haiku|luna|none
 --summarize-above-bytes BYTES
 --max-context-bytes BYTES
+--workstream ID
 --fresh
+--resume
 --no-record
 --dry-run
 --quiet
@@ -330,6 +335,8 @@ Defaults are:
 - deterministic summarization;
 - a 16 KiB model-summarization threshold when an opt-in model alias is selected;
 - no model process for history below that threshold; and
+- untracked provider-native continuity unless a Claude workstream explicitly
+  selects `--fresh` or `--resume`; and
 - recording enabled.
 
 `--dry-run` performs discovery and idempotent identity preparation but does not
@@ -356,11 +363,12 @@ For each managed run, `subagent` performs the following sequence:
 6. Redact and normalize all context before persistence or injection.
 7. Build or update the selected summary artifact.
 8. Materialize a per-run context capsule.
-9. Resolve a resumable child runtime session, unless `--fresh` was specified.
-10. Record the pending invocation and spawn the child.
+9. Resolve an exact active child runtime session for `--resume`, or allocate and
+   persist a caller-assigned session for `--fresh`.
+10. Record and link the pending invocation, then spawn the child.
 11. Forward signals and stream child stdout and stderr without adding wrapper
     output to stdout.
-12. Observe a provider session handle when available.
+12. Promote a successful fresh Claude session from `assigned` to `active`.
 13. Record the final response, exit state, duration, context provenance, and
     child runtime handle in one completion transaction.
 
@@ -371,8 +379,10 @@ stdin, without provider executable names or launch flags. The exact child argv
 is represented only by its command digest. A pending invocation is excluded
 from its own context capsule.
 
-Codex supervisor-history reading is implemented for step 5. Cached summaries
-and native runtime resume in steps 7, 9, and 12 remain unavailable. For a Codex
+Codex supervisor-history reading is implemented for step 5, and managed Claude
+assigned-session start/resume is implemented for steps 9, 10, and 12. Cached
+incremental summaries and managed Codex native runtime resume remain
+unavailable. For a Codex
 supervisor, `--context all` enriches pair history on a best-effort basis;
 `--context supervisor --context-mode required` fails before spawning the
 delegated child when the exact thread cannot be read safely. Claude supervisor
@@ -496,8 +506,8 @@ pairs(id, pair_key, workspace_id, supervisor_session_id, subagent_id,
       created_at, last_seen)
 pair_inheritance(target_pair_id, source_pair_id, declared_at)
 workspace_memories(id, workspace_id, subagent_id, created_at)
-child_sessions(id, pair_id, child_kind, profile_hash, profile_schema_version,
-               native_id, status, created_at, last_seen, retired_at,
+child_sessions(id, pair_id, child_kind, workstream_id, profile_hash,
+               profile_schema_version, native_id, status, created_at, last_seen, retired_at,
                retired_reason)
 invocations(id, pair_id, sequence, status, started_at, completed_at,
             child_session_id, command_digest, exit_kind, exit_code, signal)
@@ -506,12 +516,12 @@ summaries(id, scope_kind, scope_id, source_digest, summary_digest,
           summarizer_id, template_version, redaction_version, created_at)
 ```
 
-The MVP uses SQLite `user_version = 4`. It implements `workspaces`,
+The MVP uses SQLite `user_version = 5`. It implements `workspaces`,
 `supervisor_sessions`, `pairs`, `pair_inheritance`, `invocations`, and
-`exchange_messages`, plus the inert provider-native continuity substrate in
-`child_sessions` and the nullable `invocations.child_session_id` link. Runtime
-session assignment and resume are not enabled merely because these rows can be
-stored. It
+`exchange_messages`, plus workstream-scoped provider-native continuity in
+`child_sessions` and the nullable `invocations.child_session_id` link. Claude
+assignment and exact resume consume this substrate; legacy pre-version-5 rows
+retain a null workstream and remain auditable but are never resumable. It
 enforces one pair row for each workspace/supervisor-session/subagent tuple and
 allocates monotonically increasing per-pair invocation sequences under an
 immediate transaction. Pending, completed, spawn-failed, and abandoned runs are
@@ -658,13 +668,17 @@ applicable, generation time, truncation flag, and source digest.
 
 ### 13.1 Claude Code child
 
-The MVP recognizes `claude -p` / `claude --print`, preserves the caller's argv,
-and prepends the context bootstrap through stdin. Claude native resume,
-continue, session-id, and fork options are rejected in managed mode rather than
-combined ambiguously with pair memory. Use explicit `--context none
---no-record` passthrough when provider-native session behavior is required.
-Until managed child sessions land, wrapper `--fresh` also fails before state
-access or child spawn instead of being accepted without changing behavior.
+The MVP recognizes `claude -p` / `claude --print`, preserves the caller's argv
+for command digest, profile, and task projection, and prepends the context
+bootstrap through stdin. Caller-supplied Claude resume, continue, session-id,
+and fork options are rejected in managed mode. With `--workstream ID --fresh`,
+the wrapper persists a UUIDv7 assigned session and injects `--session-id ID`
+ahead of the caller argv. With `--workstream ID --resume`, it requires the exact
+active compatible row and injects `--resume ID`. Injection never changes the
+caller-derived profile. A successful exit promotes an assigned session to
+active; a nonzero exit leaves it assigned and therefore non-resumable; a spawn
+failure marks it invalid. A later explicit fresh start retires the prior live
+row transactionally. Dry-run never assigns, retires, links, or spawns.
 
 ### 13.2 Codex child
 
@@ -696,20 +710,17 @@ Exclusions are limited to provider options with known non-variadic arity; a
 future ambiguous option remains included. In particular, Codex task text is
 omitted only when it appears immediately after `exec` or after an explicit
 `--`; an ambiguous trailing positional remains hashed. A profile change starts
-a new child runtime session while retaining pair history.
+a new child runtime session only through an explicit `--fresh`; `--resume`
+fails before spawn while retaining pair history.
 
-Schema version 4 stores at most one live `assigned` or `active` child session
-for each pair, child kind, profile schema version, and profile hash. Deliberate
-replacement produces a terminal `retired` row; provider rejection produces a
-terminal `invalid` row. Historical rows remain for audit, and deleting a pair
-cascades to its child sessions. This storage and hashing substrate is present
-before runtime resume is enabled, so `--fresh` continues to fail closed until
-the later assigned-session slice lands.
-
-Before managed resume is enabled, a later SQLite migration must add
-`workstream_id` to the live-session uniqueness key. It must not add the
-workstream to `PairKey`, because doing so would fragment the role-level ledger
-and invalidate existing pair identities.
+Schema version 5 stores at most one live `assigned` or `active` child session
+for each pair, child kind, and non-null workstream. Deliberate replacement
+produces a terminal `retired` row; provider rejection produces a terminal
+`invalid` row. Historical rows remain for audit, and deleting a pair cascades
+to its child sessions. Legacy rows with a null workstream remain auditable but
+cannot satisfy a resume lookup. Fresh replacement and insertion share one
+immediate transaction, so an insertion failure rolls back retirement.
+`workstream_id` remains outside `PairKey` to preserve the role-level ledger.
 
 ### 13.4 Claude prompt placement
 
@@ -836,8 +847,8 @@ is to test the vocabulary and workflow before committing to those mechanisms.
 
 Implementation status: the usable MVP implements explicit supervisor
 references, unambiguous native Codex/Claude environment detection, canonical
-path-based workspace identity, conversation `PairKey` derivation, the version 4
-SQLite pair/exchange ledger and inert child-session substrate,
+path-based workspace identity, conversation `PairKey` derivation, the version 5
+SQLite pair/exchange ledger and workstream-scoped child-session substrate,
 common-credential redaction, deterministic recent
 history summaries, explicit one-way same-conversation pair inheritance,
 owner-only context capsules with explicit pointer/inline delivery, raw stream
@@ -845,10 +856,11 @@ forwarding, signal propagation, and
 actual `claude -p` / `codex exec` child execution. `context`,
 `log`, `pairs`, `forget`, and `doctor` are operational. Managed-parent manifest
 resolution, hook-registry detection, the Claude supervisor-history adapter,
-workspace memory, native child-session resume, configured agent aliases, and
+workspace memory, managed Codex native resume, configured agent aliases, and
 cached incremental summarization remain deferred and fail explicitly where
-requested. The Codex app-server supervisor-history adapter is implemented with
-bounded, read-only, allowlisted projection.
+requested. Managed Claude assigned-session start and exact active-session resume
+are implemented. The Codex app-server supervisor-history adapter is implemented
+with bounded, read-only, allowlisted projection.
 
 Repository CI runs formatting, Clippy with warnings denied, and all-target,
 all-feature tests on Linux and macOS. End-to-end contract tests execute the
@@ -864,16 +876,14 @@ provider-neutral, implementation-deferred decision in
 
 ### Slice 2: Claude runtime continuity
 
-- schema migration adding provider-native child sessions (implemented as the
-  inert SQLite version 4 substrate);
-- a migration adding explicit workstream identity to the child-session resume
-  key without changing `PairKey`;
-- command-profile compatibility hashing (implemented but not yet consumed by
-  managed execution);
-- caller-assigned Claude session IDs and exact resume;
-- explicit new-session versus resume selection, with resume requiring a
-  workstream and no silent same-invocation fallback; and
-- continuity provenance on every invocation.
+- provider-native child-session storage and the version 5 workstream migration
+  without changing `PairKey` (implemented);
+- command-profile compatibility hashing consumed by resume (implemented);
+- caller-assigned Claude session IDs and exact active-session resume
+  (implemented);
+- explicit fresh versus resume selection with no silent fallback (implemented);
+  and
+- continuity provenance on every invocation (implemented).
 
 ### Slice 3: remaining history and nested delegation
 

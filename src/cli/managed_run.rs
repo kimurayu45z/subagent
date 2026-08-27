@@ -11,16 +11,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use super::capsule::{self, Capsule, CapsuleRequest, InheritedHistory};
-use super::child;
+use super::child::{self, ClaudeSessionMode, CommandProfile, ProfileHash};
 use super::history::{self, SupervisorHistory};
 use super::id::SubagentId;
 use super::process::{self, ChildExit, ChildOutcome, ChildRunRequest};
 use super::redaction::{self, RedactionResult};
-use super::run_cmd::{ContextDelivery, ContextMode, ContextScope, SummarizerChoice};
+use super::run_cmd::{
+    ContextDelivery, ContextMode, ContextScope, NativeContinuity, SummarizerChoice,
+};
 use super::state_dir;
-use super::store::{self, BegunInvocation, ChildKind, ExchangeBody, ExitOutcome};
+use super::store::{
+    self, BegunInvocation, ChildKind, ChildSessionRecord, ChildSessionRetirement,
+    ChildSessionStatus, ExchangeBody, ExitOutcome,
+};
 use super::summarizer;
 use super::supervisor::SupervisorRef;
+use super::workstream::WorkstreamId;
 use super::wrapper_error_exit;
 
 const DEFAULT_MAX_CONTEXT_BYTES: u64 = 256 * 1024;
@@ -46,6 +52,8 @@ pub(crate) struct ManagedRunRequest<'a> {
     pub summarizer: &'a SummarizerChoice,
     pub summarize_above_bytes: u64,
     pub max_context_bytes: Option<u64>,
+    pub workstream: Option<&'a WorkstreamId>,
+    pub native_continuity: NativeContinuity,
     pub no_record: bool,
     pub quiet: bool,
     pub forward_signals: bool,
@@ -167,6 +175,13 @@ pub(crate) fn execute(
         );
         return wrapper_error_exit();
     };
+    if request.workstream.is_some() && kind != ChildKind::Claude {
+        let _ = writeln!(
+            err,
+            "subagent: managed native continuity currently supports only Claude Code"
+        );
+        return wrapper_error_exit();
+    }
 
     let state_root: PathBuf = match state_dir::resolve_state_root(request.state_dir_override) {
         Ok(path) => path,
@@ -182,6 +197,33 @@ pub(crate) fn execute(
             return wrapper_error_exit();
         }
     };
+
+    let profile_hash: Option<ProfileHash> = request.workstream.map(|_workstream: &WorkstreamId| {
+        child::command_profile_hash(&CommandProfile {
+            child_kind: kind,
+            program: request.program,
+            working_directory: &pair.workspace,
+            args: request.args,
+        })
+    });
+    let resolved_resume: Option<ChildSessionRecord> =
+        if request.native_continuity == NativeContinuity::Resume {
+            let workstream: &WorkstreamId = request
+                .workstream
+                .expect("resume continuity is validated with a workstream");
+            let profile_hash: ProfileHash =
+                profile_hash.expect("tracked continuity always computes a profile hash");
+            match resolve_resume_session(&ledger, &pair.pair_key, kind, workstream, profile_hash) {
+                Ok(session) => Some(session),
+                Err(message) => {
+                    let _ = writeln!(err, "subagent: {message}");
+                    return wrapper_error_exit();
+                }
+            }
+        } else {
+            None
+        };
+
     let cutoff: i64 = unix_now().saturating_sub(STALE_PENDING_AFTER_SECONDS);
     if let Err(error) = ledger.abandon_stale_pending_invocations(&pair.pair_key, cutoff) {
         let _ = writeln!(
@@ -195,6 +237,8 @@ pub(crate) fn execute(
     let provenance: String = context_provenance(
         request.context_scope,
         request.context_delivery,
+        request.native_continuity,
+        request.workstream,
         &supervisor_history,
     );
     let program_name: String = std::path::Path::new(request.program)
@@ -217,6 +261,46 @@ pub(crate) fn execute(
             return wrapper_error_exit();
         }
     };
+
+    let native_session: Option<ChildSessionRecord> = match request.native_continuity {
+        NativeContinuity::Untracked => None,
+        NativeContinuity::Fresh => {
+            let workstream: &WorkstreamId = request
+                .workstream
+                .expect("fresh continuity is validated with a workstream");
+            let profile_hash: ProfileHash =
+                profile_hash.expect("tracked continuity always computes a profile hash");
+            let native_id: String = Uuid::now_v7().to_string();
+            match ledger.assign_fresh_child_session(
+                &pair.pair_key,
+                kind,
+                workstream.as_str(),
+                profile_hash.as_bytes(),
+                &native_id,
+            ) {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    let _ = ledger.mark_spawn_failed(&begun.invocation_id);
+                    let _ = writeln!(
+                        err,
+                        "subagent: failed to assign fresh child session: {error}"
+                    );
+                    return wrapper_error_exit();
+                }
+            }
+        }
+        NativeContinuity::Resume => {
+            Some(resolved_resume.expect("resume resolution succeeds before invocation allocation"))
+        }
+    };
+    if let Some(session) = &native_session
+        && let Err(error) =
+            ledger.link_invocation_child_session(&begun.invocation_id, &session.native_id)
+    {
+        let _ = ledger.mark_spawn_failed(&begun.invocation_id);
+        let _ = writeln!(err, "subagent: failed to link child session: {error}");
+        return wrapper_error_exit();
+    }
 
     let capsule: Option<Capsule> = match prepare_capsule(
         &request,
@@ -249,10 +333,22 @@ pub(crate) fn execute(
     }
 
     let stdin_bytes: Vec<u8> = prepare_child_stdin(capsule.as_ref(), request.caller_stdin);
+    let spawn_args_storage: Option<Vec<OsString>> =
+        native_session.as_ref().map(|session: &ChildSessionRecord| {
+            let mode: ClaudeSessionMode = match request.native_continuity {
+                NativeContinuity::Fresh => ClaudeSessionMode::Assign,
+                NativeContinuity::Resume => ClaudeSessionMode::Resume,
+                NativeContinuity::Untracked => {
+                    unreachable!("an untracked invocation has no native session")
+                }
+            };
+            child::inject_claude_session_args(request.args, mode, &session.native_id)
+        });
+    let spawn_args: &[OsString] = spawn_args_storage.as_deref().unwrap_or(request.args);
     let outcome: ChildOutcome = match process::run_child(
         ChildRunRequest {
             program: request.program,
-            args: request.args,
+            args: spawn_args,
             cwd: request.cwd,
             stdin_bytes,
             env_overrides: Vec::new(),
@@ -265,6 +361,15 @@ pub(crate) fn execute(
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
+            if request.native_continuity == NativeContinuity::Fresh
+                && let Some(session) = &native_session
+            {
+                let _ = ledger.retire_child_session(
+                    &pair.pair_key,
+                    &session.native_id,
+                    ChildSessionRetirement::ProviderRejected,
+                );
+            }
             let _ = ledger.mark_spawn_failed(&begun.invocation_id);
             let _ = writeln!(err, "subagent: {error}");
             return wrapper_error_exit();
@@ -281,6 +386,15 @@ pub(crate) fn execute(
         redaction_classes: response_redaction.redaction_classes,
     };
     let exit_outcome: ExitOutcome = store_exit(outcome.exit);
+    if child_exit_succeeded(outcome.exit)
+        && let Some(session) = &native_session
+        && let Err(error) = ledger.mark_child_session_active(&pair.pair_key, &session.native_id)
+    {
+        let _ = writeln!(
+            err,
+            "subagent: warning: child succeeded but its native session could not be activated: {error}"
+        );
+    }
     if let Err(error) = ledger.complete_invocation(&begun.invocation_id, exit_outcome, response) {
         let _ = writeln!(
             err,
@@ -523,6 +637,8 @@ fn prepare_child_stdin(capsule: Option<&Capsule>, caller_stdin: &[u8]) -> Vec<u8
 fn context_provenance(
     scope: ContextScope,
     delivery: ContextDelivery,
+    native_continuity: NativeContinuity,
+    workstream: Option<&WorkstreamId>,
     supervisor_history: &SupervisorHistory,
 ) -> String {
     let pair: &str = if matches!(scope, ContextScope::Pair | ContextScope::All) {
@@ -535,7 +651,57 @@ fn context_provenance(
         SupervisorHistory::Unavailable { .. } => "unavailable",
         SupervisorHistory::NotRequested => "not_requested",
     };
-    format!("{{\"pair\":\"{pair}\",\"supervisor\":\"{supervisor}\",\"delivery\":\"{delivery}\"}}")
+    let workstream_json: String = workstream
+        .map(|id: &WorkstreamId| format!("\"{}\"", id.as_str()))
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        "{{\"pair\":\"{pair}\",\"supervisor\":\"{supervisor}\",\"delivery\":\"{delivery}\",\"native_continuity\":\"{native_continuity}\",\"workstream\":{workstream_json}}}"
+    )
+}
+
+pub(crate) fn resolve_resume_session(
+    ledger: &store::Store,
+    pair_key: &super::pair_key::PairKey,
+    child_kind: ChildKind,
+    workstream: &WorkstreamId,
+    profile_hash: ProfileHash,
+) -> Result<ChildSessionRecord, String> {
+    let session: ChildSessionRecord = ledger
+        .live_child_session_for_workstream(pair_key, child_kind, workstream.as_str())
+        .map_err(|error| format!("failed to resolve workstream session: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "no live native session exists for workstream {:?}; start it with --fresh",
+                workstream.as_str()
+            )
+        })?;
+    if session.status != ChildSessionStatus::Active {
+        return Err(format!(
+            "workstream {:?} was assigned but never confirmed by a successful child exit; restart it with --fresh",
+            workstream.as_str()
+        ));
+    }
+    if session.profile_schema_version != i64::from(child::COMMAND_PROFILE_SCHEMA_VERSION) {
+        return Err(format!(
+            "workstream {:?} uses command profile schema {}, but this build requires {}; restart it with --fresh",
+            workstream.as_str(),
+            session.profile_schema_version,
+            child::COMMAND_PROFILE_SCHEMA_VERSION
+        ));
+    }
+    if session.profile_hash != *profile_hash.as_bytes() {
+        return Err(format!(
+            "workstream {:?} is bound to command profile {}, but this invocation uses {}; restart it with --fresh",
+            workstream.as_str(),
+            ProfileHash::from_bytes(session.profile_hash).to_hex(),
+            profile_hash.to_hex()
+        ));
+    }
+    Ok(session)
+}
+
+fn child_exit_succeeded(exit: ChildExit) -> bool {
+    matches!(exit, ChildExit::Exited(0))
 }
 
 fn report_forwarding_errors(outcome: &ChildOutcome, err: &mut dyn Write) {

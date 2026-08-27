@@ -41,22 +41,31 @@ impl SubagentId {
     }
 
     fn is_valid(raw: &str) -> bool {
-        if raw.is_empty() || raw.len() > MAX_ID_LEN {
-            return false;
-        }
-        let mut chars = raw.chars();
-        let Some(first) = chars.next() else {
-            return false;
-        };
-        if !first.is_ascii_alphanumeric() {
-            return false;
-        }
-        chars.all(|c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        is_valid_logical_name(raw)
     }
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+pub(crate) fn is_valid_logical_name(raw: &str) -> bool {
+    if raw.is_empty() || raw.len() > MAX_ID_LEN {
+        return false;
+    }
+    let mut chars: std::str::Chars<'_> = raw.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    chars.all(|character: char| {
+        character.is_ascii_alphanumeric()
+            || character == '.'
+            || character == '_'
+            || character == '-'
+    })
 }
 
 impl fmt::Display for SubagentId {

@@ -108,7 +108,12 @@ fn capabilities() -> Vec<Capability> {
         capability(
             "child-session-store",
             CapabilityState::Implemented,
-            "SQLite schema version 4 stores typed provider-native child sessions and versioned command-profile hashes; managed assignment and resume are not wired yet",
+            "SQLite schema version 5 stores workstream-scoped provider-native child sessions, lifecycle state, and versioned command-profile hashes",
+        ),
+        capability(
+            "child-session-resume-claude",
+            CapabilityState::Implemented,
+            "Claude Code supports explicit --workstream with exactly one of --fresh or --resume; exact active-session and profile matching fail closed before spawn",
         ),
         capability(
             "task-request-projection",
@@ -148,7 +153,7 @@ fn capabilities() -> Vec<Capability> {
         capability(
             "child-adapter-claude",
             CapabilityState::Implemented,
-            "claude -p/--print is supported with argument-preserving stdin bootstrap injection; native resume is intentionally deferred",
+            "claude -p/--print is supported with argument-preserving stdin bootstrap injection and wrapper-managed --session-id/--resume injection; caller-native continuity flags remain rejected",
         ),
         capability(
             "child-adapter-codex",
@@ -222,7 +227,7 @@ mod tests {
         let code = execute(&args, &mut out, &mut err);
         assert_eq!(code, ExitCode::SUCCESS);
         let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["kind"], "doctor");
         assert_eq!(value["status"], "ok");
         assert!(value["body"]["capabilities"].as_array().unwrap().len() >= capabilities().len());
@@ -236,6 +241,16 @@ mod tests {
             .find(|c| c.name == "child-spawn")
             .unwrap();
         assert_eq!(child_spawn.state, CapabilityState::Implemented);
+    }
+
+    #[test]
+    fn managed_claude_resume_capability_is_implemented() {
+        let capabilities: Vec<Capability> = capabilities();
+        let managed_resume: &Capability = capabilities
+            .iter()
+            .find(|capability| capability.name == "child-session-resume-claude")
+            .unwrap();
+        assert_eq!(managed_resume.state, CapabilityState::Implemented);
     }
 
     #[test]

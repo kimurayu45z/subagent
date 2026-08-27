@@ -206,7 +206,7 @@ fn ambiguous_claude_prompt_after_provider_option_fails_before_spawn() {
 
 #[cfg(unix)]
 #[test]
-fn fresh_fails_closed_without_state_or_child_spawn() {
+fn fresh_without_workstream_fails_closed_without_state_or_child_spawn() {
     let temp_dir: tempfile::TempDir = isolated_state_dir();
     let state_root: PathBuf = temp_dir.path().join("state");
     let canary_path: PathBuf = temp_dir.path().join("canary");
@@ -219,10 +219,413 @@ fn fresh_fails_closed_without_state_or_child_spawn() {
         .assert()
         .code(WRAPPER_ERROR_EXIT)
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("--fresh is not implemented"));
+        .stderr(predicate::str::contains("--fresh requires --workstream"));
 
     assert!(!state_root.exists(), "--fresh created wrapper state");
     assert!(!canary_path.exists(), "--fresh reached the child process");
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_claude_workstream_fresh_then_resume_reuses_the_exact_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let claude_path: PathBuf = workspace.path().join("claude");
+    let session_file: PathBuf = workspace.path().join("assigned-session");
+    fs::write(
+        &claude_path,
+        "#!/bin/sh\ncase \"$1\" in\n  --session-id)\n    test \"$3\" = '-p' || exit 70\n    test \"$4\" = 'first task' || exit 71\n    printf '%s' \"$2\" > \"$SESSION_FILE\"\n    printf 'FRESH_OK\\n'\n    ;;\n  --resume)\n    test \"$2\" = \"$(cat \"$SESSION_FILE\")\" || exit 72\n    test \"$3\" = '-p' || exit 73\n    test \"$4\" = 'second task' || exit 74\n    printf 'RESUME_OK\\n'\n    ;;\n  *) exit 75 ;;\nesac\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&claude_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&claude_path, permissions).unwrap();
+
+    let run = |continuity_flag: &str, task: &str| -> std::process::Output {
+        subagent_with_clean_supervisor_env(state_dir.path())
+            .current_dir(workspace.path())
+            .env("SESSION_FILE", &session_file)
+            .args([
+                "--id",
+                "claude-haiku-implementer",
+                "--supervisor",
+                "codex:workstream-contract",
+                "--context",
+                "pair",
+                "--workstream",
+                "issue-42",
+                continuity_flag,
+                "--quiet",
+                "--",
+            ])
+            .arg(&claude_path)
+            .args(["-p", task, "--model", "haiku"])
+            .output()
+            .unwrap()
+    };
+
+    let fresh: std::process::Output = run("--fresh", "first task");
+    assert!(
+        fresh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+    assert_eq!(fresh.stdout, b"FRESH_OK\n");
+    let assigned_id: String = fs::read_to_string(&session_file).unwrap();
+    assert!(uuid::Uuid::parse_str(&assigned_id).is_ok());
+
+    let resumed: std::process::Output = run("--resume", "second task");
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(resumed.stdout, b"RESUME_OK\n");
+
+    let ledger_path: PathBuf = state_dir.path().join("ledger.sqlite3");
+    let connection: rusqlite::Connection = rusqlite::Connection::open(ledger_path).unwrap();
+    let (native_id, status, workstream): (String, String, String) = connection
+        .query_row(
+            "SELECT native_id, status, workstream_id FROM child_sessions WHERE status = 'active'",
+            [],
+            |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(native_id, assigned_id);
+    assert_eq!(status, "active");
+    assert_eq!(workstream, "issue-42");
+    let linked_invocations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM invocations WHERE child_session_id = (SELECT id FROM child_sessions WHERE native_id = ?1)",
+            [&assigned_id],
+            |row: &rusqlite::Row<'_>| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(linked_invocations, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_missing_or_profile_mismatched_session_fails_before_spawn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let claude_path: PathBuf = workspace.path().join("claude");
+    let canary_path: PathBuf = workspace.path().join("resume-canary");
+    fs::write(
+        &claude_path,
+        "#!/bin/sh\ncase \"$4\" in\n  seed) printf 'SEED_OK\\n' ;;\n  *) : > \"$RESUME_CANARY\"; printf 'UNEXPECTED_SPAWN\\n' ;;\nesac\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&claude_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&claude_path, permissions).unwrap();
+
+    let base = |workstream: &str, flag: &str, task: &str, model: &str| -> Command {
+        let mut command: Command = subagent_with_clean_supervisor_env(state_dir.path());
+        command
+            .current_dir(workspace.path())
+            .env("RESUME_CANARY", &canary_path)
+            .args([
+                "--id",
+                "claude-haiku-reviewer",
+                "--supervisor",
+                "codex:resume-errors",
+                "--context",
+                "pair",
+                "--workstream",
+                workstream,
+                flag,
+                "--quiet",
+                "--",
+            ])
+            .arg(&claude_path)
+            .args(["-p", task, "--model", model]);
+        command
+    };
+
+    base("missing", "--resume", "must not run", "haiku")
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stderr(predicate::str::contains("no live native session"));
+    assert!(!canary_path.exists());
+
+    base("profile-check", "--fresh", "seed", "haiku")
+        .assert()
+        .success()
+        .stdout("SEED_OK\n");
+    base("profile-check", "--resume", "must not run", "sonnet")
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stderr(predicate::str::contains("bound to command profile"));
+    assert!(!canary_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn nonzero_fresh_session_stays_unconfirmed_and_cannot_be_resumed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let claude_path: PathBuf = workspace.path().join("claude");
+    let canary_path: PathBuf = workspace.path().join("unconfirmed-canary");
+    fs::write(
+        &claude_path,
+        "#!/bin/sh\ncase \"$1\" in\n  --session-id) exit 42 ;;\n  --resume) : > \"$UNCONFIRMED_CANARY\"; exit 0 ;;\nesac\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&claude_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&claude_path, permissions).unwrap();
+
+    let command = |flag: &str| -> Command {
+        let mut command: Command = subagent_with_clean_supervisor_env(state_dir.path());
+        command
+            .current_dir(workspace.path())
+            .env("UNCONFIRMED_CANARY", &canary_path)
+            .args([
+                "--id",
+                "claude-haiku-worker",
+                "--supervisor",
+                "codex:unconfirmed",
+                "--context",
+                "pair",
+                "--workstream",
+                "failed-first-run",
+                flag,
+                "--quiet",
+                "--",
+            ])
+            .arg(&claude_path)
+            .args(["-p", "task", "--model", "haiku"]);
+        command
+    };
+
+    command("--fresh").assert().code(42);
+    command("--resume")
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stderr(predicate::str::contains("assigned but never confirmed"));
+    assert!(!canary_path.exists());
+
+    let connection: rusqlite::Connection =
+        rusqlite::Connection::open(state_dir.path().join("ledger.sqlite3")).unwrap();
+    let status: String = connection
+        .query_row(
+            "SELECT status FROM child_sessions WHERE workstream_id = 'failed-first-run'",
+            [],
+            |row: &rusqlite::Row<'_>| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "assigned");
+}
+
+#[cfg(unix)]
+#[test]
+fn fresh_spawn_failure_invalidates_the_assigned_session() {
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let missing_claude: PathBuf = workspace.path().join("claude");
+    let run = |flag: &str| -> Command {
+        let mut command: Command = subagent_with_clean_supervisor_env(state_dir.path());
+        command
+            .current_dir(workspace.path())
+            .args([
+                "--id",
+                "claude-haiku-worker",
+                "--supervisor",
+                "codex:spawn-failure",
+                "--context",
+                "pair",
+                "--workstream",
+                "missing-binary",
+                flag,
+                "--quiet",
+                "--",
+            ])
+            .arg(&missing_claude)
+            .args(["-p", "task", "--model", "haiku"]);
+        command
+    };
+
+    run("--fresh")
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stderr(predicate::str::contains("failed to spawn child"));
+
+    let connection: rusqlite::Connection =
+        rusqlite::Connection::open(state_dir.path().join("ledger.sqlite3")).unwrap();
+    let (status, reason): (String, String) = connection
+        .query_row(
+            "SELECT status, retired_reason FROM child_sessions WHERE workstream_id = 'missing-binary'",
+            [],
+            |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "invalid");
+    assert_eq!(reason, "provider_rejected");
+    drop(connection);
+
+    run("--resume")
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stderr(predicate::str::contains("no live native session"));
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_workstream_flag_combinations_fail_before_state_or_spawn() {
+    let temp_dir: tempfile::TempDir = isolated_state_dir();
+    let state_root: PathBuf = temp_dir.path().join("state");
+    let canary_path: PathBuf = temp_dir.path().join("continuity-canary");
+    let claude_path: PathBuf = write_named_canary_script(temp_dir.path(), &canary_path, "claude");
+
+    let cases: Vec<Vec<OsString>> = vec![
+        vec![
+            "--id".into(),
+            "worker".into(),
+            "--workstream".into(),
+            "lane".into(),
+            "--".into(),
+            claude_path.as_os_str().to_os_string(),
+            "-p".into(),
+            "task".into(),
+        ],
+        vec![
+            "--id".into(),
+            "worker".into(),
+            "--workstream".into(),
+            "lane".into(),
+            "--fresh".into(),
+            "--resume".into(),
+            "--".into(),
+            claude_path.as_os_str().to_os_string(),
+            "-p".into(),
+            "task".into(),
+        ],
+        vec![
+            "--id".into(),
+            "worker".into(),
+            "--workstream".into(),
+            "lane".into(),
+            "--fresh".into(),
+            "--no-record".into(),
+            "--".into(),
+            claude_path.as_os_str().to_os_string(),
+            "-p".into(),
+            "task".into(),
+        ],
+        vec![
+            "--id".into(),
+            "worker".into(),
+            "--workstream".into(),
+            "lane".into(),
+            "--fresh".into(),
+            "--".into(),
+            "codex".into(),
+            "exec".into(),
+            "task".into(),
+        ],
+    ];
+
+    for args in cases {
+        subagent_with_clean_supervisor_env(&state_root)
+            .env("CODEX_THREAD_ID", "invalid-continuity")
+            .args(args)
+            .assert()
+            .code(WRAPPER_ERROR_EXIT)
+            .stdout(predicate::str::is_empty());
+    }
+    assert!(!state_root.exists());
+    assert!(!canary_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn workstream_dry_run_never_replaces_or_invokes_the_live_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let claude_path: PathBuf = workspace.path().join("claude");
+    fs::write(&claude_path, "#!/bin/sh\nprintf 'ACTIVE_OK\\n'\n").unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&claude_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&claude_path, permissions).unwrap();
+
+    let base_args: [&str; 9] = [
+        "--id",
+        "claude-haiku-worker",
+        "--supervisor",
+        "codex:dry-run-continuity",
+        "--context",
+        "pair",
+        "--workstream",
+        "dry-run-lane",
+        "--quiet",
+    ];
+    subagent_with_clean_supervisor_env(state_dir.path())
+        .current_dir(workspace.path())
+        .args(base_args)
+        .args(["--fresh", "--"])
+        .arg(&claude_path)
+        .args(["-p", "seed", "--model", "haiku"])
+        .assert()
+        .success()
+        .stdout("ACTIVE_OK\n");
+
+    let ledger_path: PathBuf = state_dir.path().join("ledger.sqlite3");
+    let before: (String, i64) = {
+        let connection: rusqlite::Connection = rusqlite::Connection::open(&ledger_path).unwrap();
+        let native_id: String = connection
+            .query_row(
+                "SELECT native_id FROM child_sessions WHERE workstream_id = 'dry-run-lane' AND status = 'active'",
+                [],
+                |row: &rusqlite::Row<'_>| row.get(0),
+            )
+            .unwrap();
+        let invocation_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM invocations",
+                [],
+                |row: &rusqlite::Row<'_>| row.get(0),
+            )
+            .unwrap();
+        (native_id, invocation_count)
+    };
+
+    for flag in ["--fresh", "--resume"] {
+        subagent_with_clean_supervisor_env(state_dir.path())
+            .current_dir(workspace.path())
+            .args(base_args)
+            .args([flag, "--dry-run", "--"])
+            .arg(&claude_path)
+            .args(["-p", "different task", "--model", "haiku"])
+            .assert()
+            .success();
+    }
+
+    let connection: rusqlite::Connection = rusqlite::Connection::open(ledger_path).unwrap();
+    let after_native_id: String = connection
+        .query_row(
+            "SELECT native_id FROM child_sessions WHERE workstream_id = 'dry-run-lane' AND status = 'active'",
+            [],
+            |row: &rusqlite::Row<'_>| row.get(0),
+        )
+        .unwrap();
+    let after_invocation_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM invocations",
+            [],
+            |row: &rusqlite::Row<'_>| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after_native_id, before.0);
+    assert_eq!(after_invocation_count, before.1);
 }
 
 #[cfg(unix)]
@@ -271,7 +674,7 @@ fn dry_run_writes_a_json_plan_report_preserving_child_arguments_verbatim() {
     let report_text = fs::read_to_string(&report_path).unwrap();
     let report: serde_json::Value = serde_json::from_str(&report_text).unwrap();
 
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["kind"], "run_plan");
     assert_eq!(report["status"], "ok");
     assert_eq!(report["body"]["id"], "reviewer");
@@ -893,7 +1296,7 @@ fn doctor_json_output_is_a_valid_versioned_report() {
         .stdout
         .clone();
     let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["kind"], "doctor");
     assert_eq!(report["status"], "ok");
     let capabilities = report["body"]["capabilities"].as_array().unwrap();

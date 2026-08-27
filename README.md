@@ -127,12 +127,28 @@ Accepted product decisions should live in version-controlled design files,
 ADRs, issues, or pull requests. The SQLite ledger is operational evidence and a
 recovery/indexing aid, not the canonical product specification.
 
-Managed provider-native resume is not enabled yet. The planned design adds an
-explicit workstream identity below the role pair; exact resume will require that
-workstream and a compatible child profile, and will fail rather than silently
-starting a new session. Until then, use direct provider-native resume for an
-exact follow-up and use `subagent` when role history, cross-provider handoff, or
-an audit trail is useful.
+For an intentional Claude Code continuation, give the chain its own workstream.
+Start it explicitly, then resume that exact provider session:
+
+```sh
+subagent --id claude-haiku-implementer \
+  --workstream issue-42 --fresh -- \
+  claude -p "Implement the first slice" --model haiku
+
+subagent --id claude-haiku-implementer \
+  --workstream issue-42 --resume -- \
+  claude -p "Fix the failing test from that slice" --model haiku
+```
+
+`--workstream` must be paired with exactly one of `--fresh` or `--resume`.
+Resume requires one active session with the same pair, Claude adapter, and
+command profile; a model, tool, MCP, permission, executable, or working-directory
+change fails before spawn and asks for `--fresh`. It never silently starts a new
+session. A managed Claude call without a workstream retains the ordinary
+untracked behavior. Caller-supplied Claude continuity flags remain rejected so
+the wrapper cannot disagree with its ledger. Managed Codex native resume remains
+deferred; use its direct provider-native resume form when exact continuity is
+required.
 
 Deterministic summary artifacts remain the offline default. Under pointer
 delivery they stay in the capsule for pull-based reading; they are not pasted

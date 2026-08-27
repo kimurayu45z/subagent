@@ -24,6 +24,7 @@ use super::state_dir;
 use super::store;
 use super::supervisor::{self, DetectionEnv, Provider, SupervisorRef};
 use super::workspace::WorkspaceRef;
+use super::workstream::WorkstreamId;
 use super::{handle_clap_error, split_on_double_dash, wrapper_error_exit};
 
 const SUBAGENT_ID_ENV: &str = "SUBAGENT_ID";
@@ -106,6 +107,26 @@ impl fmt::Display for ContextDelivery {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeContinuity {
+    #[default]
+    Untracked,
+    Fresh,
+    Resume,
+}
+
+impl fmt::Display for NativeContinuity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text: &str = match self {
+            NativeContinuity::Untracked => "untracked",
+            NativeContinuity::Fresh => "fresh",
+            NativeContinuity::Resume => "resume",
+        };
+        formatter.write_str(text)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SummarizerChoice {
@@ -175,7 +196,13 @@ struct RunArgs {
     max_context_bytes: Option<u64>,
 
     #[arg(long)]
+    workstream: Option<String>,
+
+    #[arg(long)]
     fresh: bool,
+
+    #[arg(long)]
+    resume: bool,
 
     #[arg(long = "no-record")]
     no_record: bool,
@@ -237,7 +264,8 @@ struct RunPlan {
     summarizer: SummarizerChoice,
     summarize_above_bytes: u64,
     max_context_bytes: Option<u64>,
-    fresh: bool,
+    workstream: Option<WorkstreamId>,
+    native_continuity: NativeContinuity,
     no_record: bool,
     quiet: bool,
     program: OsString,
@@ -258,7 +286,8 @@ struct RunPlanReport {
     summarizer: SummarizerChoice,
     summarize_above_bytes: u64,
     max_context_bytes: Option<u64>,
-    fresh: bool,
+    workstream: Option<WorkstreamId>,
+    native_continuity: NativeContinuity,
     no_record: bool,
     quiet: bool,
     program: OsStringJson,
@@ -280,7 +309,8 @@ impl From<&RunPlan> for RunPlanReport {
             summarizer: plan.summarizer.clone(),
             summarize_above_bytes: plan.summarize_above_bytes,
             max_context_bytes: plan.max_context_bytes,
-            fresh: plan.fresh,
+            workstream: plan.workstream.clone(),
+            native_continuity: plan.native_continuity,
             no_record: plan.no_record,
             quiet: plan.quiet,
             program: OsStringJson::from_os_str(&plan.program),
@@ -369,15 +399,6 @@ fn execute_with_env(
         let _ = writeln!(err, "subagent: no child command given after `--`");
         return wrapper_error_exit();
     }
-    if run_args.fresh {
-        let _ = writeln!(
-            err,
-            "subagent: --fresh is not implemented until managed native child-session \
-             continuity lands; remove --fresh to use pair-ledger continuity"
-        );
-        return wrapper_error_exit();
-    }
-
     let id: Option<SubagentId> = match resolve_id(run_args.id.as_deref(), subagent_id_env, err) {
         Ok(id) => id,
         Err(code) => return code,
@@ -392,6 +413,42 @@ fn execute_with_env(
         },
         None => None,
     };
+    let workstream: Option<WorkstreamId> = match run_args.workstream.as_deref() {
+        Some(raw_id) => match WorkstreamId::parse(raw_id) {
+            Ok(workstream_id) => Some(workstream_id),
+            Err(invalid) => {
+                let _ = writeln!(err, "subagent: {invalid}");
+                return wrapper_error_exit();
+            }
+        },
+        None => None,
+    };
+    let native_continuity: NativeContinuity =
+        match (workstream.is_some(), run_args.fresh, run_args.resume) {
+            (false, false, false) => NativeContinuity::Untracked,
+            (true, true, false) => NativeContinuity::Fresh,
+            (true, false, true) => NativeContinuity::Resume,
+            (true, false, false) => {
+                let _ = writeln!(
+                    err,
+                    "subagent: --workstream requires exactly one of --fresh or --resume"
+                );
+                return wrapper_error_exit();
+            }
+            (false, true, false) | (false, false, true) => {
+                let flag: &str = if run_args.fresh {
+                    "--fresh"
+                } else {
+                    "--resume"
+                };
+                let _ = writeln!(err, "subagent: {flag} requires --workstream ID");
+                return wrapper_error_exit();
+            }
+            (_, true, true) => {
+                let _ = writeln!(err, "subagent: --fresh and --resume are mutually exclusive");
+                return wrapper_error_exit();
+            }
+        };
     if let (Some(target_id), Some(source_id)) = (&id, &inherit_from)
         && target_id == source_id
     {
@@ -422,6 +479,38 @@ fn execute_with_env(
              or --memory none"
         );
         return wrapper_error_exit();
+    }
+    if workstream.is_some() && (memory != MemoryMode::Conversation || run_args.no_record) {
+        let _ = writeln!(
+            err,
+            "subagent: --workstream requires recorded conversation memory; it cannot be combined with --memory none or --no-record"
+        );
+        return wrapper_error_exit();
+    }
+    if workstream.is_some() {
+        let continuity_kind: store::ChildKind =
+            match super::child::recognize_managed_child(&child_tokens[0], &child_tokens[1..]) {
+                Ok(kind) => kind,
+                Err(adapter_error) => {
+                    let _ = writeln!(err, "subagent: {adapter_error}");
+                    return wrapper_error_exit();
+                }
+            };
+        if continuity_kind != store::ChildKind::Claude {
+            let _ = writeln!(
+                err,
+                "subagent: managed native continuity currently supports only Claude Code; Codex workstreams are not implemented"
+            );
+            return wrapper_error_exit();
+        }
+        if let Err(adapter_error) = super::child::validate_managed_task_input(
+            continuity_kind,
+            &child_tokens[1..],
+            caller_stdin,
+        ) {
+            let _ = writeln!(err, "subagent: {adapter_error}");
+            return wrapper_error_exit();
+        }
     }
 
     let context: ContextScope = run_args.context.unwrap_or(if memory == MemoryMode::None {
@@ -509,13 +598,56 @@ fn execute_with_env(
         summarizer,
         summarize_above_bytes,
         max_context_bytes: run_args.max_context_bytes,
-        fresh: run_args.fresh,
+        workstream,
+        native_continuity,
         no_record: run_args.no_record,
         quiet: run_args.quiet,
         program: child_tokens[0].clone(),
         args: child_tokens[1..].to_vec(),
         ensured_pair,
     };
+
+    if run_args.dry_run && plan.native_continuity == NativeContinuity::Resume {
+        let pair: &store::EnsuredPair = plan
+            .ensured_pair
+            .as_ref()
+            .expect("resume validation requires a conversation pair");
+        let workstream: &WorkstreamId = plan
+            .workstream
+            .as_ref()
+            .expect("resume validation requires a workstream");
+        let state_root: PathBuf = match state_dir::resolve_state_root(state_dir_override) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = writeln!(err, "subagent: {error}");
+                return wrapper_error_exit();
+            }
+        };
+        let ledger: store::Store = match store::Store::open_for_write(&state_root) {
+            Ok(store) => store,
+            Err(error) => {
+                let _ = writeln!(err, "subagent: failed to open invocation ledger: {error}");
+                return wrapper_error_exit();
+            }
+        };
+        let profile_hash: super::child::ProfileHash =
+            super::child::command_profile_hash(&super::child::CommandProfile {
+                child_kind: store::ChildKind::Claude,
+                program: &plan.program,
+                working_directory: &pair.workspace,
+                args: &plan.args,
+            });
+        if let Err(message) = super::managed_run::resolve_resume_session(
+            &ledger,
+            &pair.pair_key,
+            store::ChildKind::Claude,
+            workstream,
+            profile_hash,
+        ) {
+            let _ = writeln!(err, "subagent: {message}");
+            return wrapper_error_exit();
+        }
+    }
 
     if let Some(report_path) = &run_args.report {
         let report = Report::new("run_plan", ReportStatus::Ok, RunPlanReport::from(&plan));
@@ -552,6 +684,8 @@ fn execute_with_env(
                 summarizer: &plan.summarizer,
                 summarize_above_bytes: plan.summarize_above_bytes,
                 max_context_bytes: plan.max_context_bytes,
+                workstream: plan.workstream.as_ref(),
+                native_continuity: plan.native_continuity,
                 no_record: plan.no_record,
                 quiet: plan.quiet,
                 forward_signals,
@@ -692,7 +826,13 @@ fn print_human_plan(plan: &RunPlan, dry_run: bool, err: &mut dyn Write) {
             .map(|bytes| bytes.to_string())
             .unwrap_or_else(|| "<unset>".to_string())
     );
-    let _ = writeln!(err, "  fresh:             {}", plan.fresh);
+    let workstream_display: &str = plan
+        .workstream
+        .as_ref()
+        .map(WorkstreamId::as_str)
+        .unwrap_or("<none>");
+    let _ = writeln!(err, "  workstream:        {workstream_display}");
+    let _ = writeln!(err, "  native continuity:{}", plan.native_continuity);
     let _ = writeln!(err, "  no-record:         {}", plan.no_record);
     if let Some(pair) = &plan.ensured_pair {
         let _ = writeln!(err, "  pair-key:          {}", pair.pair_key);
@@ -784,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_fails_closed_until_native_child_sessions_are_implemented() {
+    fn continuity_flags_require_an_explicit_workstream() {
         let args: Vec<OsString> = os(&[
             "--id",
             "claude-haiku-reviewer",
@@ -798,7 +938,7 @@ mod tests {
         let (code, out, err) = run(&args, None);
         assert_eq!(code, wrapper_error_exit());
         assert!(out.is_empty());
-        assert!(err.contains("--fresh is not implemented"));
+        assert!(err.contains("--fresh requires --workstream"));
         assert!(!err.contains("pair-key:"));
     }
 

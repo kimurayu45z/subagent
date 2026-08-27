@@ -30,6 +30,7 @@ mod store;
 mod summarizer;
 mod supervisor;
 mod workspace;
+mod workstream;
 
 /// Wrapper-level exit code used for every failure that happens before, or in
 /// place of, spawning a managed child process. See `docs/design.md` section
@@ -75,7 +76,9 @@ RUN OPTIONS:
     --summarizer deterministic|haiku|luna|none
     --summarize-above-bytes BYTES  Model summary threshold (default 16384)
     --max-context-bytes BYTES
-    --fresh
+    --workstream ID                 Explicit native-session task chain
+    --fresh                         Start/restart the named workstream
+    --resume                        Resume the named workstream exactly
     --no-record
     --dry-run
     --quiet

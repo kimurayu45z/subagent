@@ -86,7 +86,9 @@ Treat `pair-identity-store` separately from `pair-exchange-ledger`. Require the
 exchange ledger, context capsule, deterministic summarizer, and the intended
 child adapter to be `implemented` before claiming durable conversational memory
 is active. Require `pair-inheritance` before using an ID handoff and
-`summarizer-model` before selecting `haiku` or `luna`.
+`summarizer-model` before selecting `haiku` or `luna`. Require
+`child-session-resume-claude` before relying on wrapper-managed Claude native
+continuity.
 
 If the desired capability is reported as planned or unavailable:
 
@@ -126,9 +128,8 @@ does not need to be renamed to comply.
 
 The ID identifies a role, not a work chain. A new request to the same reviewer
 may be a separate assignment and must not be presented as "continue" merely
-because the ID matches. Managed native resume will later require a separate,
-explicit workstream identity; the installed milestone does not expose that
-option yet.
+because the ID matches. Wrapper-managed Claude native resume uses a separate,
+explicit workstream identity for one intentional follow-up chain.
 
 When an intentional model change also changes the model-prefixed ID, preserve
 the historical boundary with an explicit one-way handoff:
@@ -187,11 +188,26 @@ when the child needs continuity but its tool configuration or sandbox cannot
 read the capsule path. Inline delivery pushes the bounded summary into the
 bootstrap, so stale conclusions can bias a separate assignment.
 
-Do not combine managed mode with provider-native resume/fork flags; native
-runtime-session continuity is not implemented yet. Use the exact direct native
-resume form from the provider reference for a deliberate follow-up. Unknown
-programs are allowed only as explicit `--memory none --context none --no-record`
-passthrough.
+Do not combine managed mode with caller-supplied provider-native resume, fork,
+or session-ID flags. When `child-session-resume-claude` is implemented, start
+and resume one intentional Claude chain with wrapper options:
+
+```sh
+subagent --id claude-haiku-implementer --workstream issue-42 --fresh -- \
+  claude -p "Implement the first slice" --model haiku
+subagent --id claude-haiku-implementer --workstream issue-42 --resume -- \
+  claude -p "Fix the failing test" --model haiku
+```
+
+Use exactly one of `--fresh` or `--resume` with `--workstream`. Resume must find
+the active session for the same pair and workstream with an identical command
+profile; otherwise it fails before spawn and must not be replaced implicitly.
+Use `--fresh` deliberately when changing model, tools, MCP configuration,
+permissions, executable, or canonical working directory. A managed Claude run
+without a workstream is untracked native continuity. Managed Codex native resume
+remains unavailable until doctor says otherwise; use its exact direct resume
+form from the provider reference. Unknown programs are allowed only as explicit
+`--memory none --context none --no-record` passthrough.
 
 Inspect and manage durable state with:
 
