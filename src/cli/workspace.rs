@@ -126,14 +126,12 @@ mod tests {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
-        let dir = tempfile::tempdir().unwrap();
-        let raw_name: &OsStr = OsStr::from_bytes(&[0x66, 0x6f, 0xff, 0x6f]);
-        let child = dir.path().join(raw_name);
-        std::fs::create_dir(&child).unwrap();
-
-        let workspace = WorkspaceRef::from_dir(&child).unwrap();
-        let canonical_bytes: Vec<u8> = workspace.canonical_path().as_os_str().as_bytes().to_vec();
-        assert_eq!(workspace.identity_bytes(), canonical_bytes);
+        let raw_path: &OsStr =
+            OsStr::from_bytes(&[b'/', b't', b'm', b'p', b'/', b'f', b'o', 0xff, b'o']);
+        let workspace: WorkspaceRef = WorkspaceRef {
+            canonical_path: PathBuf::from(raw_path),
+        };
+        assert_eq!(workspace.identity_bytes(), raw_path.as_bytes());
         // The raw byte sequence must survive verbatim; a lossy projection
         // would have replaced 0xff with U+FFFD's UTF-8 encoding instead.
         assert!(workspace.identity_bytes().windows(1).any(|w| w == [0xff]));

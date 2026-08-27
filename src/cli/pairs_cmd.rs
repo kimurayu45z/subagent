@@ -340,7 +340,10 @@ mod tests {
         assert!(value["body"]["pairs"].as_array().unwrap().is_empty());
     }
 
-    #[cfg(unix)]
+    // macOS filesystem APIs reject creation of this invalid UTF-8 name with
+    // EILSEQ. The byte-preserving conversion itself has Unix-wide in-memory
+    // coverage in workspace.rs; this on-disk integration is Linux-specific.
+    #[cfg(target_os = "linux")]
     #[test]
     fn json_preserves_a_non_utf8_workspace_as_bytes() {
         use std::os::unix::ffi::OsStringExt;

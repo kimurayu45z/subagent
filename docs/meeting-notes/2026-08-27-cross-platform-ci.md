@@ -31,6 +31,13 @@ Local Linux verification covers the new tests and the complete suite. The
 macOS claim becomes verified only after the pushed GitHub Actions matrix job
 passes; adding the workflow alone is not evidence that the platform is green.
 
+The first matrix run passed on Ubuntu and exposed two pre-existing macOS test
+assumptions. macOS filesystem APIs rejected creation of invalid UTF-8 filenames
+with `EILSEQ`. Raw `OsStr`-to-byte preservation is now tested without touching
+the filesystem on every Unix target, while the on-disk non-UTF-8 workspace
+integration remains Linux-only. This reflects a platform capability boundary;
+it does not weaken normal macOS workspace coverage.
+
 ## Next
 
 Make the accepted but inert `--fresh` flag fail closed, then add the next SQLite
