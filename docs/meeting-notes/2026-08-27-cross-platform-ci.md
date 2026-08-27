@@ -40,5 +40,7 @@ it does not weaken normal macOS workspace coverage.
 
 ## Next
 
-Make the accepted but inert `--fresh` flag fail closed, then add the next SQLite
-migration for provider-native child sessions and profile compatibility.
+The follow-up run `33032128233` passed formatting, Clippy, and all tests on both
+Ubuntu and macOS. The next slice makes the accepted but inert `--fresh` flag
+fail closed, then proceeds to the SQLite migration for provider-native child
+sessions and profile compatibility.

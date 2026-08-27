@@ -636,6 +636,8 @@ and prepends the context bootstrap through stdin. Claude native resume,
 continue, session-id, and fork options are rejected in managed mode rather than
 combined ambiguously with pair memory. Use explicit `--context none
 --no-record` passthrough when provider-native session behavior is required.
+Until managed child sessions land, wrapper `--fresh` also fails before state
+access or child spawn instead of being accepted without changing behavior.
 
 ### 13.2 Codex child
 

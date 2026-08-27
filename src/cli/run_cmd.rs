@@ -345,6 +345,14 @@ fn execute_with_env(
         let _ = writeln!(err, "subagent: no child command given after `--`");
         return wrapper_error_exit();
     }
+    if run_args.fresh {
+        let _ = writeln!(
+            err,
+            "subagent: --fresh is not implemented until managed native child-session \
+             continuity lands; remove --fresh to use pair-ledger continuity"
+        );
+        return wrapper_error_exit();
+    }
 
     let id: Option<SubagentId> = match resolve_id(run_args.id.as_deref(), subagent_id_env, err) {
         Ok(id) => id,
@@ -746,6 +754,25 @@ mod tests {
         let (code, _out, err) = run(&args, None);
         assert_eq!(code, wrapper_error_exit());
         assert!(err.contains("no child command"));
+    }
+
+    #[test]
+    fn fresh_fails_closed_until_native_child_sessions_are_implemented() {
+        let args: Vec<OsString> = os(&[
+            "--id",
+            "claude-haiku-reviewer",
+            "--fresh",
+            "--dry-run",
+            "--",
+            "claude",
+            "-p",
+            "review the current diff",
+        ]);
+        let (code, out, err) = run(&args, None);
+        assert_eq!(code, wrapper_error_exit());
+        assert!(out.is_empty());
+        assert!(err.contains("--fresh is not implemented"));
+        assert!(!err.contains("pair-key:"));
     }
 
     #[test]

@@ -205,6 +205,27 @@ fn ambiguous_claude_prompt_after_provider_option_fails_before_spawn() {
 }
 
 #[cfg(unix)]
+#[test]
+fn fresh_fails_closed_without_state_or_child_spawn() {
+    let temp_dir: tempfile::TempDir = isolated_state_dir();
+    let state_root: PathBuf = temp_dir.path().join("state");
+    let canary_path: PathBuf = temp_dir.path().join("canary");
+    let script_path: PathBuf = write_named_canary_script(temp_dir.path(), &canary_path, "claude");
+
+    subagent_with_resolvable_supervisor(&state_root)
+        .args(["--id", "claude-haiku-reviewer", "--fresh", "--"])
+        .arg(&script_path)
+        .args(["-p", "review the current diff"])
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("--fresh is not implemented"));
+
+    assert!(!state_root.exists(), "--fresh created wrapper state");
+    assert!(!canary_path.exists(), "--fresh reached the child process");
+}
+
+#[cfg(unix)]
 fn write_canary_script(dir: &Path, canary_path: &Path) -> PathBuf {
     write_named_canary_script(dir, canary_path, "fake-child.sh")
 }
