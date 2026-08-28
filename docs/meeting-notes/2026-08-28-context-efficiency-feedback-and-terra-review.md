@@ -2,7 +2,7 @@
 
 Date: 2026-08-28
 
-Status: Experiment planned; no normative behavior change accepted yet
+Status: Experiment executed; no normative behavior change accepted yet
 
 This note records field feedback about `subagent` memory, a diversity review by
 GPT-5.6 Terra, and the controlled experiment chosen before changing defaults.
@@ -132,12 +132,12 @@ D compare delivery reachability without conflating it with native resume.
 
 The first execution is a mechanism pilot, not a performance conclusion. Repeat
 successful conditions at least three times before changing a default or making
-a provider-efficiency claim.
+a provider-efficiency claim. Results are recorded in
+[`2026-08-28-haiku-context-abcd-results.md`](2026-08-28-haiku-context-abcd-results.md).
 
 ## Implementation boundary
 
 The reproducible harness lives at
 [`../../scripts/experiments/claude-context-abcd.sh`](../../scripts/experiments/claude-context-abcd.sh).
-Experiment results will be appended to a separate dated note or a results
-section after the preserved artifacts are inspected. No canonical design change
-is made merely because one pilot succeeds or fails.
+Experiment results are kept in the separate dated note linked above. No
+canonical design change is made merely because one pilot succeeds or fails.
