@@ -5,14 +5,6 @@ set -euo pipefail
 # pointer delivery, and inline delivery. The experiment never cleans up its
 # temporary root so failed and successful runs remain inspectable.
 
-model="${CLAUDE_MODEL:-haiku}"
-supervisor="codex:claude-context-abcd-20260828"
-experiment_root="$(mktemp -d "${TMPDIR:-/tmp}/subagent-claude-context-20260828.XXXXXX")"
-workspace="$experiment_root/workspace"
-provider_state="$experiment_root/claude-config"
-fact_uuid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
-fact="CONTEXT_FACT=${fact_uuid%%-*}"
-
 require_command() {
     local command_name="$1"
     if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -24,6 +16,14 @@ require_command() {
 require_command claude
 require_command subagent
 require_command uuidgen
+
+model="${CLAUDE_MODEL:-haiku}"
+supervisor="codex:claude-context-abcd-20260828"
+experiment_root="$(mktemp -d "${TMPDIR:-/tmp}/subagent-claude-context-20260828.XXXXXX")"
+workspace="$experiment_root/workspace"
+provider_state="$experiment_root/claude-config"
+fact_uuid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+fact="ContextLease${fact_uuid%%-*}"
 
 mkdir -p "$workspace" "$provider_state"
 chmod 700 "$experiment_root" "$workspace" "$provider_state"
@@ -91,11 +91,11 @@ export CLAUDE_CONFIG_DIR="$provider_state"
 direct_session_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 run_case a1-direct-fresh \
     claude -p \
-    "Remember the exact line '$fact'. Reply with exactly that line and nothing else." \
+    "Act as a read-only Rust API reviewer. The fixture accepted the type identifier '$fact'. Confirm by replying with exactly that identifier and nothing else." \
     --session-id "$direct_session_id" "${common_claude_args[@]}"
 run_case a2-direct-resume \
     claude -p \
-    "Reply with exactly the CONTEXT_FACT line from the previous turn and nothing else." \
+    "Reply with exactly the accepted Rust type identifier from the previous turn and nothing else." \
     --resume "$direct_session_id" "${common_claude_args[@]}"
 
 # B: the same native continuity through the wrapper, with no pair/supervisor
@@ -106,7 +106,7 @@ run_case b1-managed-fresh \
     --supervisor "$supervisor" --context none \
     --workstream managed-resume --fresh -- \
     claude -p \
-    "Remember the exact line '$fact'. Reply with exactly that line and nothing else." \
+    "Act as a read-only Rust API reviewer. The fixture accepted the type identifier '$fact'. Confirm by replying with exactly that identifier and nothing else." \
     "${common_claude_args[@]}"
 run_case b2-managed-resume \
     env SUBAGENT_STATE_DIR="$experiment_root/state-b" \
@@ -114,7 +114,7 @@ run_case b2-managed-resume \
     --supervisor "$supervisor" --context none \
     --workstream managed-resume --resume -- \
     claude -p \
-    "Reply with exactly the CONTEXT_FACT line from the previous turn and nothing else." \
+    "Reply with exactly the accepted Rust type identifier from the previous turn and nothing else." \
     "${common_claude_args[@]}"
 
 # C: create pair evidence, then start a separate native session with pointer
@@ -124,14 +124,14 @@ run_case c1-pointer-seed \
     subagent --id claude-haiku-context-benchmark \
     --supervisor "$supervisor" --context none -- \
     claude -p \
-    "Record the exact line '$fact'. Reply with exactly that line and nothing else." \
+    "Act as a read-only Rust API reviewer. The fixture accepted the type identifier '$fact'. Confirm by replying with exactly that identifier and nothing else." \
     "${common_claude_args[@]}" --no-session-persistence
 run_case c2-pointer-read \
     env SUBAGENT_STATE_DIR="$experiment_root/state-c" \
     subagent --id claude-haiku-context-benchmark \
     --supervisor "$supervisor" --context pair --context-delivery pointer -- \
     claude -p \
-    "Use Read on summary.md in the context capsule path supplied in the bootstrap. Return exactly the prior CONTEXT_FACT line and nothing else. If Read is denied or the fact is absent, return exactly CAPSULE_UNAVAILABLE." \
+    "Use Read on summary.md in the context capsule path supplied in the bootstrap. Return exactly the previously accepted Rust type identifier and nothing else. If Read is denied or the identifier is absent, return exactly CAPSULE_UNAVAILABLE." \
     "${common_claude_args[@]}" --no-session-persistence
 
 # D: create the same pair evidence, then start a separate native session with
@@ -141,14 +141,14 @@ run_case d1-inline-seed \
     subagent --id claude-haiku-context-benchmark \
     --supervisor "$supervisor" --context none -- \
     claude -p \
-    "Record the exact line '$fact'. Reply with exactly that line and nothing else." \
+    "Act as a read-only Rust API reviewer. The fixture accepted the type identifier '$fact'. Confirm by replying with exactly that identifier and nothing else." \
     "${common_claude_args[@]}" --no-session-persistence
 run_case d2-inline-read \
     env SUBAGENT_STATE_DIR="$experiment_root/state-d" \
     subagent --id claude-haiku-context-benchmark \
     --supervisor "$supervisor" --context pair --context-delivery inline -- \
     claude -p \
-    "Return exactly the prior CONTEXT_FACT line from the inline context bootstrap and nothing else. If it is absent, return exactly CAPSULE_UNAVAILABLE." \
+    "Return exactly the previously accepted Rust type identifier from the inline context bootstrap and nothing else. If it is absent, return exactly CAPSULE_UNAVAILABLE." \
     "${common_claude_args[@]}" --no-session-persistence
 
 printf '%s\n' "$experiment_root" >"${TMPDIR:-/tmp}/subagent-claude-context-latest"
