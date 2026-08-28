@@ -22,6 +22,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -55,6 +56,10 @@ const SUMMARY_BUDGET_NUMERATOR: u64 = 1;
 const SUMMARY_BUDGET_DENOMINATOR: u64 = 8;
 const SUPERVISOR_BUDGET_NUMERATOR: u64 = 1;
 const SUPERVISOR_BUDGET_DENOMINATOR: u64 = 8;
+/// One record must not consume the complete deterministic summary budget.
+/// Provider transport envelopes can be hundreds of kilobytes even when the
+/// useful final result is one line.
+const SUMMARY_SNIPPET_MAX_BYTES: usize = 2 * 1024;
 
 #[derive(Debug)]
 pub(crate) enum CapsuleError {
@@ -587,14 +592,63 @@ struct SummarySnippet {
     line: String,
 }
 
+/// Returns the outcome-bearing portion of a structured provider response.
+/// Claude JSON output places the final answer in `result`; schema-constrained
+/// output may instead use `structured_output`. Transport, usage, timing, and
+/// model metadata are deliberately not copied into the deterministic summary.
+fn structured_response_outcome(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let Value::Object(object) = value else {
+        return None;
+    };
+    for key in ["result", "structured_output", "message"] {
+        let Some(outcome) = object.get(key) else {
+            continue;
+        };
+        match outcome {
+            Value::String(text) if !text.is_empty() => return Some(text.clone()),
+            Value::Null => {}
+            other => {
+                let serialized: String = serde_json::to_string(other)
+                    .expect("a parsed provider outcome always serializes");
+                return Some(serialized);
+            }
+        }
+    }
+    Some(
+        "[structured provider response has no extractable result; consult pair-history.jsonl]"
+            .to_string(),
+    )
+}
+
 /// Builds one redacted, single-line snippet for `summary.md`, or `None` if
 /// the body is not valid UTF-8 (summary.md is a Markdown document; non-UTF-8
-/// bodies are represented only in `pair-history.jsonl`).
+/// bodies are represented only in `pair-history.jsonl`). Structured response
+/// envelopes are reduced to their final outcome before redaction and bounding.
 fn prepare_summary_snippet(exchange: &CompletedExchange, cap: usize) -> Option<SummarySnippet> {
-    if std::str::from_utf8(&exchange.body).is_err() {
-        return None;
-    }
-    let redaction = redaction::redact(&exchange.body, cap);
+    let body_text: &str = std::str::from_utf8(&exchange.body).ok()?;
+    let summary_source: String = if exchange.direction == super::store::ExchangeDirection::Response
+    {
+        structured_response_outcome(body_text).unwrap_or_else(|| body_text.to_string())
+    } else {
+        body_text.to_string()
+    };
+    let line_limit: usize = cap.min(SUMMARY_SNIPPET_MAX_BYTES);
+    let source_truncated: &str = if exchange.truncated {
+        ", source-truncated"
+    } else {
+        ""
+    };
+    let normal_prefix: String = format!(
+        "- [seq {}, {}, unix:{}{}] ",
+        exchange.sequence, exchange.direction, exchange.created_at_unix, source_truncated
+    );
+    let truncated_prefix: String = format!(
+        "- [seq {}, {}, unix:{}{}, snippet-truncated] ",
+        exchange.sequence, exchange.direction, exchange.created_at_unix, source_truncated
+    );
+    let payload_cap: usize = line_limit.checked_sub(truncated_prefix.len())?;
+    let redaction = redaction::redact(summary_source.as_bytes(), payload_cap);
     if redaction
         .redaction_classes
         .iter()
@@ -604,18 +658,13 @@ fn prepare_summary_snippet(exchange: &CompletedExchange, cap: usize) -> Option<S
     }
     let text: String = String::from_utf8(redaction.redacted_bytes).ok()?;
     let single_line: String = text.replace(['\n', '\r'], " ");
-    let line: String = format!(
-        "- [seq {}, {}, unix:{}{}] {}",
-        exchange.sequence,
-        exchange.direction,
-        exchange.created_at_unix,
-        if exchange.truncated {
-            ", source-truncated"
-        } else {
-            ""
-        },
-        single_line
-    );
+    let prefix: &str = if redaction.truncated {
+        &truncated_prefix
+    } else {
+        &normal_prefix
+    };
+    let line: String = format!("{prefix}{single_line}");
+    debug_assert!(line.len() <= line_limit);
     Some(SummarySnippet { line })
 }
 
@@ -1184,6 +1233,140 @@ mod tests {
         assert!(capsule.bootstrap_text.contains("Delivery mode: pointer"));
         assert!(capsule.bootstrap_text.contains("manifest.json"));
         assert!(!capsule.bootstrap_text.contains("PRIOR_CONCLUSION_MARKER"));
+    }
+
+    #[test]
+    fn deterministic_summary_extracts_provider_result_and_omits_transport_envelope() {
+        let root: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let state_root: PathBuf = root.path().join("state");
+        let workspace: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let subagent_id: SubagentId = id("claude-haiku-reviewer");
+        let invocation_id: String = new_invocation_id();
+        let provider_response: Vec<u8> = serde_json::to_vec(&serde_json::json!({
+            "is_error": false,
+            "duration_ms": 4000,
+            "session_id": "provider-session",
+            "usage": {
+                "input_tokens": 17,
+                "cache_creation_input_tokens": 1978,
+                "cache_read_input_tokens": 9168,
+                "output_tokens": 406,
+                "transport_padding": "x".repeat(6_000)
+            },
+            "api_key": "sk-example-secret-value",
+            "result": "ContextLeaseOutcomeMarker"
+        }))
+        .unwrap();
+        let prior: CompletedExchange = exchange(
+            &new_invocation_id(),
+            1,
+            super::super::store::ExchangeDirection::Response,
+            &provider_response,
+            1,
+        );
+        let mut request: CapsuleRequest<'_> = base_request(
+            workspace.path(),
+            &subagent_id,
+            &invocation_id,
+            2,
+            vec![prior],
+        );
+        request.context_scope = ContextScope::Pair;
+        request.context_delivery = ContextDelivery::Pointer;
+        request.max_context_bytes = 16 * 1024;
+
+        let capsule: Capsule = create_capsule(&state_root, request).unwrap();
+        let summary: String =
+            std::fs::read_to_string(capsule.directory.join(SUMMARY_FILE_NAME)).unwrap();
+        assert!(summary.contains("ContextLeaseOutcomeMarker"));
+        assert!(!summary.contains("input_tokens"));
+        assert!(!summary.contains("transport_padding"));
+        assert!(!summary.contains("provider-session"));
+        assert!(!summary.contains("sk-example-secret-value"));
+
+        let pair_history: String =
+            std::fs::read_to_string(capsule.directory.join(PAIR_HISTORY_FILE_NAME)).unwrap();
+        let record: Value = serde_json::from_str(pair_history.lines().next().unwrap()).unwrap();
+        let body_text: &str = record["body"]["value"].as_str().unwrap();
+        let body: Value = serde_json::from_str(body_text).unwrap();
+        assert_eq!(body["usage"]["input_tokens"], 17);
+        assert_eq!(body["usage"]["cache_read_input_tokens"], 9168);
+        assert_eq!(body["api_key"], "[REDACTED]");
+        assert_eq!(body["result"], "ContextLeaseOutcomeMarker");
+        assert_eq!(record["redaction_count"], 1);
+        assert_eq!(record["redaction_classes"], serde_json::json!(["api_key"]));
+    }
+
+    #[test]
+    fn deterministic_summary_recovers_outcome_from_storage_truncated_json() {
+        let root: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let state_root: PathBuf = root.path().join("state");
+        let workspace: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let subagent_id: SubagentId = id("claude-haiku-reviewer");
+        let invocation_id: String = new_invocation_id();
+        let provider_response: String = serde_json::to_string(&serde_json::json!({
+            "transport_padding": "x".repeat(1_100_000),
+            "usage": {"input_tokens": 17, "output_tokens": 23},
+            "api_key": "sk-example-secret-value",
+            "result": "StorageTruncationOutcomeMarker"
+        }))
+        .unwrap();
+        let stored: redaction::RedactionResult =
+            redaction::redact(provider_response.as_bytes(), 1024 * 1024);
+        assert!(stored.truncated);
+        let prior: CompletedExchange = CompletedExchange {
+            invocation_id: new_invocation_id(),
+            sequence: 1,
+            direction: super::super::store::ExchangeDirection::Response,
+            body: stored.redacted_bytes,
+            truncated: stored.truncated,
+            redaction_count: stored.redaction_count,
+            redaction_classes: stored.redaction_classes,
+            created_at_unix: 1,
+        };
+        let mut request: CapsuleRequest<'_> = base_request(
+            workspace.path(),
+            &subagent_id,
+            &invocation_id,
+            2,
+            vec![prior],
+        );
+        request.context_scope = ContextScope::Pair;
+        request.context_delivery = ContextDelivery::Pointer;
+        request.max_context_bytes = 16 * 1024;
+
+        let capsule: Capsule = create_capsule(&state_root, request).unwrap();
+        let summary: String =
+            std::fs::read_to_string(capsule.directory.join(SUMMARY_FILE_NAME)).unwrap();
+        assert!(summary.contains("StorageTruncationOutcomeMarker"));
+        assert!(!summary.contains("transport_padding"));
+        assert!(!summary.contains("sk-example-secret-value"));
+
+        let pair_history: String =
+            std::fs::read_to_string(capsule.directory.join(PAIR_HISTORY_FILE_NAME)).unwrap();
+        let record: Value = serde_json::from_str(pair_history.lines().next().unwrap()).unwrap();
+        let body_text: &str = record["body"]["value"].as_str().unwrap();
+        let body: Value = serde_json::from_str(body_text).unwrap();
+        assert_eq!(body["_subagent_truncated"], true);
+        assert_eq!(body["result"], "StorageTruncationOutcomeMarker");
+    }
+
+    #[test]
+    fn deterministic_summary_bounds_each_plain_text_snippet() {
+        let body: String = format!("BEGIN_MARKER {} END_MARKER", "x".repeat(8_000));
+        let prior: CompletedExchange = exchange(
+            &new_invocation_id(),
+            1,
+            super::super::store::ExchangeDirection::Response,
+            body.as_bytes(),
+            1,
+        );
+        let snippet: SummarySnippet = prepare_summary_snippet(&prior, 16 * 1024).unwrap();
+
+        assert!(snippet.line.contains("BEGIN_MARKER"));
+        assert!(snippet.line.contains("snippet-truncated"));
+        assert!(!snippet.line.contains("END_MARKER"));
+        assert!(snippet.line.len() <= SUMMARY_SNIPPET_MAX_BYTES);
     }
 
     #[test]

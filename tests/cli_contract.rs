@@ -1286,6 +1286,82 @@ fn second_managed_run_receives_the_first_runs_response_in_its_bootstrap() {
 
 #[cfg(unix)]
 #[test]
+fn structured_provider_response_is_valid_in_history_and_outcome_only_in_summary() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let claude_path: PathBuf = workspace.path().join("claude");
+    let provider_json: &str = "{\"result\":\"STRUCTURED_OUTCOME_MARKER\",\"usage\":{\"input_tokens\":17,\"cache_read_input_tokens\":9168},\"api_key\":\"sk-provider-secret\"}";
+    fs::write(
+        &claude_path,
+        format!(
+            "#!/bin/sh\ninput=$(cat)\ncase \"$*\" in\n  *establish*) printf '%s\\n' '{provider_json}' ;;\n  *) case \"$input\" in\n       *STRUCTURED_OUTCOME_MARKER*)\n         case \"$input\" in\n           *input_tokens*|*sk-provider-secret*) printf 'ENVELOPE_LEAKED\\n' ;;\n           *) printf 'OUTCOME_ONLY_OK\\n' ;;\n         esac ;;\n       *) printf 'OUTCOME_MISSING\\n' ;;\n     esac ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&claude_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&claude_path, permissions).unwrap();
+
+    subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--id",
+            "claude-haiku-structured-reviewer",
+            "--context-delivery",
+            "inline",
+            "--quiet",
+            "--",
+        ])
+        .arg(&claude_path)
+        .args(["-p", "establish structured provider response"])
+        .assert()
+        .success()
+        .stdout(format!("{provider_json}\n"));
+
+    subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--id",
+            "claude-haiku-structured-reviewer",
+            "--context-delivery",
+            "inline",
+            "--quiet",
+            "--",
+        ])
+        .arg(&claude_path)
+        .args(["-p", "recover the prior outcome"])
+        .assert()
+        .success()
+        .stdout("OUTCOME_ONLY_OK\n");
+
+    let pairs_output: std::process::Output = subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args(["pairs", "--format", "json"])
+        .output()
+        .unwrap();
+    let pairs_report: serde_json::Value = serde_json::from_slice(&pairs_output.stdout).unwrap();
+    let pair_key: &str = pairs_report["body"]["pairs"][0]["pair_key"]
+        .as_str()
+        .unwrap();
+    let log_output: std::process::Output = subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args(["log", "--pair", pair_key, "--format", "json"])
+        .output()
+        .unwrap();
+    let log_report: serde_json::Value = serde_json::from_slice(&log_output.stdout).unwrap();
+    let exchanges: &Vec<serde_json::Value> = log_report["body"]["exchanges"].as_array().unwrap();
+    let stored_response_text: &str = exchanges[1]["body"]["value"].as_str().unwrap();
+    let stored_response: serde_json::Value = serde_json::from_str(stored_response_text).unwrap();
+    assert_eq!(stored_response["result"], "STRUCTURED_OUTCOME_MARKER");
+    assert_eq!(stored_response["usage"]["input_tokens"], 17);
+    assert_eq!(stored_response["usage"]["cache_read_input_tokens"], 9168);
+    assert_eq!(stored_response["api_key"], "[REDACTED]");
+}
+
+#[cfg(unix)]
+#[test]
 fn pointer_delivery_is_default_and_keeps_prior_response_out_of_the_bootstrap() {
     use std::os::unix::fs::PermissionsExt;
 

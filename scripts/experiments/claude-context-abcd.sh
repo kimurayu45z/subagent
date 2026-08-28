@@ -19,6 +19,7 @@ require_command uuidgen
 
 model="${CLAUDE_MODEL:-haiku}"
 supervisor="codex:claude-context-abcd-20260828"
+benchmark_scope="${BENCHMARK_SCOPE:-all}"
 native_order="${NATIVE_ORDER:-ab}"
 delivery_order="${DELIVERY_ORDER:-cd}"
 experiment_root="$(mktemp -d "${TMPDIR:-/tmp}/subagent-claude-context-20260828.XXXXXX")"
@@ -27,6 +28,10 @@ provider_state="$experiment_root/claude-config"
 fact_uuid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 fact="ContextLease${fact_uuid%%-*}"
 
+if [[ "$benchmark_scope" != "all" && "$benchmark_scope" != "native" && "$benchmark_scope" != "delivery" ]]; then
+    printf 'BENCHMARK_SCOPE must be all, native, or delivery\n' >&2
+    exit 64
+fi
 if [[ "$native_order" != "ab" && "$native_order" != "ba" ]]; then
     printf 'NATIVE_ORDER must be ab or ba\n' >&2
     exit 64
@@ -102,8 +107,8 @@ archive_fixture() {
 }
 
 printf '%s\n' "$fact" >"$experiment_root/fact.txt"
-printf 'model=%s\nsupervisor=%s\nworkspace=%s\nnative_order=%s\ndelivery_order=%s\n' \
-    "$model" "$supervisor" "$workspace" "$native_order" "$delivery_order" \
+printf 'model=%s\nsupervisor=%s\nworkspace=%s\nbenchmark_scope=%s\nnative_order=%s\ndelivery_order=%s\n' \
+    "$model" "$supervisor" "$workspace" "$benchmark_scope" "$native_order" "$delivery_order" \
     >"$experiment_root/experiment.env"
 
 cd "$workspace"
@@ -183,20 +188,24 @@ run_inline_delivery() {
         "${common_claude_args[@]}" --no-session-persistence
 }
 
-if [[ "$native_order" == "ab" ]]; then
-    run_direct_native
-    run_managed_native
-else
-    run_managed_native
-    run_direct_native
+if [[ "$benchmark_scope" == "all" || "$benchmark_scope" == "native" ]]; then
+    if [[ "$native_order" == "ab" ]]; then
+        run_direct_native
+        run_managed_native
+    else
+        run_managed_native
+        run_direct_native
+    fi
 fi
 
-if [[ "$delivery_order" == "cd" ]]; then
-    run_pointer_delivery
-    run_inline_delivery
-else
-    run_inline_delivery
-    run_pointer_delivery
+if [[ "$benchmark_scope" == "all" || "$benchmark_scope" == "delivery" ]]; then
+    if [[ "$delivery_order" == "cd" ]]; then
+        run_pointer_delivery
+        run_inline_delivery
+    else
+        run_inline_delivery
+        run_pointer_delivery
+    fi
 fi
 
 printf '%s\n' "$experiment_root" >"${TMPDIR:-/tmp}/subagent-claude-context-latest"

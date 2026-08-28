@@ -15,6 +15,8 @@
 
 use std::collections::BTreeSet;
 
+use serde_json::Value;
+
 /// The class recorded when input is not valid UTF-8 and therefore was not
 /// scanned for credential patterns at all -- the bytes are preserved
 /// losslessly, not "inspected and found clean".
@@ -24,20 +26,6 @@ pub(crate) const CLASS_UNSCANNABLE_NON_UTF8: &str = "unscannable_non_utf8";
 /// content-free: the whole point of a redaction is to avoid ever writing the
 /// removed value anywhere, including here.
 const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
-
-/// Case-insensitive substrings that mark a `key=value` / `key:value` key as
-/// credential-shaped, in priority order (first match wins when a key
-/// contains more than one trigger). `api_key` and `apikey` intentionally
-/// collapse to the same class.
-const KEY_VALUE_TRIGGERS: [(&str, &str); 7] = [
-    ("api_key", "api_key"),
-    ("apikey", "api_key"),
-    ("token", "token"),
-    ("secret", "secret"),
-    ("password", "password"),
-    ("authorization", "authorization"),
-    ("cookie", "cookie"),
-];
 
 /// Standalone token prefixes redacted wherever they appear as a whole word,
 /// independent of any `key=value` framing.
@@ -65,8 +53,30 @@ pub(crate) struct RedactionResult {
 pub(crate) fn redact(input: &[u8], max_bytes: usize) -> RedactionResult {
     match std::str::from_utf8(input) {
         Ok(text) => {
-            let (redacted, count, classes) = redact_text(text);
-            let (final_text, truncated) = truncate_str_to_bytes(redacted, max_bytes);
+            let (final_text, truncated, count, classes): (
+                String,
+                bool,
+                u32,
+                BTreeSet<&'static str>,
+            ) = match serde_json::from_str::<Value>(text) {
+                Ok(mut value) => {
+                    let mut count: u32 = 0;
+                    let mut classes: BTreeSet<&'static str> = BTreeSet::new();
+                    redact_json_value(&mut value, &mut count, &mut classes);
+                    let serialized: String = serde_json::to_string(&value)
+                        .expect("a parsed JSON value always serializes");
+                    let (final_text, truncated): (String, bool) =
+                        truncate_json_to_bytes(&value, serialized, max_bytes);
+                    (final_text, truncated, count, classes)
+                }
+                Err(_) => {
+                    let (redacted, count, classes): (String, u32, BTreeSet<&'static str>) =
+                        redact_text(text);
+                    let (final_text, truncated): (String, bool) =
+                        truncate_str_to_bytes(redacted, max_bytes);
+                    (final_text, truncated, count, classes)
+                }
+            };
             RedactionResult {
                 redacted_bytes: final_text.into_bytes(),
                 truncated,
@@ -89,6 +99,46 @@ pub(crate) fn redact(input: &[u8], max_bytes: usize) -> RedactionResult {
             }
         }
     }
+}
+
+/// Keeps a redacted JSON payload syntactically valid even when the caller's
+/// byte cap cannot hold it. A small provenance-free sentinel is preferable to
+/// persisting an invalid prefix that downstream readers may mistake for the
+/// complete provider response. For caps below the object sentinel's size,
+/// `null` or `0` is used; no non-empty valid JSON representation fits at cap
+/// zero.
+fn truncate_json_to_bytes(value: &Value, text: String, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+    if let Value::Object(object) = value {
+        let mut truncated_object: serde_json::Map<String, Value> = serde_json::Map::new();
+        truncated_object.insert("_subagent_truncated".to_string(), Value::Bool(true));
+        for key in ["result", "structured_output", "message"] {
+            let Some(outcome) = object.get(key) else {
+                continue;
+            };
+            truncated_object.insert(key.to_string(), outcome.clone());
+            let outcome_text: String =
+                serde_json::to_string(&Value::Object(truncated_object.clone()))
+                    .expect("a truncated JSON outcome always serializes");
+            if outcome_text.len() <= max_bytes {
+                return (outcome_text, true);
+            }
+            truncated_object.remove(key);
+        }
+    }
+    const TRUNCATED_SENTINEL: &str = r#"{"_subagent_truncated":true}"#;
+    if TRUNCATED_SENTINEL.len() <= max_bytes {
+        return (TRUNCATED_SENTINEL.to_string(), true);
+    }
+    if max_bytes >= 4 {
+        return ("null".to_string(), true);
+    }
+    if max_bytes >= 1 {
+        return ("0".to_string(), true);
+    }
+    (String::new(), true)
 }
 
 fn truncate_str_to_bytes(text: String, max_bytes: usize) -> (String, bool) {
@@ -130,12 +180,105 @@ fn is_word_boundary_before(text: &str, index: usize) -> bool {
     }
 }
 
+fn compact_key(key: &str) -> String {
+    key.chars()
+        .filter(|character: &char| character.is_ascii_alphanumeric())
+        .map(|character: char| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_known_usage_token_key(compact: &str) -> bool {
+    matches!(
+        compact,
+        "inputtokens"
+            | "outputtokens"
+            | "inputtokensdetails"
+            | "outputtokensdetails"
+            | "thinkingtokens"
+            | "prompttokens"
+            | "completiontokens"
+            | "reasoningoutputtokens"
+            | "cachedtokens"
+            | "cachecreationinputtokens"
+            | "cachereadinputtokens"
+            | "ephemeral1hinputtokens"
+            | "ephemeral5minputtokens"
+            | "maxoutputtokens"
+            | "acceptedpredictiontokens"
+            | "rejectedpredictiontokens"
+            | "audiotokens"
+            | "totaltokens"
+            | "tokencount"
+            | "tokenlimit"
+            | "tokenbudget"
+            | "tokenusage"
+            | "tokenlength"
+    )
+}
+
+fn is_allowed_usage_token_value(compact: &str, value: &Value) -> bool {
+    match compact {
+        "inputtokensdetails" | "outputtokensdetails" | "tokenusage" => {
+            matches!(value, Value::Object(_))
+        }
+        _ => matches!(value, Value::Number(_)),
+    }
+}
+
 fn classify_key(key: &str) -> Option<&'static str> {
-    let lower: String = key.to_ascii_lowercase();
-    KEY_VALUE_TRIGGERS
-        .iter()
-        .find(|(trigger, _class)| lower.contains(trigger))
-        .map(|(_trigger, class)| *class)
+    let compact: String = compact_key(key);
+    if compact.contains("apikey") {
+        Some("api_key")
+    } else if compact.contains("token") {
+        Some("token")
+    } else if compact.contains("secret") {
+        Some("secret")
+    } else if compact.contains("password") {
+        Some("password")
+    } else if compact.contains("authorization") {
+        Some("authorization")
+    } else if compact.contains("cookie") {
+        Some("cookie")
+    } else {
+        None
+    }
+}
+
+fn redact_json_value(value: &mut Value, count: &mut u32, classes: &mut BTreeSet<&'static str>) {
+    match value {
+        Value::Object(entries) => {
+            for (key, child) in entries.iter_mut() {
+                let compact: String = compact_key(key);
+                if is_known_usage_token_key(&compact)
+                    && is_allowed_usage_token_value(&compact, child)
+                {
+                    redact_json_value(child, count, classes);
+                } else if let Some(class) = classify_key(key) {
+                    if matches!(child, Value::String(text) if text == REDACTED_PLACEHOLDER) {
+                        continue;
+                    }
+                    *child = Value::String(REDACTED_PLACEHOLDER.to_string());
+                    *count = count.saturating_add(1);
+                    classes.insert(class);
+                } else {
+                    redact_json_value(child, count, classes);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_json_value(item, count, classes);
+            }
+        }
+        Value::String(text) => {
+            let (redacted, string_count, string_classes): (String, u32, BTreeSet<&'static str>) =
+                redact_text(text);
+            *text = redacted;
+            *count = count.saturating_add(string_count);
+            classes.extend(string_classes);
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 /// Scans `text` for credential-shaped substrings and returns the redacted
@@ -210,6 +353,18 @@ struct BearerMatch {
     end: usize,
 }
 
+fn existing_placeholder_end(text: &str, start: usize) -> Option<usize> {
+    let remaining: &str = &text[start..];
+    if !remaining.starts_with(REDACTED_PLACEHOLDER) {
+        return None;
+    }
+    let end: usize = start + REDACTED_PLACEHOLDER.len();
+    match char_at(text, end) {
+        Some(character) if is_token_char(character) => None,
+        _ => Some(end),
+    }
+}
+
 /// Matches a case-insensitive `Bearer` keyword at `start`, followed by
 /// whitespace and a non-empty token, returning the span of just the token
 /// (so the `Bearer ` keyword and its whitespace are preserved verbatim by
@@ -231,6 +386,9 @@ fn try_match_bearer(text: &str, start: usize) -> Option<BearerMatch> {
         } else {
             break;
         }
+    }
+    if existing_placeholder_end(text, value_start).is_some() {
+        return None;
     }
     let mut end: usize = value_start;
     while let Some(cc) = char_at(text, end) {
@@ -308,6 +466,11 @@ fn try_match_key_value(text: &str, after_key: usize) -> Option<KeyValueMatch> {
     match char_at(text, v) {
         Some(quote @ ('"' | '\'')) => {
             let value_start: usize = v + quote.len_utf8();
+            if let Some(placeholder_end) = existing_placeholder_end(text, value_start)
+                && char_at(text, placeholder_end) == Some(quote)
+            {
+                return None;
+            }
             let mut w: usize = value_start;
             loop {
                 match char_at(text, w) {
@@ -327,6 +490,16 @@ fn try_match_key_value(text: &str, after_key: usize) -> Option<KeyValueMatch> {
         }
         Some(_) => {
             let value_start: usize = v;
+            if existing_placeholder_end(text, value_start).is_some() {
+                return None;
+            }
+            if let Some(bearer) = try_match_bearer(text, value_start) {
+                return Some(KeyValueMatch {
+                    value_start,
+                    end: bearer.end,
+                    quote: None,
+                });
+            }
             let mut w: usize = value_start;
             while let Some(cc) = char_at(text, w) {
                 if is_unquoted_value_char(cc) {
@@ -381,9 +554,189 @@ mod tests {
         let result = redact_str(r#"{"password": "hunter2example", "ok": true}"#, 1024);
         let text = String::from_utf8(result.redacted_bytes).unwrap();
         assert!(!text.contains("hunter2example"));
-        assert!(text.contains("\"password\": \"[REDACTED]\""));
-        assert!(text.contains("\"ok\": true"));
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["password"], REDACTED_PLACEHOLDER);
+        assert_eq!(value["ok"], true);
         assert_eq!(result.redaction_classes, vec!["password".to_string()]);
+    }
+
+    #[test]
+    fn preserves_provider_usage_counters_as_valid_json() {
+        let input: &str = r#"{
+            "usage": {
+                "input_tokens": 17,
+                "cache_creation_input_tokens": 1978,
+                "cache_read_input_tokens": 9168,
+                "output_tokens": 406,
+                "output_tokens_details": {"thinking_tokens": 280}
+            },
+            "modelUsage": {
+                "claude-haiku": {
+                    "inputTokens": 17,
+                    "maxOutputTokens": 64000
+                }
+            },
+            "result": "ContextLease1234"
+        }"#;
+        let result: RedactionResult = redact_str(input, 4096);
+        let text: String = String::from_utf8(result.redacted_bytes).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(value["usage"]["input_tokens"], 17);
+        assert_eq!(value["usage"]["cache_read_input_tokens"], 9168);
+        assert_eq!(value["modelUsage"]["claude-haiku"]["inputTokens"], 17);
+        assert_eq!(
+            value["modelUsage"]["claude-haiku"]["maxOutputTokens"],
+            64000
+        );
+        assert_eq!(value["result"], "ContextLease1234");
+        assert_eq!(result.redaction_count, 0);
+        assert!(result.redaction_classes.is_empty());
+    }
+
+    #[test]
+    fn redacts_ambiguous_plural_token_fields_but_preserves_known_usage_keys() {
+        let input: &str = r#"{
+            "access_tokens": ["opaque-a", "opaque-b"],
+            "tokens": ["opaque-c"],
+            "usage": {
+                "input_tokens": 17,
+                "outputTokens": 23,
+                "total_tokens": 40
+            }
+        }"#;
+        let result: RedactionResult = redact_str(input, 4096);
+        let text: String = String::from_utf8(result.redacted_bytes).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(value["access_tokens"], REDACTED_PLACEHOLDER);
+        assert_eq!(value["tokens"], REDACTED_PLACEHOLDER);
+        assert_eq!(value["usage"]["input_tokens"], 17);
+        assert_eq!(value["usage"]["outputTokens"], 23);
+        assert_eq!(value["usage"]["total_tokens"], 40);
+        assert_eq!(result.redaction_count, 2);
+        assert_eq!(result.redaction_classes, vec!["token".to_string()]);
+    }
+
+    #[test]
+    fn redacts_known_usage_keys_when_their_json_value_has_an_unexpected_type() {
+        let input: &str = r#"{
+            "input_tokens": "opaque-a",
+            "outputTokens": ["opaque-b"],
+            "total_tokens": {"value": "opaque-c"},
+            "output_tokens_details": {
+                "thinking_tokens": 11,
+                "access_token": "opaque-d"
+            }
+        }"#;
+        let result: RedactionResult = redact_str(input, 4096);
+        let text: String = String::from_utf8(result.redacted_bytes).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(value["input_tokens"], REDACTED_PLACEHOLDER);
+        assert_eq!(value["outputTokens"], REDACTED_PLACEHOLDER);
+        assert_eq!(value["total_tokens"], REDACTED_PLACEHOLDER);
+        assert_eq!(value["output_tokens_details"]["thinking_tokens"], 11);
+        assert_eq!(
+            value["output_tokens_details"]["access_token"],
+            REDACTED_PLACEHOLDER
+        );
+        assert_eq!(result.redaction_count, 4);
+        assert_eq!(result.redaction_classes, vec!["token".to_string()]);
+    }
+
+    #[test]
+    fn redacts_structured_secret_fields_without_breaking_json() {
+        let input: &str = r#"{
+            "access_token": 123456,
+            "clientSecret": {"nested": true},
+            "metadata": {
+                "apiKey": "sk-example-secret",
+                "token_count": 9,
+                "token_value": "opaque-value",
+                "password_hash": "opaque-hash"
+            },
+            "message": "Authorization: Bearer abcdefghijklmnop"
+        }"#;
+        let result: RedactionResult = redact_str(input, 4096);
+        let text: String = String::from_utf8(result.redacted_bytes).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(value["access_token"], REDACTED_PLACEHOLDER);
+        assert_eq!(value["clientSecret"], REDACTED_PLACEHOLDER);
+        assert_eq!(value["metadata"]["apiKey"], REDACTED_PLACEHOLDER);
+        assert_eq!(value["metadata"]["token_count"], 9);
+        assert_eq!(value["metadata"]["token_value"], REDACTED_PLACEHOLDER);
+        assert_eq!(value["metadata"]["password_hash"], REDACTED_PLACEHOLDER);
+        assert_eq!(value["message"], "Authorization: [REDACTED]");
+        assert_eq!(result.redaction_count, 6);
+        assert_eq!(
+            result.redaction_classes,
+            vec![
+                "api_key".to_string(),
+                "authorization".to_string(),
+                "password".to_string(),
+                "secret".to_string(),
+                "token".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn truncated_json_is_replaced_by_a_valid_secret_free_sentinel() {
+        let input: &str = r#"{"result":"safe but much too long","api_key":"sk-secret-value"}"#;
+        let result: RedactionResult = redact_str(input, 32);
+        let text: String = String::from_utf8(result.redacted_bytes).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(value["_subagent_truncated"], true);
+        assert!(!text.contains("sk-secret-value"));
+        assert!(result.truncated);
+        assert_eq!(result.redaction_count, 1);
+    }
+
+    #[test]
+    fn truncated_json_preserves_a_small_provider_outcome_when_it_fits() {
+        let input: String = serde_json::to_string(&serde_json::json!({
+            "transport_padding": "x".repeat(8_000),
+            "api_key": "sk-secret-value",
+            "result": "OutcomeMarker"
+        }))
+        .unwrap();
+        let result: RedactionResult = redact_str(&input, 128);
+        let text: String = String::from_utf8(result.redacted_bytes).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(value["_subagent_truncated"], true);
+        assert_eq!(value["result"], "OutcomeMarker");
+        assert!(!text.contains("transport_padding"));
+        assert!(!text.contains("sk-secret-value"));
+        assert!(result.truncated);
+        assert_eq!(result.redaction_count, 1);
+    }
+
+    #[test]
+    fn structured_redaction_is_idempotent_for_existing_placeholders() {
+        let first: RedactionResult =
+            redact_str(r#"{"api_key":"sk-secret-value","input_tokens":17}"#, 1024);
+        let second: RedactionResult = redact(&first.redacted_bytes, 1024);
+
+        assert_eq!(first.redaction_count, 1);
+        assert_eq!(second.redaction_count, 0);
+        assert_eq!(second.redacted_bytes, first.redacted_bytes);
+        assert!(second.redaction_classes.is_empty());
+    }
+
+    #[test]
+    fn text_redaction_is_idempotent_for_existing_placeholders() {
+        let original: &str = "Authorization: Bearer abcdefghijklmnop API_KEY=sk-secret-value";
+        let first: RedactionResult = redact_str(original, 1024);
+        let second: RedactionResult = redact(&first.redacted_bytes, 1024);
+
+        assert_eq!(first.redaction_count, 2);
+        assert_eq!(second.redaction_count, 0);
+        assert_eq!(second.redacted_bytes, first.redacted_bytes);
+        assert!(second.redaction_classes.is_empty());
     }
 
     #[test]

@@ -602,7 +602,15 @@ The default summarizer does not call a model. The MVP selects recent completed
 pair request/response snippets within a byte budget and preserves their source
 sequence, direction, redaction, and truncation provenance. Request snippets are
 task-focused projections, so provider flags and model-selection boilerplate do
-not consume the summary budget. Future extraction may additionally identify:
+not consume the summary budget. Each complete deterministic snippet, including
+its provenance prefix, is independently bounded to 2 KiB so one response cannot
+consume the whole summary. For a JSON provider response, the implementation
+extracts `result`, `structured_output`, or `message` in that order and omits the
+transport, usage, timing, session, and model envelope. A structured response
+without one of those outcome fields tells the child to consult
+`pair-history.jsonl` instead of copying the whole envelope into `summary.md`.
+
+Future extraction may additionally identify:
 
 - current objectives;
 - recent supervisor requests;
@@ -805,6 +813,15 @@ lossy replacement.
   tokens, and common token prefixes. Private-key blocks, JWTs, credential URLs,
   and configured project-specific patterns remain required hardening work and
   are not claimed as covered by the current detector.
+- Valid JSON is redacted structurally and reserialized as valid JSON.
+  Credential keys such as `access_token`, `access_tokens`, and ambiguous
+  `tokens` are redacted, while an explicit allowlist of known usage keys such as
+  `input_tokens`, `cacheReadInputTokens`, and `maxOutputTokens` is retained only
+  when the value also has the expected numeric or known details-object type. If
+  a structured payload exceeds its byte cap, a small top-level `result`,
+  `structured_output`, or `message` is preserved when it fits; otherwise the
+  payload becomes a small valid-JSON truncation sentinel rather than an invalid
+  prefix. Non-JSON text continues to use the bounded heuristic scanner.
 - Model summarization is opt-in because it sends redacted pair history to the
   selected provider. Redaction is damage reduction, not a guarantee that the
   history contains no sensitive information.
