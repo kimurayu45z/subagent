@@ -80,6 +80,16 @@ run_case() {
         "$label" "$child_exit" "$((SECONDS - started_at))"
 }
 
+write_fixture() {
+    printf 'pub struct %s;\n' "$fact" >"$workspace/fixture.rs"
+    chmod 600 "$workspace/fixture.rs"
+}
+
+archive_fixture() {
+    local condition="$1"
+    mv "$workspace/fixture.rs" "$experiment_root/$condition-fixture.rs"
+}
+
 printf '%s\n' "$fact" >"$experiment_root/fact.txt"
 printf 'model=%s\nsupervisor=%s\nworkspace=%s\n' \
     "$model" "$supervisor" "$workspace" >"$experiment_root/experiment.env"
@@ -89,66 +99,74 @@ export CLAUDE_CONFIG_DIR="$provider_state"
 
 # A: direct Claude native session continuity.
 direct_session_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+write_fixture
 run_case a1-direct-fresh \
     claude -p \
-    "Act as a read-only Rust API reviewer. The fixture accepted the type identifier '$fact'. Confirm by replying with exactly that identifier and nothing else." \
+    "Read fixture.rs and report the exact public Rust struct identifier declared there. Return only the identifier." \
     --session-id "$direct_session_id" "${common_claude_args[@]}"
+archive_fixture a
 run_case a2-direct-resume \
     claude -p \
-    "Reply with exactly the accepted Rust type identifier from the previous turn and nothing else." \
+    "The reviewed fixture has been archived. Return only the exact Rust struct identifier from the previous review." \
     --resume "$direct_session_id" "${common_claude_args[@]}"
 
 # B: the same native continuity through the wrapper, with no pair/supervisor
 # context materialization.
+write_fixture
 run_case b1-managed-fresh \
     env SUBAGENT_STATE_DIR="$experiment_root/state-b" \
     subagent --id claude-haiku-context-benchmark \
     --supervisor "$supervisor" --context none \
     --workstream managed-resume --fresh -- \
     claude -p \
-    "Act as a read-only Rust API reviewer. The fixture accepted the type identifier '$fact'. Confirm by replying with exactly that identifier and nothing else." \
+    "Read fixture.rs and report the exact public Rust struct identifier declared there. Return only the identifier." \
     "${common_claude_args[@]}"
+archive_fixture b
 run_case b2-managed-resume \
     env SUBAGENT_STATE_DIR="$experiment_root/state-b" \
     subagent --id claude-haiku-context-benchmark \
     --supervisor "$supervisor" --context none \
     --workstream managed-resume --resume -- \
     claude -p \
-    "Reply with exactly the accepted Rust type identifier from the previous turn and nothing else." \
+    "The reviewed fixture has been archived. Return only the exact Rust struct identifier from the previous review." \
     "${common_claude_args[@]}"
 
 # C: create pair evidence, then start a separate native session with pointer
 # delivery. The task explicitly asks Claude to pull summary.md with Read.
+write_fixture
 run_case c1-pointer-seed \
     env SUBAGENT_STATE_DIR="$experiment_root/state-c" \
     subagent --id claude-haiku-context-benchmark \
     --supervisor "$supervisor" --context none -- \
     claude -p \
-    "Act as a read-only Rust API reviewer. The fixture accepted the type identifier '$fact'. Confirm by replying with exactly that identifier and nothing else." \
+    "Read fixture.rs and report the exact public Rust struct identifier declared there. Return only the identifier." \
     "${common_claude_args[@]}" --no-session-persistence
+archive_fixture c
 run_case c2-pointer-read \
     env SUBAGENT_STATE_DIR="$experiment_root/state-c" \
     subagent --id claude-haiku-context-benchmark \
     --supervisor "$supervisor" --context pair --context-delivery pointer -- \
     claude -p \
-    "Use Read on summary.md in the context capsule path supplied in the bootstrap. Return exactly the previously accepted Rust type identifier and nothing else. If Read is denied or the identifier is absent, return exactly CAPSULE_UNAVAILABLE." \
+    "Use Read on summary.md in the context capsule path supplied in the bootstrap. Return only the exact Rust struct identifier from the prior review. If Read is denied or the identifier is absent, return exactly CAPSULE_UNAVAILABLE." \
     "${common_claude_args[@]}" --no-session-persistence
 
 # D: create the same pair evidence, then start a separate native session with
 # the bounded summary included in the bootstrap.
+write_fixture
 run_case d1-inline-seed \
     env SUBAGENT_STATE_DIR="$experiment_root/state-d" \
     subagent --id claude-haiku-context-benchmark \
     --supervisor "$supervisor" --context none -- \
     claude -p \
-    "Act as a read-only Rust API reviewer. The fixture accepted the type identifier '$fact'. Confirm by replying with exactly that identifier and nothing else." \
+    "Read fixture.rs and report the exact public Rust struct identifier declared there. Return only the identifier." \
     "${common_claude_args[@]}" --no-session-persistence
+archive_fixture d
 run_case d2-inline-read \
     env SUBAGENT_STATE_DIR="$experiment_root/state-d" \
     subagent --id claude-haiku-context-benchmark \
     --supervisor "$supervisor" --context pair --context-delivery inline -- \
     claude -p \
-    "Return exactly the previously accepted Rust type identifier from the inline context bootstrap and nothing else. If it is absent, return exactly CAPSULE_UNAVAILABLE." \
+    "Return only the exact Rust struct identifier from the prior review in the inline context bootstrap. If it is absent, return exactly CAPSULE_UNAVAILABLE." \
     "${common_claude_args[@]}" --no-session-persistence
 
 printf '%s\n' "$experiment_root" >"${TMPDIR:-/tmp}/subagent-claude-context-latest"
