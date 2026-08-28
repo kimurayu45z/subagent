@@ -153,3 +153,7 @@ The next implementation slice is:
 Permission preflight and retry stopping remain important based on the field
 report, but this controlled read-only run produced no denials and cannot measure
 their benefit.
+
+This next slice was implemented and rerun successfully. See
+[`2026-08-28-structured-context-fix-and-rerun.md`](2026-08-28-structured-context-fix-and-rerun.md)
+for the 4/4 balanced C/D recovery result and the structured-redaction evidence.
