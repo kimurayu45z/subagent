@@ -24,7 +24,7 @@ const COMMAND_DIGEST_DOMAIN: &[u8] = b"subagent.command.v1\n";
 /// of [`super::store::LEDGER_SCHEMA_VERSION`]: a stored row's
 /// `profile_schema_version` pins it to the algorithm that produced it, so a
 /// later change here never silently reinterprets an old hash.
-pub(crate) const COMMAND_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub(crate) const COMMAND_PROFILE_SCHEMA_VERSION: u32 = 2;
 const COMMAND_PROFILE_DOMAIN: &[u8] = b"subagent.command-profile.v1\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +39,12 @@ pub(crate) enum CodexSessionMode<'a> {
     Resume(&'a str),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenCodeSessionMode<'a> {
+    Fresh,
+    Resume(&'a str),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChildAdapterError {
     UnsupportedProgram(OsString),
@@ -49,6 +55,9 @@ pub(crate) enum ChildAdapterError {
     NativeSessionContinuityUnavailable(&'static str),
     CodexRequiresExec,
     CodexExecSubcommandUnsupported(&'static str),
+    OpenCodeRequiresRun,
+    OpenCodePromptPlacementAmbiguous,
+    OpenCodeOptionUnsupported(&'static str),
 }
 
 impl fmt::Display for ChildAdapterError {
@@ -56,7 +65,8 @@ impl fmt::Display for ChildAdapterError {
         match self {
             ChildAdapterError::UnsupportedProgram(program) => write!(
                 f,
-                "managed context supports only `claude -p` and `codex exec` in this build; \
+                "managed context supports only `claude -p`, `codex exec`, and `opencode run` \
+                 in this build; \
                  got program {:?}. Use --context none --no-record for explicit passthrough",
                 program
             ),
@@ -95,6 +105,21 @@ impl fmt::Display for ChildAdapterError {
                 "`codex exec {subcommand}` native session/subcommand behavior is not supported \
                  by the managed adapter yet"
             ),
+            ChildAdapterError::OpenCodeRequiresRun => write!(
+                f,
+                "managed OpenCode execution requires the `opencode run` subcommand"
+            ),
+            ChildAdapterError::OpenCodePromptPlacementAmbiguous => write!(
+                f,
+                "managed OpenCode execution requires one quoted task immediately after `run`, \
+                 after an explicit `--`, or through caller stdin"
+            ),
+            ChildAdapterError::OpenCodeOptionUnsupported(flag) => write!(
+                f,
+                "OpenCode option {flag} is not supported by the managed adapter; use wrapper \
+                 --workstream for native continuity, or use --context none --no-record \
+                 passthrough"
+            ),
         }
     }
 }
@@ -113,6 +138,8 @@ pub(crate) fn recognize_managed_child(
         recognize_claude(args)
     } else if basename == OsStr::new("codex") {
         recognize_codex(args)
+    } else if basename == OsStr::new("opencode") {
+        recognize_opencode(args)
     } else {
         Err(ChildAdapterError::UnsupportedProgram(
             program.to_os_string(),
@@ -120,7 +147,7 @@ pub(crate) fn recognize_managed_child(
     }
 }
 
-/// Rejects Claude argv that require guessing where provider option values end
+/// Rejects Claude Code and OpenCode argv that require guessing where provider option values end
 /// and the task begins. Caller stdin is unambiguous and remains valid.
 ///
 /// This validation is for managed execution only. Explicit no-context,
@@ -130,15 +157,30 @@ pub(crate) fn validate_managed_task_input(
     args: &[OsString],
     caller_stdin: &[u8],
 ) -> Result<(), ChildAdapterError> {
-    if kind != ChildKind::Claude || !caller_stdin.is_empty() {
+    if !caller_stdin.is_empty() {
         return Ok(());
     }
-    if claude_prompt_immediately_after_print(args).is_some()
-        || explicit_separator_prompt(args, 0).is_some()
-    {
-        return Ok(());
+    match kind {
+        ChildKind::Claude => {
+            if claude_prompt_immediately_after_print(args).is_some()
+                || explicit_separator_prompt(args, 0).is_some()
+            {
+                Ok(())
+            } else {
+                Err(ChildAdapterError::ClaudePromptPlacementAmbiguous)
+            }
+        }
+        ChildKind::Codex => Ok(()),
+        ChildKind::OpenCode => {
+            if opencode_prompt_immediately_after_run_index(args).is_some()
+                || opencode_explicit_separator_prompt_index(args).is_some()
+            {
+                Ok(())
+            } else {
+                Err(ChildAdapterError::OpenCodePromptPlacementAmbiguous)
+            }
+        }
     }
-    Err(ChildAdapterError::ClaudePromptPlacementAmbiguous)
 }
 
 /// Applies the stricter input contract required when the wrapper must rewrite
@@ -149,6 +191,14 @@ pub(crate) fn validate_managed_continuity_input(
     args: &[OsString],
     caller_stdin: &[u8],
 ) -> Result<(), ChildAdapterError> {
+    if kind == ChildKind::OpenCode {
+        if !opencode_format_is_compatible(args) {
+            return Err(ChildAdapterError::OpenCodeOptionUnsupported(
+                "--format other than json",
+            ));
+        }
+        return validate_managed_task_input(kind, args, caller_stdin);
+    }
     if kind == ChildKind::Claude {
         return validate_managed_task_input(kind, args, caller_stdin);
     }
@@ -213,6 +263,7 @@ fn likely_positional_prompt_index(kind: ChildKind, args: &[OsString]) -> Option<
     let first_index: usize = match kind {
         ChildKind::Claude => 0,
         ChildKind::Codex => 1,
+        ChildKind::OpenCode => 1,
     };
     if args.len() <= first_index {
         return None;
@@ -224,11 +275,22 @@ fn likely_positional_prompt_index(kind: ChildKind, args: &[OsString]) -> Option<
         return Some(index);
     }
 
-    if let Some(index) = explicit_separator_prompt_index(args, first_index) {
+    if kind == ChildKind::OpenCode
+        && let Some(index) = opencode_prompt_immediately_after_run_index(args)
+    {
         return Some(index);
     }
 
-    if kind == ChildKind::Claude {
+    let separator_prompt_index: Option<usize> = if kind == ChildKind::OpenCode {
+        opencode_explicit_separator_prompt_index(args)
+    } else {
+        explicit_separator_prompt_index(args, first_index)
+    };
+    if let Some(index) = separator_prompt_index {
+        return Some(index);
+    }
+
+    if matches!(kind, ChildKind::Claude | ChildKind::OpenCode) {
         return None;
     }
 
@@ -263,6 +325,33 @@ fn claude_prompt_immediately_after_print_index(args: &[OsString]) -> Option<usiz
         None
     } else {
         Some(candidate_index)
+    }
+}
+
+fn opencode_prompt_immediately_after_run_index(args: &[OsString]) -> Option<usize> {
+    if args.first().map(OsString::as_os_str) != Some(OsStr::new("run")) {
+        return None;
+    }
+    let candidate_index: usize = 1;
+    let candidate: &OsStr = args.get(candidate_index)?.as_os_str();
+    if candidate == OsStr::new("-") || looks_like_option(candidate) {
+        return None;
+    }
+    if args
+        .get(candidate_index + 1)
+        .is_some_and(|argument: &OsString| !looks_like_option(argument.as_os_str()))
+    {
+        return None;
+    }
+    Some(candidate_index)
+}
+
+fn opencode_explicit_separator_prompt_index(args: &[OsString]) -> Option<usize> {
+    let index: usize = explicit_separator_prompt_index(args, 1)?;
+    if index + 1 == args.len() {
+        Some(index)
+    } else {
+        None
     }
 }
 
@@ -354,6 +443,31 @@ fn option_takes_value(kind: ChildKind, option: &OsStr) -> bool {
                     | "-o"
             )
         ),
+        ChildKind::OpenCode => matches!(
+            option.to_str(),
+            Some(
+                "--command"
+                    | "--session"
+                    | "-s"
+                    | "--model"
+                    | "-m"
+                    | "--agent"
+                    | "--format"
+                    | "--file"
+                    | "-f"
+                    | "--title"
+                    | "--attach"
+                    | "--password"
+                    | "-p"
+                    | "--username"
+                    | "-u"
+                    | "--dir"
+                    | "--port"
+                    | "--variant"
+                    | "--log-level"
+                    | "--replay-limit"
+            )
+        ),
     }
 }
 
@@ -408,6 +522,37 @@ fn recognize_codex(args: &[OsString]) -> Result<ChildKind, ChildAdapterError> {
         ));
     }
     Ok(ChildKind::Codex)
+}
+
+fn recognize_opencode(args: &[OsString]) -> Result<ChildKind, ChildAdapterError> {
+    if args.first().map(OsString::as_os_str) != Some(OsStr::new("run")) {
+        return Err(ChildAdapterError::OpenCodeRequiresRun);
+    }
+    for argument in &args[1..] {
+        if let Some(text) = argument.to_str()
+            && !text.starts_with("--")
+            && text.len() > 2
+            && (text.starts_with("-s") || text.starts_with("-c") || text.starts_with("-i"))
+        {
+            return Err(ChildAdapterError::OpenCodeOptionUnsupported(
+                "attached native short option",
+            ));
+        }
+        let name: Option<&str> = profile_excluded_option_name(argument.as_os_str());
+        let unsupported: Option<&'static str> = match name {
+            Some("--session") | Some("-s") => Some("--session/-s"),
+            Some("--continue") | Some("-c") => Some("--continue/-c"),
+            Some("--fork") => Some("--fork"),
+            Some("--interactive") | Some("-i") | Some("--mini") => Some("--interactive/-i"),
+            Some("--command") => Some("--command"),
+            Some("--attach") => Some("--attach"),
+            _ => None,
+        };
+        if let Some(flag) = unsupported {
+            return Err(ChildAdapterError::OpenCodeOptionUnsupported(flag));
+        }
+    }
+    Ok(ChildKind::OpenCode)
 }
 
 /// Stable SHA-256 digest of the exact child argv, including the program, with
@@ -497,10 +642,75 @@ pub(crate) fn inject_codex_session_args(
     }
 }
 
+/// Builds the OpenCode argv used for managed native continuity. Fresh runs
+/// add wrapper-owned JSONL output so the exact provider session can be
+/// observed. Resume additionally selects only the stored session ID.
+pub(crate) fn inject_opencode_session_args(
+    caller_args: &[OsString],
+    mode: OpenCodeSessionMode<'_>,
+) -> Vec<OsString> {
+    debug_assert_eq!(
+        caller_args.first().map(OsString::as_os_str),
+        Some(OsStr::new("run"))
+    );
+    let extra_capacity: usize = match mode {
+        OpenCodeSessionMode::Fresh => 2,
+        OpenCodeSessionMode::Resume(_) => 4,
+    };
+    let mut spawn_args: Vec<OsString> =
+        Vec::with_capacity(caller_args.len().saturating_add(extra_capacity));
+    spawn_args.push(OsString::from("run"));
+    if !opencode_json_requested(caller_args) {
+        spawn_args.extend([OsString::from("--format"), OsString::from("json")]);
+    }
+    if let OpenCodeSessionMode::Resume(native_id) = mode {
+        spawn_args.extend([OsString::from("--session"), OsString::from(native_id)]);
+    }
+    spawn_args.extend_from_slice(&caller_args[1..]);
+    spawn_args
+}
+
 pub(crate) fn codex_json_requested(args: &[OsString]) -> bool {
     codex_provider_arguments(args).any(|argument: &OsString| {
         profile_excluded_option_name(argument.as_os_str()) == Some("--json")
     })
+}
+
+pub(crate) fn opencode_json_requested(args: &[OsString]) -> bool {
+    let end: usize = args
+        .iter()
+        .position(|argument: &OsString| argument == OsStr::new("--"))
+        .unwrap_or(args.len());
+    let mut index: usize = 1;
+    while index < end {
+        let argument: &OsStr = args[index].as_os_str();
+        let Some(text) = argument.to_str() else {
+            index = index.saturating_add(1);
+            continue;
+        };
+        if text == "--format" {
+            return args
+                .get(index + 1)
+                .and_then(|value: &OsString| value.to_str())
+                == Some("json");
+        }
+        if let Some(value) = text.strip_prefix("--format=") {
+            return value == "json";
+        }
+        index = index.saturating_add(1);
+    }
+    false
+}
+
+fn opencode_format_is_compatible(args: &[OsString]) -> bool {
+    let end: usize = args
+        .iter()
+        .position(|argument: &OsString| argument == OsStr::new("--"))
+        .unwrap_or(args.len());
+    let has_format: bool = args[..end].iter().any(|argument: &OsString| {
+        profile_excluded_option_name(argument.as_os_str()) == Some("--format")
+    });
+    !has_format || opencode_json_requested(args)
 }
 
 fn codex_provider_arguments(args: &[OsString]) -> impl Iterator<Item = &OsString> {
@@ -647,6 +857,11 @@ fn excluded_profile_token_mask(kind: ChildKind, args: &[OsString]) -> Vec<bool> 
                 excluded[0] = true;
             }
         }
+        ChildKind::OpenCode => {
+            if args.first().map(OsString::as_os_str) == Some(OsStr::new("run")) {
+                excluded[0] = true;
+            }
+        }
     }
 
     let task_index: Option<usize> = profile_task_index(kind, args);
@@ -664,11 +879,14 @@ fn excluded_profile_token_mask(kind: ChildKind, args: &[OsString]) -> Vec<bool> 
             continue;
         }
         let is_excluded_option: bool = profile_excluded_option_name(args[index].as_os_str())
-            .map(is_excluded_profile_option_name)
+            .map(|name: &str| is_excluded_profile_option_name(kind, name))
             .unwrap_or(false);
         if is_excluded_option {
             excluded[index] = true;
-            if option_takes_value(kind, args[index].as_os_str()) && index + 1 < args.len() {
+            if option_takes_value(kind, args[index].as_os_str())
+                && !option_has_inline_value(args[index].as_os_str())
+                && index + 1 < args.len()
+            {
                 excluded[index + 1] = true;
                 index += 2;
                 continue;
@@ -701,6 +919,8 @@ fn profile_task_index(kind: ChildKind, args: &[OsString]) -> Option<usize> {
                 Some(candidate_index)
             }
         }
+        ChildKind::OpenCode => opencode_prompt_immediately_after_run_index(args)
+            .or_else(|| opencode_explicit_separator_prompt_index(args)),
     }
 }
 
@@ -713,33 +933,50 @@ fn profile_excluded_option_name(token: &OsStr) -> Option<&str> {
     Some(text.split_once('=').map(|(name, _)| name).unwrap_or(text))
 }
 
+fn option_has_inline_value(token: &OsStr) -> bool {
+    token.to_str().is_some_and(|text: &str| text.contains('='))
+}
+
 /// The exclusion list from the command-profile hash design: session-
 /// continuity options (injected by the wrapper after hashing),
 /// output-shaping/telemetry options, and per-run budget knobs. Each entry is
 /// a known single-token or `--opt value` pair; arity is resolved separately
 /// via [`option_takes_value`].
 #[allow(dead_code)]
-fn is_excluded_profile_option_name(name: &str) -> bool {
-    matches!(
-        name,
-        "--session-id"
-            | "--resume"
-            | "-r"
-            | "--continue"
-            | "-c"
-            | "--fork-session"
-            | "--output-format"
-            | "--input-format"
-            | "--json-schema"
-            | "--debug-file"
-            | "--color"
-            | "-o"
-            | "--output-last-message"
-            | "--output-schema"
-            | "--json"
-            | "--max-turns"
-            | "--max-budget-usd"
-    )
+fn is_excluded_profile_option_name(kind: ChildKind, name: &str) -> bool {
+    match kind {
+        ChildKind::Claude => matches!(
+            name,
+            "--session-id"
+                | "--resume"
+                | "-r"
+                | "--continue"
+                | "-c"
+                | "--fork-session"
+                | "--output-format"
+                | "--input-format"
+                | "--json-schema"
+                | "--debug-file"
+                | "--max-turns"
+                | "--max-budget-usd"
+        ),
+        ChildKind::Codex => matches!(
+            name,
+            "--color" | "-o" | "--output-last-message" | "--output-schema" | "--json"
+        ),
+        ChildKind::OpenCode => matches!(
+            name,
+            "--session"
+                | "-s"
+                | "--continue"
+                | "-c"
+                | "--fork"
+                | "--format"
+                | "--print-logs"
+                | "--log-level"
+                | "--thinking"
+        ),
+    }
 }
 
 #[cfg(unix)]
@@ -801,6 +1038,33 @@ mod tests {
         assert!(matches!(
             recognize_managed_child(OsStr::new("codex"), &args(&["exec", "resume", "id"])),
             Err(ChildAdapterError::CodexExecSubcommandUnsupported("resume"))
+        ));
+    }
+
+    #[test]
+    fn recognizes_opencode_run_and_rejects_caller_native_continuity() {
+        assert_eq!(
+            recognize_managed_child(
+                OsStr::new("/usr/local/bin/opencode"),
+                &args(&["run", "review this", "--model", "opencode/big-pickle"]),
+            )
+            .unwrap(),
+            ChildKind::OpenCode
+        );
+        for arguments in [
+            args(&["run", "task", "--session", "ses_owned"]),
+            args(&["run", "task", "-s=ses_owned"]),
+            args(&["run", "task", "--continue"]),
+            args(&["run", "task", "--fork"]),
+        ] {
+            assert!(matches!(
+                recognize_managed_child(OsStr::new("opencode"), &arguments),
+                Err(ChildAdapterError::OpenCodeOptionUnsupported(_))
+            ));
+        }
+        assert!(matches!(
+            recognize_managed_child(OsStr::new("opencode"), &args(&["session", "list"])),
+            Err(ChildAdapterError::OpenCodeRequiresRun)
         ));
     }
 
@@ -910,6 +1174,55 @@ mod tests {
             args: &args(&["exec", "--future-variadic", "value-b"]),
         });
         assert_ne!(ambiguous_a, ambiguous_b);
+    }
+
+    #[test]
+    fn opencode_profile_ignores_task_and_wrapper_transport_but_keeps_model() {
+        let cwd: &Path = Path::new("/workspace");
+        let first: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::OpenCode,
+            program: OsStr::new("opencode"),
+            working_directory: cwd,
+            args: &args(&["run", "review the diff", "--model", "opencode/big-pickle"]),
+        });
+        let second: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::OpenCode,
+            program: OsStr::new("opencode"),
+            working_directory: cwd,
+            args: &args(&[
+                "run",
+                "different task",
+                "--format=json",
+                "--model",
+                "opencode/big-pickle",
+            ]),
+        });
+        let different_model: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::OpenCode,
+            program: OsStr::new("opencode"),
+            working_directory: cwd,
+            args: &args(&["run", "different task", "--model", "anthropic/haiku"]),
+        });
+        assert_eq!(first, second);
+        assert_ne!(first, different_model);
+    }
+
+    #[test]
+    fn provider_specific_short_flags_do_not_cross_contaminate_profiles() {
+        let cwd: &Path = Path::new("/workspace");
+        let codex_without_config: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Codex,
+            program: OsStr::new("codex"),
+            working_directory: cwd,
+            args: &args(&["exec", "task"]),
+        });
+        let codex_with_config: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Codex,
+            program: OsStr::new("codex"),
+            working_directory: cwd,
+            args: &args(&["exec", "task", "-c", "model_reasoning_effort=low"]),
+        });
+        assert_ne!(codex_without_config, codex_with_config);
     }
 
     #[test]
@@ -1171,6 +1484,95 @@ mod tests {
             &[],
         );
         assert_eq!(codex, b"summarize these findings");
+
+        let opencode: Vec<u8> = project_task_request(
+            ChildKind::OpenCode,
+            &args(&[
+                "run",
+                "inspect the current patch",
+                "--model",
+                "opencode/big-pickle",
+            ]),
+            &[],
+        );
+        assert_eq!(opencode, b"inspect the current patch");
+    }
+
+    #[test]
+    fn opencode_task_placement_is_deliberately_unambiguous() {
+        let immediate: Vec<OsString> = args(&["run", "quoted task", "--model", "model/name"]);
+        assert_eq!(
+            validate_managed_task_input(ChildKind::OpenCode, &immediate, &[]),
+            Ok(())
+        );
+
+        let after_options: Vec<OsString> = args(&["run", "--model", "model/name", "task"]);
+        assert_eq!(
+            validate_managed_task_input(ChildKind::OpenCode, &after_options, &[]),
+            Err(ChildAdapterError::OpenCodePromptPlacementAmbiguous)
+        );
+
+        let multiple_tokens: Vec<OsString> = args(&["run", "task", "split", "into", "tokens"]);
+        assert_eq!(
+            validate_managed_task_input(ChildKind::OpenCode, &multiple_tokens, &[]),
+            Err(ChildAdapterError::OpenCodePromptPlacementAmbiguous)
+        );
+
+        let separated: Vec<OsString> =
+            args(&["run", "--model", "model/name", "--", "one quoted task"]);
+        assert_eq!(
+            validate_managed_task_input(ChildKind::OpenCode, &separated, &[]),
+            Ok(())
+        );
+        assert_eq!(
+            project_task_request(ChildKind::OpenCode, &separated, &[]),
+            b"one quoted task"
+        );
+    }
+
+    #[test]
+    fn wrapper_injected_opencode_args_preserve_task_and_exact_resume() {
+        let caller: Vec<OsString> = args(&["run", "review this", "--model", "opencode/big-pickle"]);
+        assert_eq!(
+            inject_opencode_session_args(&caller, OpenCodeSessionMode::Fresh),
+            args(&[
+                "run",
+                "--format",
+                "json",
+                "review this",
+                "--model",
+                "opencode/big-pickle",
+            ])
+        );
+        assert_eq!(
+            inject_opencode_session_args(&caller, OpenCodeSessionMode::Resume("ses_exact-child")),
+            args(&[
+                "run",
+                "--format",
+                "json",
+                "--session",
+                "ses_exact-child",
+                "review this",
+                "--model",
+                "opencode/big-pickle",
+            ])
+        );
+
+        let caller_json: Vec<OsString> = args(&["run", "task", "--format=json"]);
+        assert_eq!(
+            inject_opencode_session_args(&caller_json, OpenCodeSessionMode::Fresh),
+            caller_json
+        );
+        assert_eq!(
+            validate_managed_continuity_input(
+                ChildKind::OpenCode,
+                &args(&["run", "task", "--format", "default"]),
+                &[],
+            ),
+            Err(ChildAdapterError::OpenCodeOptionUnsupported(
+                "--format other than json"
+            ))
+        );
     }
 
     #[test]

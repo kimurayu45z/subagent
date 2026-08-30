@@ -1,6 +1,6 @@
 # subagent
 
-`subagent` is a Rust wrapper that gives Codex and Claude Code delegations a
+`subagent` is a Rust wrapper that gives Codex, Claude Code, and OpenCode delegations a
 role-level audit trail and a pull-based path to prior context. It complements a
 precise task prompt and exact provider-native resume; it does not treat a reused
 role name as proof that two assignments are the same work.
@@ -39,6 +39,7 @@ lives alongside equivalent Codex guidance under this repository.
 # GPT-family examples first by project convention
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
 subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
+subagent --id big-pickle-reviewer -- opencode run "Review the current diff" --model opencode/big-pickle
 ```
 
 The same `--id`, canonical working directory, and supervisor conversation reuse
@@ -55,7 +56,14 @@ subagent --id gpt-sol-reviewer --supervisor claude:SESSION_ID -- \
 For a Codex supervisor, requested `all`/`supervisor` context is enriched through
 the read-only `codex app-server thread/read` interface. The capsule allowlists
 visible user and agent messages; reasoning and raw tool records are excluded.
-Claude supervisor transcript discovery remains a later adapter milestone.
+Claude and OpenCode supervisor transcript discovery remain later adapter
+milestones. OpenCode does not currently expose its immediate supervisor session
+to a child process, so identify an OpenCode supervisor explicitly:
+
+```sh
+subagent --id gpt-sol-reviewer --supervisor opencode:ses_EXACT_ID -- \
+  codex exec "Review the current diff"
+```
 
 ## Isolated experiments
 
@@ -84,7 +92,7 @@ subagent --id claude-haiku-architect \
 
 Everything after the first literal `--` belongs to the provider command and is
 never interpreted as another wrapper option. Managed mode recognizes
-`codex exec` and `claude -p`/`claude --print`; an explicit workstream validates
+`codex exec`, `claude -p`/`claude --print`, and `opencode run`; an explicit workstream validates
 the supported task shape and adds wrapper-owned native continuity arguments
 only after hashing the caller command.
 
@@ -110,6 +118,21 @@ not guess against this evolving grammar: they accept the immediate form above,
 an explicit `--` separator, or caller stdin, and reject other trailing-task
 forms before starting Claude. Programmatic callers should build an argument
 vector rather than one shell command string.
+
+### OpenCode argument safety
+
+Pass the whole OpenCode task as one quoted argument immediately after `run`:
+
+```sh
+opencode run "Review the current diff" --model opencode/big-pickle
+```
+
+For managed continuity, caller-owned `--session`, `--continue`, and `--fork`
+are rejected. A task after provider options or split across multiple shell
+arguments is ambiguous; use one quoted token, the only token after an explicit
+`--`, or caller stdin. The logical `--id` names the actual model family and
+durable role, not the execution CLI, so prefer `gpt-luna-reviewer` or
+`big-pickle-reviewer` over `opencode-reviewer`.
 
 Pair history records the task prompt and caller stdin, not provider launch flags.
 The exact child command remains correlatable through a digest without repeatedly
@@ -160,6 +183,14 @@ subagent --id claude-haiku-implementer \
 subagent --id claude-haiku-implementer \
   --workstream issue-42 --resume -- \
   claude -p "Fix the failing test from that slice" --model haiku
+
+subagent --id big-pickle-implementer \
+  --workstream issue-42 --fresh -- \
+  opencode run "Implement the first slice" --model opencode/big-pickle
+
+subagent --id big-pickle-implementer \
+  --workstream issue-42 --resume -- \
+  opencode run "Fix the failing test from that slice" --model opencode/big-pickle
 ```
 
 `--workstream` must be paired with exactly one of `--fresh` or `--resume`.
@@ -180,6 +211,14 @@ exit code; the captured output is preserved and an unsafe session is not made
 resumable. Current `codex exec resume` does not accept several fresh-only flags,
 including sandbox, profile, and working-root options, so the wrapper retains
 them in compatibility hashing but omits them from the provider resume argv.
+
+Tracked OpenCode adds `--format json`, validates one consistent `ses_...`
+session ID, and requires a completed step with final text before activating the
+session. Resume passes only the exact stored ID through `--session`; it never
+selects by recency. The wrapper normally restores text events to stdout, while
+an explicit caller `--format json` preserves raw JSONL. Malformed, truncated,
+conflicting, or mismatched transport cannot establish continuity and preserves
+the child exit status.
 
 Deterministic summary artifacts remain the offline default. Under pointer
 delivery they stay in the capsule for pull-based reading; they are not pasted

@@ -398,6 +398,179 @@ fn managed_codex_workstream_observes_and_resumes_the_exact_thread() {
 
 #[cfg(unix)]
 #[test]
+fn managed_opencode_workstream_observes_and_resumes_the_exact_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let opencode_path: PathBuf = workspace.path().join("opencode");
+    let session_id: &str = "ses_contract-child-001";
+    fs::write(
+        &opencode_path,
+        "#!/bin/sh\n\
+         cat >/dev/null\n\
+         test \"$1\" = run || exit 70\n\
+         test \"$2\" = --format || exit 71\n\
+         test \"$3\" = json || exit 72\n\
+         case \"$4\" in\n\
+           'first task') test \"$5\" = --model || exit 73; test \"$6\" = opencode/big-pickle || exit 74; message=FRESH_OPENCODE ;;\n\
+           --session) test \"$5\" = \"$SESSION_ID\" || exit 75; test \"$6\" = 'second task' || exit 76; test \"$7\" = --model || exit 77; test \"$8\" = opencode/big-pickle || exit 78; message=RESUME_OPENCODE ;;\n\
+           *) exit 79 ;;\n\
+         esac\n\
+         printf '{\"type\":\"step_start\",\"sessionID\":\"%s\"}\\n' \"$SESSION_ID\"\n\
+         printf '{\"type\":\"text\",\"sessionID\":\"%s\",\"part\":{\"text\":\"%s\"}}\\n' \"$SESSION_ID\" \"$message\"\n\
+         printf '{\"type\":\"step_finish\",\"sessionID\":\"%s\"}\\n' \"$SESSION_ID\"\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&opencode_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&opencode_path, permissions).unwrap();
+
+    let run = |flag: &str, task: &str| -> std::process::Output {
+        subagent_with_clean_supervisor_env(state_dir.path())
+            .current_dir(workspace.path())
+            .env("SESSION_ID", session_id)
+            .args([
+                "--id",
+                "big-pickle-implementer",
+                "--supervisor",
+                "opencode:ses_supervisor-contract",
+                "--context",
+                "pair",
+                "--workstream",
+                "issue-oc-1",
+                flag,
+                "--quiet",
+                "--",
+            ])
+            .arg(&opencode_path)
+            .args(["run", task, "--model", "opencode/big-pickle"])
+            .output()
+            .unwrap()
+    };
+
+    let fresh: std::process::Output = run("--fresh", "first task");
+    assert!(
+        fresh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+    assert_eq!(fresh.stdout, b"FRESH_OPENCODE\n");
+
+    let resumed: std::process::Output = run("--resume", "second task");
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(resumed.stdout, b"RESUME_OPENCODE\n");
+
+    let connection: rusqlite::Connection =
+        rusqlite::Connection::open(state_dir.path().join("ledger.sqlite3")).unwrap();
+    let (native_id, kind, status): (String, String, String) = connection
+        .query_row(
+            "SELECT native_id, child_kind, status FROM child_sessions WHERE workstream_id = 'issue-oc-1'",
+            [],
+            |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(native_id, session_id);
+    assert_eq!(kind, "opencode");
+    assert_eq!(status, "active");
+    let linked_invocations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM invocations WHERE child_session_id = (SELECT id FROM child_sessions WHERE native_id = ?1)",
+            [session_id],
+            |row: &rusqlite::Row<'_>| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(linked_invocations, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_opencode_conflicting_resume_invalidates_the_stored_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let opencode_path: PathBuf = workspace.path().join("opencode");
+    let calls_path: PathBuf = workspace.path().join("calls");
+    let session_id: &str = "ses_contract-good";
+    let other_id: &str = "ses_contract-conflict";
+    fs::write(
+        &opencode_path,
+        "#!/bin/sh\n\
+         cat >/dev/null\n\
+         printf x >> \"$CALLS_PATH\"\n\
+         if test \"$4\" = --session; then\n\
+           printf '{\"type\":\"step_start\",\"sessionID\":\"%s\"}\\n' \"$SESSION_ID\"\n\
+           printf '{\"type\":\"text\",\"sessionID\":\"%s\",\"part\":{\"text\":\"CONFLICT\"}}\\n' \"$OTHER_ID\"\n\
+           printf '{\"type\":\"step_finish\",\"sessionID\":\"%s\"}\\n' \"$OTHER_ID\"\n\
+         else\n\
+           printf '{\"type\":\"step_start\",\"sessionID\":\"%s\"}\\n' \"$SESSION_ID\"\n\
+           printf '{\"type\":\"text\",\"sessionID\":\"%s\",\"part\":{\"text\":\"FRESH_OK\"}}\\n' \"$SESSION_ID\"\n\
+           printf '{\"type\":\"step_finish\",\"sessionID\":\"%s\"}\\n' \"$SESSION_ID\"\n\
+         fi\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&opencode_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&opencode_path, permissions).unwrap();
+
+    let run = |flag: &str| -> std::process::Output {
+        subagent_with_clean_supervisor_env(state_dir.path())
+            .current_dir(workspace.path())
+            .env("CALLS_PATH", &calls_path)
+            .env("SESSION_ID", session_id)
+            .env("OTHER_ID", other_id)
+            .args([
+                "--id",
+                "big-pickle-conflict-probe",
+                "--supervisor",
+                "codex:opencode-conflict-contract",
+                "--context",
+                "pair",
+                "--workstream",
+                "conflict-lane",
+                flag,
+                "--quiet",
+                "--",
+            ])
+            .arg(&opencode_path)
+            .args(["run", "task", "--model", "opencode/big-pickle"])
+            .output()
+            .unwrap()
+    };
+
+    let fresh: std::process::Output = run("--fresh");
+    assert!(fresh.status.success());
+    assert_eq!(fresh.stdout, b"FRESH_OK\n");
+
+    let conflicting: std::process::Output = run("--resume");
+    assert!(conflicting.status.success());
+    assert!(
+        String::from_utf8_lossy(&conflicting.stderr).contains("conflicting top-level sessionIDs")
+    );
+
+    let connection: rusqlite::Connection =
+        rusqlite::Connection::open(state_dir.path().join("ledger.sqlite3")).unwrap();
+    let status: String = connection
+        .query_row(
+            "SELECT status FROM child_sessions WHERE native_id = ?1",
+            [session_id],
+            |row: &rusqlite::Row<'_>| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "invalid");
+
+    let rejected: std::process::Output = run("--resume");
+    assert_eq!(rejected.status.code(), Some(WRAPPER_ERROR_EXIT));
+    assert_eq!(fs::read(&calls_path).unwrap(), b"xx");
+}
+
+#[cfg(unix)]
+#[test]
 fn managed_codex_preserves_caller_json_and_child_exit_on_observation_failure() {
     use std::os::unix::fs::PermissionsExt;
 

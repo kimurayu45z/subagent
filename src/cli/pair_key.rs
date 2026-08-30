@@ -181,7 +181,10 @@ mod tests {
     fn different_provider_changes_the_key_even_with_identical_other_fields() {
         let codex = PairKey::compute(b"/w", Provider::Codex, "session", &id("reviewer"));
         let claude = PairKey::compute(b"/w", Provider::Claude, "session", &id("reviewer"));
+        let opencode = PairKey::compute(b"/w", Provider::OpenCode, "session", &id("reviewer"));
         assert_ne!(codex, claude);
+        assert_ne!(codex, opencode);
+        assert_ne!(claude, opencode);
     }
 
     #[test]

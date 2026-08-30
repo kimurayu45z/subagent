@@ -1,6 +1,6 @@
 ---
 name: subagent-memory
-description: Delegate bounded work to Codex or Claude Code, choosing direct one-shot execution, exact native resume, or the subagent CLI's role-level audit and pull-based context. Covers recurring roles, cross-provider handoffs, permissions, structured output, and result review without treating a reused role ID as automatic task continuity.
+description: Delegate bounded work to Codex, Claude Code, or OpenCode, choosing direct one-shot execution, exact native resume, or the subagent CLI's role-level audit and pull-based context. Covers recurring roles, cross-provider handoffs, permissions, structured output, and result review without treating a reused role ID as automatic task continuity.
 metadata:
   short-description: Delegate safely with durable context
 ---
@@ -15,7 +15,7 @@ responsible for scope, authorization, independent review, and the final result.
 
 ## Define the delegation contract
 
-Before starting Codex or Claude Code:
+Before starting Codex, Claude Code, or OpenCode:
 
 1. State one outcome, the relevant files or subsystem, and what is out of scope.
 2. Specify read-only versus edit authority.
@@ -34,6 +34,7 @@ Before invoking a provider directly, read only its relevant reference:
 
 - [Codex execution](references/codex.md)
 - [Claude Code execution](references/claude-code.md)
+- [OpenCode execution](references/opencode.md)
 
 They cover model selection, headless output, permissions, customization loading,
 and native resume. The Claude reference replaces the separate
@@ -54,7 +55,7 @@ Prefer `subagent` when at least one of these is true:
   trail across distinct assignments;
 - earlier decisions, rejected approaches, or verification results matter to the
   next delegation but should be pulled only if relevant;
-- work crosses Codex and Claude Code or crosses supervisor context windows;
+- work crosses provider CLIs or supervisor context windows;
 - rebuilding the subordinate's context is already consuming noticeable prompt
   space or operator time; or
 - a stable audit trail for one supervisor-and-role pair is useful.
@@ -77,7 +78,8 @@ resume, or summarization. Treat its capability report as authoritative for the
 installed build.
 
 Supervisor detection is capability-specific. A build may implement explicit
-`--supervisor` and one unambiguous native Codex or Claude environment ID while
+`--supervisor` (including `opencode:SESSION_ID`) and one unambiguous native
+Codex or Claude environment ID while
 still reporting managed-parent references and hook-registry detection as
 planned. If both native provider IDs are inherited, pass the immediate
 supervisor explicitly; do not guess from process ancestry.
@@ -89,7 +91,11 @@ is active. Require `pair-inheritance` before using an ID handoff and
 `summarizer-model` before selecting `haiku` or `luna`. Require
 `child-session-resume-claude` before relying on wrapper-managed Claude native
 continuity, and require `child-session-resume-codex` before relying on
-wrapper-managed Codex native continuity.
+wrapper-managed Codex native continuity. Require
+`child-session-resume-opencode` before relying on wrapper-managed OpenCode
+native continuity. OpenCode supervisor auto-detection and transcript history
+are separate capabilities and may remain planned even when its child adapter is
+implemented.
 
 If the desired capability is reported as planned or unavailable:
 
@@ -158,6 +164,7 @@ command as an argument vector:
 ```sh
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
 subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
+subagent --id big-pickle-reviewer -- opencode run "Review the current diff" --model opencode/big-pickle
 ```
 
 For interface inspection without starting the child:
@@ -176,6 +183,7 @@ For an actual managed run, use only the recognized MVP shapes:
 ```sh
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
 subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
+subagent --id big-pickle-reviewer -- opencode run "Review the current diff" --model opencode/big-pickle
 ```
 
 The wrapper preserves caller argv for task projection, audit digesting, and
@@ -208,6 +216,11 @@ subagent --id claude-haiku-implementer --workstream issue-42 --fresh -- \
   claude -p "Implement the first slice" --model haiku
 subagent --id claude-haiku-implementer --workstream issue-42 --resume -- \
   claude -p "Fix the failing test" --model haiku
+
+subagent --id big-pickle-implementer --workstream issue-42 --fresh -- \
+  opencode run "Implement the first slice" --model opencode/big-pickle
+subagent --id big-pickle-implementer --workstream issue-42 --resume -- \
+  opencode run "Fix the failing test" --model opencode/big-pickle
 ```
 
 Use exactly one of `--fresh` or `--resume` with `--workstream`. Resume must find
@@ -221,6 +234,15 @@ use `--ephemeral`. The wrapper captures bounded JSONL to observe the exact
 thread ID and normally restores only the final agent message to stdout. An
 explicit caller `--json` keeps raw JSONL output. Unknown programs are allowed
 only as explicit `--memory none --context none --no-record` passthrough.
+
+For tracked OpenCode, use `opencode run` and pass the whole task as one quoted
+argument immediately after `run`, as the only token after an explicit `--`, or
+through stdin. Do not pass caller-owned `--session`, `--continue`, or `--fork`.
+The wrapper selects `--format json`, observes the exact `ses_...` ID, and
+normally restores only text events to stdout; an explicit caller
+`--format json` keeps raw JSONL. Because OpenCode does not expose the immediate
+supervisor session to child tools, identify an OpenCode supervisor explicitly
+with `--supervisor opencode:SESSION_ID`.
 
 Inspect and manage durable state with:
 
@@ -265,9 +287,10 @@ claims with actual files and command output, and disclose incomplete checks.
   diagnostics through its documented side channel.
 - Report unavailable, stale, truncated, or redacted context explicitly.
 - Codex supervisor transcript projection uses a bounded, read-only app-server
-  adapter and includes only visible user/agent text. Claude supervisor history
-  remains unavailable. Default `--context all` degrades best-effort when an
-  adapter is unavailable; required supervisor-only context fails before spawn.
+  adapter and includes only visible user/agent text. Claude and OpenCode
+  supervisor history remain unavailable. Do not infer an OpenCode session from
+  process ancestry. Default `--context all` degrades best-effort when an adapter
+  is unavailable; required supervisor-only context fails before spawn.
 - Treat common-credential redaction as damage reduction, not proof that stored
   prompts contain no secrets. Use `--no-record` for sensitive work.
 

@@ -20,6 +20,7 @@ mod history;
 mod id;
 mod log_cmd;
 mod managed_run;
+mod opencode_json;
 mod pair_key;
 mod pairs_cmd;
 mod process;
@@ -52,7 +53,7 @@ pub(crate) enum OutputFormat {
 }
 
 const HELP_TEXT: &str = "\
-subagent - preserve delegation context across Codex and Claude Code sub-agent invocations
+subagent - preserve delegation context across Codex, Claude Code, and OpenCode sub-agent invocations
 
 USAGE:
     subagent --id ID [RUN-OPTIONS] -- COMMAND [ARG...]

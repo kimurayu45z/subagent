@@ -2,7 +2,7 @@
 
 Status: Draft, canonical
 
-Implementation milestone: managed Codex and Claude workstream continuity
+Implementation milestone: managed Codex, Claude Code, and OpenCode workstream continuity
 
 This document is the current normative design for `subagent`. Dated discussion,
 alternatives, and decision history belong under `docs/meeting-notes/` and do not
@@ -13,8 +13,9 @@ direction was chosen; this document remains authoritative if wording diverges.
 
 ## 1. Purpose
 
-`subagent` is a Rust CLI that preserves useful context across delegations between
-Codex and Claude Code. Either product may be the supervisor or the subordinate.
+`subagent` is a Rust CLI that preserves useful context across delegations among
+Codex, Claude Code, and OpenCode. Any supported product may be the supervisor or
+the subordinate, subject to its available identity and history adapters.
 
 The primary invocation form is:
 
@@ -27,6 +28,7 @@ For example:
 ```sh
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
 subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
+subagent --id big-pickle-reviewer -- opencode run "Review the current diff" --model opencode/big-pickle
 ```
 
 The CLI gives a subordinate access to:
@@ -48,7 +50,8 @@ behind adapters and must not silently narrow the supported platform set.
 
 - Preserve delegation memory without requiring the supervisor to restate all
   prior context.
-- Support Codex supervising Claude Code and Claude Code supervising Codex.
+- Support cross-provider supervision among Codex, Claude Code, and OpenCode
+  without guessing an unavailable immediate supervisor identity.
 - Keep provider-native session identity separate from the user's logical
   subordinate identity.
 - Keep child stdout, stderr, exit status, and signal behavior predictable.
@@ -63,7 +66,7 @@ behind adapters and must not silently narrow the supported platform set.
 ### 2.2 Non-goals
 
 - Reproduce a provider's complete internal prompt or hidden reasoning.
-- Merge Codex and Claude Code transcript schemas into a lossless universal
+- Merge provider transcript schemas into a lossless universal
   format.
 - Treat arbitrary commands as managed AI agents.
 - Infer that two differently named logical subagents are the same persona.
@@ -79,7 +82,7 @@ behind adapters and must not silently narrow the supported platform set.
 
 ```text
 SupervisorRef {
-    provider: codex | claude,
+    provider: codex | claude | opencode,
     session_id: provider-defined string,
     workspace_root: absolute path,
     detected_via: explicit | managed_ref | native_env | hook_registry,
@@ -89,6 +92,10 @@ SupervisorRef {
 
 For Codex, the native session identifier is normally `CODEX_THREAD_ID`. For
 Claude Code, it is normally `CLAUDE_CODE_SESSION_ID`.
+OpenCode supervisor identity is accepted through explicit
+`--supervisor opencode:SESSION_ID`; automatic detection is not implemented
+because OpenCode does not currently expose the immediate session ID to child
+processes reliably.
 
 ### 3.2 Logical subordinate ID
 
@@ -129,7 +136,7 @@ examples.
 Concrete model versions (for example a dated release string) and
 execution/API providers (for example `openai`, `anthropic`, `bedrock`, or
 `vertex`) must not be encoded in the logical ID. Record that information
-separately in the child profile (see section 13.3), not in `SubagentId`,
+separately in the child profile (see section 13.4), not in `SubagentId`,
 so that a provider or hosting change does not fragment pair history that
 should stay attached to the same durable role.
 
@@ -335,7 +342,7 @@ Defaults are:
 - deterministic summarization;
 - a 16 KiB model-summarization threshold when an opt-in model alias is selected;
 - no model process for history below that threshold; and
-- untracked provider-native continuity unless a Claude workstream explicitly
+- untracked provider-native continuity unless a recognized child workstream explicitly
   selects `--fresh` or `--resume`; and
 - recording enabled.
 
@@ -364,12 +371,13 @@ For each managed run, `subagent` performs the following sequence:
 7. Build or update the selected summary artifact.
 8. Materialize a per-run context capsule.
 9. Resolve an exact active child runtime session for `--resume`. For `--fresh`,
-   assign Claude's caller-controlled ID before spawn or observe Codex's native
-   thread ID after the child starts.
+   assign Claude's caller-controlled ID before spawn, observe Codex's native
+   thread ID after the child starts, or observe OpenCode's native session ID
+   from its JSON event stream.
 10. Record and link the pending invocation, then spawn the child.
-11. Forward signals and stderr. Stream ordinary stdout; for a tracked Codex
-    workstream, buffer bounded JSONL and render its final agent message unless
-    the caller explicitly requested raw `--json`.
+11. Forward signals and stderr. Stream ordinary stdout; for a tracked Codex or
+    OpenCode workstream, buffer bounded JSONL and render final assistant text
+    unless the caller explicitly requested raw provider JSON.
 12. Promote a successfully confirmed native session from `assigned` to
     `active`.
 13. Record the final response, exit state, duration, context provenance, and
@@ -383,13 +391,14 @@ is represented only by its command digest. A pending invocation is excluded
 from its own context capsule.
 
 Codex supervisor-history reading is implemented for step 5. Managed Claude
-assigned-session start/resume and managed Codex observed-thread start/resume are
-implemented for steps 9 through 12. Cached incremental summaries remain
-unavailable. For a Codex supervisor, `--context all` enriches pair history on a
-best-effort basis;
+assigned-session start/resume, managed Codex observed-thread start/resume, and
+managed OpenCode observed-session start/resume are implemented for steps 9
+through 12. Cached incremental summaries remain unavailable. For a Codex
+supervisor, `--context all` enriches pair history on a best-effort basis;
 `--context supervisor --context-mode required` fails before spawning the
-delegated child when the exact thread cannot be read safely. Claude supervisor
-history remains explicitly unavailable until its transcript adapter lands.
+delegated child when the exact thread cannot be read safely. Claude and
+OpenCode supervisor history remain explicitly unavailable until their
+transcript adapters land.
 
 ## 8. History adapters
 
@@ -434,7 +443,18 @@ Transcript parsing is versioned and tolerant of non-message records. The
 `parentUuid` relationship must be respected when necessary to avoid treating
 side chains as a single linear conversation.
 
-### 8.3 Normalized history
+### 8.3 OpenCode supervisor
+
+OpenCode supervisor identity is explicit-only in the current milestone. The
+CLI accepts `--supervisor opencode:SESSION_ID` for pair identity, but the
+history adapter reports `unavailable`. A future adapter may use the exact
+session export or a documented storage/query interface, but it must validate
+the requested session and canonical workspace and must never select a session
+by recency. Automatic detection requires an upstream-supported immediate
+session signal or a versioned managed-parent protocol; process ancestry and
+"latest session" heuristics are not acceptable.
+
+### 8.4 Normalized history
 
 ```text
 HistoryRecord {
@@ -519,11 +539,14 @@ summaries(id, scope_kind, scope_id, source_digest, summary_digest,
           summarizer_id, template_version, redaction_version, created_at)
 ```
 
-The MVP uses SQLite `user_version = 5`. It implements `workspaces`,
+The MVP uses SQLite `user_version = 6`. It implements `workspaces`,
 `supervisor_sessions`, `pairs`, `pair_inheritance`, `invocations`, and
 `exchange_messages`, plus workstream-scoped provider-native continuity in
 `child_sessions` and the nullable `invocations.child_session_id` link. Claude
-assignment and exact resume consume this substrate; legacy pre-version-5 rows
+assignment and exact resume plus Codex/OpenCode observed-session resume consume
+this substrate. Version 6 rebuilds the child-facing tables transactionally to
+extend their `child_kind` constraints with `opencode`, copying all existing
+rows and preserving foreign-key relationships. Legacy pre-version-5 rows
 retain a null workstream and remain auditable but are never resumable. It
 enforces one pair row for each workspace/supervisor-session/subagent tuple and
 allocates monotonically increasing per-pair invocation sequences under an
@@ -724,12 +747,42 @@ fresh-only flags (`--oss`, local provider, profile, sandbox/approval mode, and
 working root/additional directory) remain in the caller-derived command profile
 but are omitted from resume argv, allowing Codex to reuse the persisted thread
 configuration. Fresh-only color is also omitted from resume and remains an
-output-shaping profile exclusion under section 13.3. Unknown flags remain
+output-shaping profile exclusion under section 13.4. Unknown flags remain
 default-included in the profile and are forwarded. Full app-server-driven child
 execution remains an optional future mode for streaming and richer
 cancellation; exact native resume does not depend on it.
 
-### 13.3 Command profiles
+### 13.3 OpenCode child
+
+The MVP recognizes `opencode run`. Without a workstream, the wrapper preserves
+ordinary fresh OpenCode argv and stdout behavior but, consistently with the
+other managed adapters, still rejects caller-owned resume/fork/session flags.
+Use explicit no-memory/no-context passthrough for a direct native resume. Managed task
+projection accepts caller stdin, exactly one quoted task token immediately
+after `run`, or exactly one task token after an explicit `--`; it does not guess
+which of several variadic message tokens or trailing option values is the task.
+
+Tracked `--fresh` and `--resume` reject caller-owned `--session`/`-s`,
+`--continue`/`-c`, `--fork`, interactive, command, and attach modes. The wrapper
+adds `--format json` unless the caller already requested JSON and captures at
+most 32 MiB of JSONL. Every non-empty event must contain one valid and
+consistent ASCII session ID matching `ses_` plus at least one alphanumeric,
+underscore, or hyphen byte. A successful child exit, `step_finish`, no `error`
+event, and at least one final text event are all required before continuity is
+active.
+
+Fresh persists the exact observed session after execution. Resume injects
+`--session EXACT_ID`, verifies that all returned events use the stored ID, and
+invalidates the stored row on mismatch; it never uses `--continue` or recency.
+When the wrapper owns JSON output, it joins text events in order and restores a
+trailing newline. Caller-owned `--format json` preserves raw JSONL. Malformed,
+non-UTF-8, conflicting, truncated, incomplete, or missing-session output cannot
+confirm continuity, while the child exit status remains authoritative.
+Tracked OpenCode removes inherited `CODEX_THREAD_ID`,
+`CLAUDE_CODE_SESSION_ID`, and `SUBAGENT_SELF_REF` before spawn so a supervisor
+identity cannot alter child selection.
+
+### 13.4 Command profiles
 
 A child session is resumable only when its profile remains compatible. The
 versioned profile hash is SHA-256 over length-framed fields: child kind, exact
@@ -750,7 +803,11 @@ omitted only when it appears immediately after `exec` or after an explicit
 a new child runtime session only through an explicit `--fresh`; `--resume`
 fails before spawn while retaining pair history.
 
-Schema version 5 stores at most one live `assigned` or `active` child session
+Command-profile schema version 2 makes option exclusions provider-specific.
+This prevents OpenCode's short `-c`/`-s` continuity flags from excluding Codex
+configuration or sandbox arguments that happen to use the same spelling.
+
+Schema version 6 stores at most one live `assigned` or `active` child session
 for each pair, child kind, and non-null workstream. Deliberate replacement
 produces a terminal `retired` row; provider rejection produces a terminal
 `invalid` row. Historical rows remain for audit, and deleting a pair cascades
@@ -759,7 +816,7 @@ cannot satisfy a resume lookup. Fresh replacement and insertion share one
 immediate transaction, so an insertion failure rolls back retirement.
 `workstream_id` remains outside `PairKey` to preserve the role-level ledger.
 
-### 13.4 Claude prompt placement
+### 13.5 Claude prompt placement
 
 Several Claude Code options accept variable-length value lists, including tool,
 directory, beta, file, and MCP configuration options in the currently installed
@@ -893,20 +950,20 @@ is to test the vocabulary and workflow before committing to those mechanisms.
 
 Implementation status: the usable MVP implements explicit supervisor
 references, unambiguous native Codex/Claude environment detection, canonical
-path-based workspace identity, conversation `PairKey` derivation, the version 5
+path-based workspace identity, conversation `PairKey` derivation, the version 6
 SQLite pair/exchange ledger and workstream-scoped child-session substrate,
 common-credential redaction, deterministic recent
 history summaries, explicit one-way same-conversation pair inheritance,
 owner-only context capsules with explicit pointer/inline delivery, raw stream
-forwarding for ordinary runs, bounded tracked-Codex rendering, signal
+forwarding for ordinary runs, bounded tracked-Codex/OpenCode rendering, signal
 propagation, and
-actual `claude -p` / `codex exec` child execution. `context`,
+actual `claude -p`, `codex exec`, and `opencode run` child execution. `context`,
 `log`, `pairs`, `forget`, and `doctor` are operational. Managed-parent manifest
-resolution, hook-registry detection, the Claude supervisor-history adapter,
+resolution, hook-registry detection, the Claude and OpenCode supervisor-history adapters,
 workspace memory, configured agent aliases, and cached incremental
 summarization remain deferred and fail explicitly where requested. Managed
-Claude assigned-session start and managed Codex observed-thread start both
-support exact active-session resume. The Codex app-server supervisor-history
+Claude assigned-session start, managed Codex observed-thread start, and managed
+OpenCode observed-session start support exact active-session resume. The Codex app-server supervisor-history
 adapter is implemented with bounded, read-only, allowlisted projection.
 
 Repository CI runs formatting, Clippy with warnings denied, and all-target,
@@ -959,7 +1016,17 @@ execution is no longer a prerequisite for native continuity and may be added as
 an opt-in transport only when its streaming/cancellation benefit justifies the
 larger compatibility surface.
 
-### Slice 6: optional model summaries
+### Slice 6: managed OpenCode runtime continuity
+
+- `opencode run` child recognition and strict task placement (implemented);
+- bounded JSONL session observation and exact `--session` resume (implemented);
+- SQLite schema version 6 migration admitting `opencode` while preserving
+  existing rows and foreign keys (implemented);
+- explicit `opencode:SESSION_ID` supervisor identity (implemented); and
+- automatic OpenCode supervisor detection and safe transcript projection
+  (planned).
+
+### Slice 7: optional model summaries
 
 - tool-free configurable summarizer command;
 - incremental structured summaries;
@@ -971,8 +1038,8 @@ larger compatibility surface.
   pair's history.
 - Conversation scope and workspace scope are visibly distinct in capsules and
   logs.
-- Nested Codex-to-Claude-to-Codex and Claude-to-Codex-to-Claude tests select the
-  immediate supervisor or fail explicitly.
+- Nested cross-provider tests select the immediate Codex, Claude Code, or
+  OpenCode supervisor or fail explicitly.
 - Child stdout is byte-identical with and without wrapping for passthrough
   fixtures.
 - Exit code `42` remains `42`; Unix signal termination remains signal
@@ -997,6 +1064,11 @@ larger compatibility surface.
   <https://code.claude.com/docs/en/sessions>
 - Claude Code hooks:
   <https://code.claude.com/docs/en/hooks>
+- OpenCode CLI:
+  <https://dev.opencode.ai/docs/cli>
+- OpenCode configuration and permissions:
+  <https://dev.opencode.ai/docs/config>
+  <https://opencode.ai/docs/permissions/>
 
 Provider adapters must be checked against the installed CLI version at runtime.
 The output of `--help` is capability evidence for that installation, not a
@@ -1005,8 +1077,9 @@ permanent substitute for the provider's documented interface.
 ## 20. Release targets
 
 Version 0.2 is the usable continuity release. It requires Linux and macOS CI,
-Claude assigned-session resume, Codex observed-thread resume, explicit failure
-recovery, and supervisor history for both Codex and Claude supervisors. No
+Claude assigned-session resume, Codex observed-thread resume, OpenCode
+observed-session resume, explicit failure recovery, and honest supervisor
+history capability reporting. No
 accepted CLI flag may remain inert.
 
 Version 0.5 is the durability beta. It adds immediate-supervisor selection for

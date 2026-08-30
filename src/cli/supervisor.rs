@@ -29,6 +29,7 @@ pub(crate) const CLAUDE_CODE_SESSION_ID_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 pub(crate) enum Provider {
     Codex,
     Claude,
+    OpenCode,
 }
 
 impl Provider {
@@ -36,6 +37,7 @@ impl Provider {
         match raw {
             "codex" => Some(Provider::Codex),
             "claude" => Some(Provider::Claude),
+            "opencode" => Some(Provider::OpenCode),
             _ => None,
         }
     }
@@ -46,6 +48,7 @@ impl fmt::Display for Provider {
         let text: &str = match self {
             Provider::Codex => "codex",
             Provider::Claude => "claude",
+            Provider::OpenCode => "opencode",
         };
         f.write_str(text)
     }
@@ -118,7 +121,7 @@ impl fmt::Display for SupervisorResolutionError {
         match self {
             SupervisorResolutionError::InvalidExplicit => write!(
                 f,
-                "invalid --supervisor value: expected codex:SESSION_ID or claude:SESSION_ID"
+                "invalid --supervisor value: expected codex:SESSION_ID, claude:SESSION_ID, or opencode:SESSION_ID"
             ),
             SupervisorResolutionError::ManagedRefUnsupported => write!(
                 f,
@@ -271,6 +274,15 @@ mod tests {
         let resolved = resolve(Some("claude:xyz789"), &DetectionEnv::default()).unwrap();
         assert_eq!(resolved.provider, Provider::Claude);
         assert_eq!(resolved.session_id, "xyz789");
+        assert_eq!(resolved.detected_via, DetectionSource::Explicit);
+    }
+
+    #[test]
+    fn explicit_opencode_reference_resolves() {
+        let resolved: SupervisorRef =
+            resolve(Some("opencode:ses_xyz789"), &DetectionEnv::default()).unwrap();
+        assert_eq!(resolved.provider, Provider::OpenCode);
+        assert_eq!(resolved.session_id, "ses_xyz789");
         assert_eq!(resolved.detected_via, DetectionSource::Explicit);
     }
 

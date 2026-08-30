@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use super::child::COMMAND_PROFILE_SCHEMA_VERSION;
 use super::id::{MAX_ID_LEN, SubagentId, is_valid_logical_name};
+use super::opencode_json;
 use super::pair_key::PairKey;
 use super::supervisor::Provider;
 use super::workspace::WorkspaceRef;
@@ -47,8 +48,10 @@ use super::workspace::WorkspaceRef;
 /// Version 5 additively introduces a nullable `child_sessions.workstream_id`
 /// label, replacing `child_sessions_live_profile_idx` with a partial unique
 /// index on `(pair_id, child_kind, workstream_id)`, without altering any
-/// version 1, 2, 3, or 4 row; see [`SCHEMA_SQL_V5_ADDITIONS`].
-pub(crate) const LEDGER_SCHEMA_VERSION: i64 = 5;
+/// version 1, 2, 3, or 4 row. Version 6 rebuilds the three child-facing tables
+/// so their `child_kind` constraints also admit `opencode`, while copying all
+/// existing rows and preserving their foreign-key relationships.
+pub(crate) const LEDGER_SCHEMA_VERSION: i64 = 6;
 
 const DB_FILE_NAME: &str = "ledger.sqlite3";
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -263,6 +266,128 @@ DROP INDEX child_sessions_live_profile_idx;
 CREATE UNIQUE INDEX child_sessions_live_workstream_idx
     ON child_sessions (pair_id, child_kind, workstream_id)
     WHERE status IN ('assigned', 'active') AND workstream_id IS NOT NULL;
+";
+
+/// Version 5 -> 6 migration: SQLite cannot alter a table-level `CHECK`, so
+/// rebuild the child-facing tables as one transaction. Child sessions are
+/// copied first, followed by invocations and their exchange messages; the old
+/// tables are then dropped in dependency order. The replacement foreign keys,
+/// uniqueness constraints, and indexes are equivalent to version 5 except
+/// that `child_kind = 'opencode'` is accepted.
+const SCHEMA_SQL_V6_MIGRATION: &str = "
+CREATE TABLE child_sessions_v6 (
+    id INTEGER PRIMARY KEY,
+    pair_id INTEGER NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+    child_kind TEXT NOT NULL CHECK (child_kind IN ('claude', 'codex', 'opencode')),
+    profile_hash BLOB NOT NULL CHECK (length(profile_hash) = 32),
+    profile_schema_version INTEGER NOT NULL CHECK (profile_schema_version > 0),
+    native_id TEXT NOT NULL
+        CHECK (length(native_id) BETWEEN 1 AND 256)
+        CHECK (child_kind <> 'claude' OR length(native_id) = 36),
+    status TEXT NOT NULL
+        CHECK (status IN ('assigned', 'active', 'retired', 'invalid')),
+    created_at INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    retired_at INTEGER,
+    retired_reason TEXT
+        CHECK (retired_reason IS NULL OR retired_reason IN
+            ('fresh_requested', 'profile_changed', 'superseded', 'provider_rejected')),
+    workstream_id TEXT
+        CHECK (workstream_id IS NULL OR length(workstream_id) BETWEEN 1 AND 64),
+    UNIQUE (child_kind, native_id),
+    CHECK (last_seen >= created_at),
+    CHECK (retired_at IS NULL OR retired_at >= created_at),
+    CHECK (
+        (status IN ('assigned', 'active')
+            AND retired_at IS NULL AND retired_reason IS NULL)
+        OR (status = 'retired'
+            AND retired_at IS NOT NULL
+            AND retired_reason IN ('fresh_requested', 'profile_changed', 'superseded'))
+        OR (status = 'invalid'
+            AND retired_at IS NOT NULL
+            AND retired_reason = 'provider_rejected')
+    )
+);
+
+CREATE TABLE invocations_v6 (
+    id TEXT PRIMARY KEY CHECK (length(id) = 36),
+    pair_id INTEGER NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence > 0),
+    status TEXT NOT NULL
+        CHECK (status IN ('pending', 'completed', 'spawn_failed', 'abandoned')),
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    wrapper_pid INTEGER NOT NULL CHECK (wrapper_pid > 0),
+    command_digest BLOB NOT NULL CHECK (length(command_digest) = 32),
+    program_name TEXT NOT NULL,
+    child_kind TEXT NOT NULL CHECK (child_kind IN ('claude', 'codex', 'opencode')),
+    exit_kind TEXT CHECK (exit_kind IS NULL OR exit_kind IN ('exited', 'signaled')),
+    exit_code INTEGER,
+    signal INTEGER,
+    capsule_path BLOB,
+    capsule_digest BLOB CHECK (capsule_digest IS NULL OR length(capsule_digest) = 32),
+    context_provenance TEXT NOT NULL,
+    child_session_id INTEGER REFERENCES child_sessions_v6(id) ON DELETE SET NULL,
+    UNIQUE (pair_id, sequence),
+    CHECK (
+        (status = 'pending'
+            AND completed_at IS NULL
+            AND exit_kind IS NULL AND exit_code IS NULL AND signal IS NULL)
+        OR (status IN ('spawn_failed', 'abandoned')
+            AND completed_at IS NOT NULL
+            AND exit_kind IS NULL AND exit_code IS NULL AND signal IS NULL)
+        OR (status = 'completed'
+            AND completed_at IS NOT NULL
+            AND (
+                (exit_kind = 'exited' AND exit_code IS NOT NULL AND signal IS NULL)
+                OR (exit_kind = 'signaled' AND signal IS NOT NULL AND exit_code IS NULL)
+            ))
+    )
+);
+
+CREATE TABLE exchange_messages_v6 (
+    id INTEGER PRIMARY KEY,
+    invocation_id TEXT NOT NULL REFERENCES invocations_v6(id) ON DELETE CASCADE,
+    direction TEXT NOT NULL CHECK (direction IN ('request', 'response')),
+    body BLOB NOT NULL,
+    body_encoding TEXT NOT NULL CHECK (body_encoding IN ('utf8', 'bytes')),
+    truncated INTEGER NOT NULL CHECK (truncated IN (0, 1)),
+    redaction_count INTEGER NOT NULL CHECK (redaction_count >= 0),
+    redaction_classes TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (invocation_id, direction)
+);
+
+INSERT INTO child_sessions_v6
+SELECT id, pair_id, child_kind, profile_hash, profile_schema_version, native_id,
+       status, created_at, last_seen, retired_at, retired_reason, workstream_id
+FROM child_sessions;
+
+INSERT INTO invocations_v6
+SELECT id, pair_id, sequence, status, started_at, completed_at, wrapper_pid,
+       command_digest, program_name, child_kind, exit_kind, exit_code, signal,
+       capsule_path, capsule_digest, context_provenance, child_session_id
+FROM invocations;
+
+INSERT INTO exchange_messages_v6
+SELECT id, invocation_id, direction, body, body_encoding, truncated,
+       redaction_count, redaction_classes, created_at
+FROM exchange_messages;
+
+DROP TABLE exchange_messages;
+DROP TABLE invocations;
+DROP TABLE child_sessions;
+
+ALTER TABLE child_sessions_v6 RENAME TO child_sessions;
+ALTER TABLE invocations_v6 RENAME TO invocations;
+ALTER TABLE exchange_messages_v6 RENAME TO exchange_messages;
+
+CREATE INDEX child_sessions_pair_id_idx ON child_sessions (pair_id);
+CREATE UNIQUE INDEX child_sessions_live_workstream_idx
+    ON child_sessions (pair_id, child_kind, workstream_id)
+    WHERE status IN ('assigned', 'active') AND workstream_id IS NOT NULL;
+CREATE INDEX invocations_pair_id_idx ON invocations (pair_id);
+CREATE INDEX invocations_pair_status_sequence_idx ON invocations (pair_id, status, sequence);
 ";
 
 #[derive(Debug)]
@@ -741,6 +866,7 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             transaction.execute_batch(SCHEMA_SQL_V3_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V6_MIGRATION)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -751,6 +877,7 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             transaction.execute_batch(SCHEMA_SQL_V3_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V6_MIGRATION)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -761,6 +888,7 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             transaction.execute_batch(SCHEMA_SQL_V3_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V6_MIGRATION)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -770,6 +898,7 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             // `child_sessions` and `invocations.child_session_id` appear.
             transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V6_MIGRATION)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -780,6 +909,12 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             // `child_sessions.workstream_id` and
             // `child_sessions_live_workstream_idx` appear.
             transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
+            transaction.execute_batch(SCHEMA_SQL_V6_MIGRATION)?;
+            transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+        5 => {
+            transaction.execute_batch(SCHEMA_SQL_V6_MIGRATION)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -914,13 +1049,14 @@ pub(crate) struct PairSummary {
 }
 
 /// The runtime kind of the spawned child for an invocation row. Distinct
-/// from [`Provider`] (the resolved *supervisor*): the two currently share a
-/// claude/codex vocabulary, but a child kind describes what `subagent`
+/// from [`Provider`] (the resolved *supervisor*): they share the same provider
+/// vocabulary, but a child kind describes what `subagent`
 /// spawned, not what invoked `subagent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChildKind {
     Claude,
     Codex,
+    OpenCode,
 }
 
 impl ChildKind {
@@ -928,6 +1064,7 @@ impl ChildKind {
         match raw {
             "claude" => Some(ChildKind::Claude),
             "codex" => Some(ChildKind::Codex),
+            "opencode" => Some(ChildKind::OpenCode),
             _ => None,
         }
     }
@@ -938,6 +1075,7 @@ impl fmt::Display for ChildKind {
         let text: &str = match self {
             ChildKind::Claude => "claude",
             ChildKind::Codex => "codex",
+            ChildKind::OpenCode => "opencode",
         };
         f.write_str(text)
     }
@@ -2464,10 +2602,18 @@ fn validate_child_session_native_id(
             native_id.to_string(),
         ));
     }
-    if child_kind == ChildKind::Claude {
-        Uuid::parse_str(native_id).map_err(|_error: uuid::Error| {
-            StoreError::CorruptChildSessionNativeId(native_id.to_string())
-        })?;
+    match child_kind {
+        ChildKind::Claude => {
+            Uuid::parse_str(native_id).map_err(|_error: uuid::Error| {
+                StoreError::CorruptChildSessionNativeId(native_id.to_string())
+            })?;
+        }
+        ChildKind::OpenCode if !opencode_json::is_valid_session_id(native_id) => {
+            return Err(StoreError::CorruptChildSessionNativeId(
+                native_id.to_string(),
+            ));
+        }
+        ChildKind::Codex | ChildKind::OpenCode => {}
     }
     Ok(())
 }
@@ -2907,7 +3053,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_reaches_version_5_with_a_usable_ledger() {
+    fn fresh_database_reaches_version_6_with_a_usable_ledger() {
         let root = tempfile::tempdir().unwrap();
         let state_root = root.path().join("state");
         let store = Store::open_for_write(&state_root).unwrap();
@@ -2917,7 +3063,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, LEDGER_SCHEMA_VERSION);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 5);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 6);
 
         let invocation_count: i64 = store
             .conn
@@ -3600,7 +3746,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_migration_drops_the_profile_index_and_adds_the_workstream_index() {
+    fn workstream_index_replaces_the_legacy_profile_index() {
         let root = tempfile::tempdir().unwrap();
         let store: Store = Store::open_for_write(&root.path().join("state")).unwrap();
 
@@ -3625,13 +3771,77 @@ mod tests {
         assert_eq!(new_index_count, 1);
     }
 
+    #[test]
+    fn opening_a_v5_fixture_enables_opencode_and_preserves_foreign_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let state_root: PathBuf = root.path().join("state");
+        let workspace_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(&state_root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let db_path: PathBuf = state_root.join(DB_FILE_NAME);
+        {
+            let fixture_conn: Connection = Connection::open(&db_path).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V1).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V2_ADDITIONS).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V3_ADDITIONS).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V4_ADDITIONS).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V5_ADDITIONS).unwrap();
+            fixture_conn
+                .pragma_update(None, "user_version", 5i64)
+                .unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut store: Store = Store::open_for_write(&state_root).unwrap();
+        let workspace_ref: WorkspaceRef = workspace(workspace_dir.path());
+        let pair: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::OpenCode,
+                "ses_supervisor",
+                &id("opencode-reviewer"),
+            )
+            .unwrap();
+        let session: ChildSessionRecord = store
+            .assign_fresh_child_session(
+                &pair.pair_key,
+                ChildKind::OpenCode,
+                "implementation",
+                &[61u8; 32],
+                "ses_child-001",
+            )
+            .unwrap();
+        assert_eq!(session.native_id, "ses_child-001");
+        assert_eq!(session.child_kind, ChildKind::OpenCode);
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+        let foreign_key_errors: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+    }
+
     /// Builds an on-disk version 4 database by hand (`SCHEMA_SQL_V1` through
     /// `SCHEMA_SQL_V4_ADDITIONS`) with a pre-existing live child session (no
     /// `workstream_id` column existed at that version), so the migration
-    /// path exercised here is the real version 4 -> 5 upgrade rather than a
+    /// path exercised here traverses the real version 4 -> 5 upgrade rather than a
     /// stand-in, and the legacy row's `workstream_id` reads back as `None`.
     #[test]
-    fn opening_a_v4_fixture_migrates_to_v5_and_preserves_its_child_sessions() {
+    fn opening_a_v4_fixture_migrates_to_current_and_preserves_its_child_sessions() {
         let root = tempfile::tempdir().unwrap();
         let state_root: PathBuf = root.path().join("state");
         let workspace_dir = tempfile::tempdir().unwrap();

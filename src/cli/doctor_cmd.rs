@@ -72,7 +72,7 @@ fn capabilities() -> Vec<Capability> {
         capability(
             "supervisor-detection-explicit-native",
             CapabilityState::Implemented,
-            "resolves an explicit --supervisor codex:ID or claude:ID, or exactly one \
+            "resolves an explicit --supervisor codex:ID, claude:ID, or opencode:ID, or exactly one \
              unambiguous, non-empty CODEX_THREAD_ID or CLAUDE_CODE_SESSION_ID (design.md \
              section 5, steps 1 and 3)",
         ),
@@ -108,7 +108,7 @@ fn capabilities() -> Vec<Capability> {
         capability(
             "child-session-store",
             CapabilityState::Implemented,
-            "SQLite schema version 5 stores workstream-scoped provider-native child sessions, lifecycle state, and versioned command-profile hashes",
+            "SQLite schema version 6 stores workstream-scoped provider-native child sessions for Claude Code, Codex, and OpenCode, lifecycle state, and versioned command-profile hashes",
         ),
         capability(
             "child-session-resume-claude",
@@ -119,6 +119,11 @@ fn capabilities() -> Vec<Capability> {
             "child-session-resume-codex",
             CapabilityState::Implemented,
             "Codex supports explicit --workstream with exactly one of --fresh or --resume; JSONL observation persists and verifies the exact native thread ID",
+        ),
+        capability(
+            "child-session-resume-opencode",
+            CapabilityState::Implemented,
+            "OpenCode supports explicit --workstream with exactly one of --fresh or --resume; JSONL observation persists and verifies the exact native session ID",
         ),
         capability(
             "task-request-projection",
@@ -146,6 +151,11 @@ fn capabilities() -> Vec<Capability> {
             "the Claude Code transcript/hook adapter (design.md section 8.2) is not implemented yet",
         ),
         capability(
+            "history-adapter-opencode",
+            CapabilityState::Planned,
+            "the OpenCode supervisor-history adapter is not implemented yet; use an explicit opencode:SESSION_ID supervisor reference",
+        ),
+        capability(
             "summarizer-deterministic",
             CapabilityState::Implemented,
             "a bounded model-free summary of recent pair exchanges is materialized for pull-based reading and is injected through child stdin only with inline delivery",
@@ -166,9 +176,14 @@ fn capabilities() -> Vec<Capability> {
             "codex exec is supported with argument-preserving stdin bootstrap injection; tracked workstreams add a bounded JSONL observation transport and exact native resume",
         ),
         capability(
+            "child-adapter-opencode",
+            CapabilityState::Implemented,
+            "opencode run is supported with argument-preserving stdin bootstrap injection; tracked workstreams add a bounded JSONL observation transport and exact --session resume",
+        ),
+        capability(
             "child-spawn",
             CapabilityState::Implemented,
-            "stdout/stderr forwarding and capture are bounded; tracked Codex JSONL is rendered after completion, while observation failures preserve captured output and child exit status",
+            "stdout/stderr forwarding and capture are bounded; tracked Codex and OpenCode JSONL is rendered after completion, while observation failures preserve captured output and child exit status",
         ),
     ]
 }
@@ -266,6 +281,23 @@ mod tests {
             .find(|capability| capability.name == "child-session-resume-codex")
             .unwrap();
         assert_eq!(managed_resume.state, CapabilityState::Implemented);
+    }
+
+    #[test]
+    fn managed_opencode_resume_and_child_adapter_are_implemented() {
+        let capabilities: Vec<Capability> = capabilities();
+        for name in ["child-session-resume-opencode", "child-adapter-opencode"] {
+            let capability: &Capability = capabilities
+                .iter()
+                .find(|capability: &&Capability| capability.name == name)
+                .unwrap();
+            assert_eq!(capability.state, CapabilityState::Implemented);
+        }
+        let history: &Capability = capabilities
+            .iter()
+            .find(|capability: &&Capability| capability.name == "history-adapter-opencode")
+            .unwrap();
+        assert_eq!(history.state, CapabilityState::Planned);
     }
 
     #[test]

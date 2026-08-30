@@ -102,6 +102,11 @@ pub(crate) fn read_supervisor_history(
             "adapter_not_implemented",
             "the Claude Code supervisor-history adapter is not implemented yet",
         ),
+        Provider::OpenCode => unavailable(
+            "opencode_transcript",
+            "adapter_not_implemented",
+            "the OpenCode supervisor-history adapter is not implemented yet",
+        ),
     }
 }
 

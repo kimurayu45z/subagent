@@ -11,10 +11,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use super::capsule::{self, Capsule, CapsuleRequest, InheritedHistory};
-use super::child::{self, ClaudeSessionMode, CodexSessionMode, CommandProfile, ProfileHash};
+use super::child::{
+    self, ClaudeSessionMode, CodexSessionMode, CommandProfile, OpenCodeSessionMode, ProfileHash,
+};
 use super::codex_json;
 use super::history::{self, SupervisorHistory};
 use super::id::SubagentId;
+use super::opencode_json;
 use super::process::{self, ChildExit, ChildOutcome, ChildRunRequest};
 use super::redaction::{self, RedactionResult};
 use super::run_cmd::{
@@ -36,7 +39,7 @@ const MAX_MAX_CONTEXT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STDIN_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RECORDED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECORDED_RESPONSE_BYTES: usize = 1024 * 1024;
-const MAX_CODEX_JSON_TRANSPORT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PROVIDER_JSON_TRANSPORT_BYTES: usize = 32 * 1024 * 1024;
 const STALE_PENDING_AFTER_SECONDS: i64 = 24 * 60 * 60;
 
 pub(crate) struct ManagedRunRequest<'a> {
@@ -261,7 +264,7 @@ pub(crate) fn execute(
 
     let mut native_session: Option<ChildSessionRecord> = match request.native_continuity {
         NativeContinuity::Untracked => None,
-        NativeContinuity::Fresh if kind == ChildKind::Codex => None,
+        NativeContinuity::Fresh if matches!(kind, ChildKind::Codex | ChildKind::OpenCode) => None,
         NativeContinuity::Fresh => {
             let workstream: &WorkstreamId = request
                 .workstream
@@ -332,8 +335,14 @@ pub(crate) fn execute(
 
     let stdin_bytes: Vec<u8> = prepare_child_stdin(capsule.as_ref(), request.caller_stdin);
     let tracked_codex: bool = kind == ChildKind::Codex && request.workstream.is_some();
+    let tracked_opencode: bool = kind == ChildKind::OpenCode && request.workstream.is_some();
+    let tracked_observed_session: bool = tracked_codex || tracked_opencode;
     let caller_requested_codex_json: bool =
         tracked_codex && child::codex_json_requested(request.args);
+    let caller_requested_opencode_json: bool =
+        tracked_opencode && child::opencode_json_requested(request.args);
+    let caller_requested_transport_json: bool =
+        caller_requested_codex_json || caller_requested_opencode_json;
     let spawn_args_storage: Option<Vec<OsString>> = match (kind, request.native_continuity) {
         (ChildKind::Claude, NativeContinuity::Fresh | NativeContinuity::Resume) => {
             let session: &ChildSessionRecord = native_session
@@ -363,6 +372,18 @@ pub(crate) fn execute(
                 CodexSessionMode::Resume(&session.native_id),
             ))
         }
+        (ChildKind::OpenCode, NativeContinuity::Fresh) => Some(
+            child::inject_opencode_session_args(request.args, OpenCodeSessionMode::Fresh),
+        ),
+        (ChildKind::OpenCode, NativeContinuity::Resume) => {
+            let session: &ChildSessionRecord = native_session
+                .as_ref()
+                .expect("tracked OpenCode resume resolves a session before spawn");
+            Some(child::inject_opencode_session_args(
+                request.args,
+                OpenCodeSessionMode::Resume(&session.native_id),
+            ))
+        }
         (_, NativeContinuity::Untracked) => None,
     };
     let spawn_args: &[OsString] = spawn_args_storage.as_deref().unwrap_or(request.args);
@@ -373,7 +394,7 @@ pub(crate) fn execute(
             cwd: request.cwd,
             stdin_bytes,
             env_overrides: Vec::new(),
-            env_removals: if tracked_codex {
+            env_removals: if tracked_observed_session {
                 vec![
                     OsString::from("CODEX_THREAD_ID"),
                     OsString::from("CLAUDE_CODE_SESSION_ID"),
@@ -382,12 +403,12 @@ pub(crate) fn execute(
             } else {
                 Vec::new()
             },
-            max_capture_bytes: if tracked_codex {
-                MAX_CODEX_JSON_TRANSPORT_BYTES
+            max_capture_bytes: if tracked_observed_session {
+                MAX_PROVIDER_JSON_TRANSPORT_BYTES
             } else {
                 MAX_RECORDED_RESPONSE_BYTES
             },
-            forward_stdout: !tracked_codex || caller_requested_codex_json,
+            forward_stdout: !tracked_observed_session || caller_requested_transport_json,
             forward_signals: request.forward_signals,
             timeout: None,
         },
@@ -519,6 +540,131 @@ pub(crate) fn execute(
 
         let rendered: Vec<u8> = observation.final_message.unwrap_or_default();
         if !caller_requested_codex_json
+            && !rendered.is_empty()
+            && let Err(error) = out.write_all(&rendered).and_then(|()| {
+                if rendered.ends_with(b"\n") {
+                    Ok(())
+                } else {
+                    out.write_all(b"\n")
+                }
+            })
+        {
+            let _ = writeln!(
+                err,
+                "subagent: warning: child stdout forwarding failed: {error}"
+            );
+        }
+        outcome.stdout_capture = rendered;
+        outcome.stdout_truncated = false;
+    }
+
+    if tracked_opencode {
+        let expected_session_id: Option<&str> =
+            if request.native_continuity == NativeContinuity::Resume {
+                native_session
+                    .as_ref()
+                    .map(|session: &ChildSessionRecord| session.native_id.as_str())
+            } else {
+                None
+            };
+        let observation: opencode_json::Observation = match opencode_json::observe(
+            &outcome.stdout_capture,
+            outcome.stdout_truncated,
+            expected_session_id,
+        ) {
+            Ok(observation) => observation,
+            Err(protocol_error) => {
+                let _ = writeln!(
+                    err,
+                    "subagent: warning: could not confirm OpenCode native continuity: {protocol_error}"
+                );
+                if matches!(
+                    protocol_error,
+                    opencode_json::ProtocolError::SessionIdMismatch { .. }
+                        | opencode_json::ProtocolError::ConflictingSessionId
+                ) && let Some(session) = &native_session
+                {
+                    let _ = ledger.retire_child_session(
+                        &pair.pair_key,
+                        &session.native_id,
+                        ChildSessionRetirement::ProviderRejected,
+                    );
+                }
+                if !caller_requested_opencode_json
+                    && let Err(error) = out
+                        .write_all(&outcome.stdout_capture)
+                        .and_then(|()| out.flush())
+                {
+                    let _ = writeln!(
+                        err,
+                        "subagent: warning: fallback OpenCode stdout forwarding failed: {error}"
+                    );
+                }
+                let diagnostic: String =
+                    format!("[OpenCode continuity unconfirmed: {protocol_error}]");
+                outcome.stdout_capture = diagnostic.into_bytes();
+                return complete_and_return(
+                    &mut ledger,
+                    &begun.invocation_id,
+                    outcome,
+                    None,
+                    pair,
+                    err,
+                    request.forward_signals,
+                );
+            }
+        };
+
+        native_session_confirmed = child_exit_succeeded(outcome.exit)
+            && observation.turn_completed
+            && !observation.turn_failed
+            && observation.final_message.is_some();
+        if child_exit_succeeded(outcome.exit) && !native_session_confirmed {
+            let _ = writeln!(
+                err,
+                "subagent: warning: OpenCode exited successfully without a completed turn and final text; native continuity remains unconfirmed"
+            );
+        }
+
+        if request.native_continuity == NativeContinuity::Fresh {
+            let workstream: &WorkstreamId = request
+                .workstream
+                .expect("tracked OpenCode fresh has a workstream");
+            let profile_hash: ProfileHash =
+                profile_hash.expect("tracked continuity always computes a profile hash");
+            let assigned: Option<ChildSessionRecord> = match ledger.assign_fresh_child_session(
+                &pair.pair_key,
+                kind,
+                workstream.as_str(),
+                profile_hash.as_bytes(),
+                &observation.session_id,
+            ) {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    let _ = writeln!(
+                        err,
+                        "subagent: warning: child finished but its observed OpenCode session could not be persisted: {error}"
+                    );
+                    native_session_confirmed = false;
+                    None
+                }
+            };
+            if let Some(assigned) = assigned {
+                if let Err(error) =
+                    ledger.link_invocation_child_session(&begun.invocation_id, &assigned.native_id)
+                {
+                    let _ = writeln!(
+                        err,
+                        "subagent: warning: child finished but its observed OpenCode session could not be linked: {error}"
+                    );
+                    native_session_confirmed = false;
+                }
+                native_session = Some(assigned);
+            }
+        }
+
+        let rendered: Vec<u8> = observation.final_message.unwrap_or_default();
+        if !caller_requested_opencode_json
             && !rendered.is_empty()
             && let Err(error) = out.write_all(&rendered).and_then(|()| {
                 if rendered.ends_with(b"\n") {
