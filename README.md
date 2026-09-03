@@ -33,6 +33,13 @@ This skill supersedes the former `claude-code-subagent` skill from
 `kimurayu45z/codex-claude-subagent`; its Claude Code execution guidance now
 lives alongside equivalent Codex guidance under this repository.
 
+The skill entrypoint starts with a short route: use a provider CLI directly for
+a one-off task, use `subagent` for recurring-role or cross-provider history,
+and add `--workstream` only for one intentional native-session continuation.
+It does not launch a child when asked only to explain or review the skill.
+Detailed concepts, capability gates, result reporting, provider arguments, and
+Git worktree coordination are loaded from separate references only when needed.
+
 ## Run
 
 ```sh
@@ -93,6 +100,13 @@ SUBAGENT_STATE_DIR="$experiment_state_dir" \
 All SQLite rows and context capsules for that invocation stay below the
 temporary directory. Do not run `subagent forget` against a normal pair merely
 to clean up an experiment.
+
+When concurrent source-writing has a material speed benefit, use one Git
+worktree per independent writer and keep `subagent --workstream` conceptually
+separate: a worktree isolates files and branches, while a workstream continues
+one provider-native conversation. Sequence trivial changes when setup costs
+more than it saves, and do not parallelize writers that edit the same files or
+depend on each other's uncommitted results.
 
 When a model-prefixed logical identity changes, declare a one-way handoff from
 the older identity. The source must exist in this same workspace and supervisor
@@ -188,6 +202,11 @@ state path:
 subagent --id claude-opus-architect --context-delivery inline -- \
   claude -p "Continue the architecture review" --model opus
 ```
+
+Do not read the entire ledger or native transcript merely because it exists.
+Keep the current task self-contained, inspect `summary.md` only when prior
+context may matter, and request the smallest relevant history slice only when
+the summary is insufficient.
 
 Accepted product decisions should live in version-controlled design files,
 ADRs, issues, or pull requests. The SQLite ledger is operational evidence and a

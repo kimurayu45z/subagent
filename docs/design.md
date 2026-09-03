@@ -999,6 +999,28 @@ Command arrays are stored and executed as argument vectors, not shell strings.
 - a distributable Agent Skill that explains when durable delegation context is
   useful and checks installed capabilities before relying on them.
 
+The skill uses progressive disclosure. Its entrypoint contains the quick route,
+authorization boundary, representative direct/wrapped/continued calls, and the
+summary-first context rule. Provider argument details, identity terminology,
+doctor capability gates, compact parent reporting, and Git worktree coordination
+live in references that are read only when relevant. A request to explain or
+review the skill is a meta request and must not itself launch a child merely
+because the skill is named. An explicit request for another agent's opinion is
+still a valid delegation request.
+
+The context rule is summary-first and bounded: keep the current task
+self-contained, consult `summary.md` only when prior decisions may matter, then
+read the smallest relevant history slice if the summary is insufficient. The
+skill must not instruct a parent or child to read or paste complete pair logs,
+supervisor transcripts, native session logs, or raw tool traces by default.
+
+Git worktrees and native workstreams remain separate concepts. Independent
+concurrent writers may receive distinct worktrees and branches when the
+parallel speed benefit exceeds setup and integration cost; tiny changes may be
+faster sequentially. Overlapping or ordered changes stay sequential. Worktree
+creation, branch creation, commit, push, integration, and removal remain subject
+to the user's authorization and dirty-worktree protections.
+
 Slice 0 deliberately excludes supervisor discovery, persistence, history
 adapters, context injection, native child resume, and summarization. Its purpose
 is to test the vocabulary and workflow before committing to those mechanisms.
