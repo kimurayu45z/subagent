@@ -15,11 +15,33 @@ The argument order matters. Do not write `agy -p --model MODEL TASK`: `-p`
 consumes the next token as its prompt. Build argv as separate arguments and do
 not concatenate an untrusted task into a shell command string.
 
-The installed CLI may request command or file permissions even in headless
-mode. A permission denial is a real subordinate failure, not a reason to add
-`--dangerously-skip-permissions`. Only grant tools or edit authority already
-within the user's request. For experiments, isolate XDG config, data, cache,
-and state directories plus `SUBAGENT_STATE_DIR`; do not clear normal state.
+Headless print is an I/O mode, not a permission grant. Match the provider's
+execution mode to the authority already established for the task. On an
+installed build that advertises these modes, use `plan` for read-only work:
+
+```sh
+agy -p "Review the current diff without modifying files" \
+  --model gemini-3.8-flash-high --mode plan
+```
+
+Use `accept-edits` only after edit authority is established:
+
+```sh
+agy -p "Implement only the requested change" \
+  --model gemini-3.8-flash-high --mode accept-edits
+```
+
+`accept-edits` does not imply blanket approval for terminal commands, MCP
+tools, external access, or paths outside the provider workspace. Those remain
+subject to Antigravity's permission policy. If a headless tool is denied,
+inspect the stderr notice and then, only when needed and supported by the
+installed build, inspect `agy -p "/permissions" --output-format json`. Grant
+only a narrow rule already within the user's request. Do not add
+`--dangerously-skip-permissions` merely to make an unattended run proceed.
+
+Verify `agy --version` and `agy --help` before depending on exact mode or
+permission behavior. For experiments, isolate XDG config, data, cache, and
+state directories plus `SUBAGENT_STATE_DIR`; do not clear normal state.
 
 ## Managed context and exact continuity
 
@@ -30,15 +52,22 @@ positional print selector/task, sends the context capsule and current task as
 one typed NDJSON user event, closes stdin, validates a terminal `SUCCESS`
 result, and normally renders only its response text.
 
-For one deliberate chain, let the wrapper own the exact conversation ID:
+For one deliberate implementation chain with established edit authority, let
+the wrapper own the exact conversation ID and keep the provider mode stable:
 
 ```sh
 subagent --id gemini-flash-implementer --workstream issue-42 --fresh -- \
-  agy -p "Implement the first slice" --model gemini-3.8-flash-high
+  agy -p "Implement the first slice" --model gemini-3.8-flash-high \
+    --mode accept-edits
 
 subagent --id gemini-flash-implementer --workstream issue-42 --resume -- \
-  agy -p "Fix the failing test" --model gemini-3.8-flash-high
+  agy -p "Fix the failing test" --model gemini-3.8-flash-high \
+    --mode accept-edits
 ```
+
+The execution mode is part of the command profile. Do not add or change it on
+`--resume`; start a deliberate `--fresh` chain when the permission profile must
+change.
 
 The wrapper observes the provider-issued UUID and resumes it only through
 `--conversation EXACT_UUID`. It rejects caller-owned `--conversation`,
@@ -66,5 +95,7 @@ history is conservatively unavailable. Keep the logical ID tied to the model
 family/alias and durable role (`gemini-flash-reviewer`), not to the execution
 CLI (`agy-reviewer`).
 
-Treat the result as evidence, not acceptance. Inspect edits and rerun
-proportionate verification independently.
+Treat the result as evidence, not acceptance. A zero exit status or terminal
+`SUCCESS` confirms provider-protocol completion, not that a requested edit or
+other side effect happened. Inspect the expected diff or artifact, account for
+permission denials, and rerun proportionate verification independently.

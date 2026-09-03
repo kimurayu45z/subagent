@@ -827,6 +827,14 @@ formats, and output formats other than `stream-json`. The wrapper never injects
 `--dangerously-skip-permissions`; provider tool permission remains within the
 caller's authorization boundary.
 
+Headless print transport does not grant file or command authority. The caller
+must select an installed Antigravity execution mode consistent with the task's
+existing authorization; the wrapper preserves that provider mode and never
+infers broader permission from a role name or an implementation prompt. A
+provider exit status or terminal `SUCCESS` establishes protocol completion,
+not completion of a requested mutation, which the parent verifies from the
+actual diff, artifact, or external side effect.
+
 Antigravity's positional print mode does not merge piped stdin into the model
 prompt. Every managed Antigravity run therefore removes the caller's print
 selector and task only after projection/digest/profile calculation, adds
