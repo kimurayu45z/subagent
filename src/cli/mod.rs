@@ -10,6 +10,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 mod agent_cmd;
+mod antigravity_json;
 mod capsule;
 mod child;
 mod codex_json;
@@ -53,7 +54,7 @@ pub(crate) enum OutputFormat {
 }
 
 const HELP_TEXT: &str = "\
-subagent - preserve delegation context across Codex, Claude Code, and OpenCode sub-agent invocations
+subagent - preserve delegation context across Codex, Claude Code, OpenCode, and Antigravity sub-agent invocations
 
 USAGE:
     subagent --id ID [RUN-OPTIONS] -- COMMAND [ARG...]

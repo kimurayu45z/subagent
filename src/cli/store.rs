@@ -27,10 +27,10 @@ use uuid::Uuid;
 
 use super::child::COMMAND_PROFILE_SCHEMA_VERSION;
 use super::id::{MAX_ID_LEN, SubagentId, is_valid_logical_name};
-use super::opencode_json;
 use super::pair_key::PairKey;
 use super::supervisor::Provider;
 use super::workspace::WorkspaceRef;
+use super::{antigravity_json, opencode_json};
 
 /// The on-disk ledger schema version, tracked independently of
 /// [`super::pair_key::PAIR_KEY_SCHEMA_VERSION`] and
@@ -50,8 +50,9 @@ use super::workspace::WorkspaceRef;
 /// index on `(pair_id, child_kind, workstream_id)`, without altering any
 /// version 1, 2, 3, or 4 row. Version 6 rebuilds the three child-facing tables
 /// so their `child_kind` constraints also admit `opencode`, while copying all
-/// existing rows and preserving their foreign-key relationships.
-pub(crate) const LEDGER_SCHEMA_VERSION: i64 = 6;
+/// existing rows and preserving their foreign-key relationships. Version 7
+/// performs the same constrained-table rebuild to admit `antigravity`.
+pub(crate) const LEDGER_SCHEMA_VERSION: i64 = 7;
 
 const DB_FILE_NAME: &str = "ledger.sqlite3";
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -381,6 +382,127 @@ DROP TABLE child_sessions;
 ALTER TABLE child_sessions_v6 RENAME TO child_sessions;
 ALTER TABLE invocations_v6 RENAME TO invocations;
 ALTER TABLE exchange_messages_v6 RENAME TO exchange_messages;
+
+CREATE INDEX child_sessions_pair_id_idx ON child_sessions (pair_id);
+CREATE UNIQUE INDEX child_sessions_live_workstream_idx
+    ON child_sessions (pair_id, child_kind, workstream_id)
+    WHERE status IN ('assigned', 'active') AND workstream_id IS NOT NULL;
+CREATE INDEX invocations_pair_id_idx ON invocations (pair_id);
+CREATE INDEX invocations_pair_status_sequence_idx ON invocations (pair_id, status, sequence);
+";
+
+/// Version 6 -> 7 migration: preserve every child session, invocation, and
+/// exchange row while extending the child-kind constraints with Antigravity.
+/// SQLite cannot alter these table-level checks in place.
+const SCHEMA_SQL_V7_MIGRATION: &str = "
+CREATE TABLE child_sessions_v7 (
+    id INTEGER PRIMARY KEY,
+    pair_id INTEGER NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+    child_kind TEXT NOT NULL CHECK (child_kind IN ('claude', 'codex', 'opencode', 'antigravity')),
+    profile_hash BLOB NOT NULL CHECK (length(profile_hash) = 32),
+    profile_schema_version INTEGER NOT NULL CHECK (profile_schema_version > 0),
+    native_id TEXT NOT NULL
+        CHECK (length(native_id) BETWEEN 1 AND 256)
+        CHECK (child_kind <> 'claude' OR length(native_id) = 36)
+        CHECK (child_kind <> 'antigravity' OR length(native_id) = 36),
+    status TEXT NOT NULL
+        CHECK (status IN ('assigned', 'active', 'retired', 'invalid')),
+    created_at INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    retired_at INTEGER,
+    retired_reason TEXT
+        CHECK (retired_reason IS NULL OR retired_reason IN
+            ('fresh_requested', 'profile_changed', 'superseded', 'provider_rejected')),
+    workstream_id TEXT
+        CHECK (workstream_id IS NULL OR length(workstream_id) BETWEEN 1 AND 64),
+    UNIQUE (child_kind, native_id),
+    CHECK (last_seen >= created_at),
+    CHECK (retired_at IS NULL OR retired_at >= created_at),
+    CHECK (
+        (status IN ('assigned', 'active')
+            AND retired_at IS NULL AND retired_reason IS NULL)
+        OR (status = 'retired'
+            AND retired_at IS NOT NULL
+            AND retired_reason IN ('fresh_requested', 'profile_changed', 'superseded'))
+        OR (status = 'invalid'
+            AND retired_at IS NOT NULL
+            AND retired_reason = 'provider_rejected')
+    )
+);
+
+CREATE TABLE invocations_v7 (
+    id TEXT PRIMARY KEY CHECK (length(id) = 36),
+    pair_id INTEGER NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence > 0),
+    status TEXT NOT NULL
+        CHECK (status IN ('pending', 'completed', 'spawn_failed', 'abandoned')),
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    wrapper_pid INTEGER NOT NULL CHECK (wrapper_pid > 0),
+    command_digest BLOB NOT NULL CHECK (length(command_digest) = 32),
+    program_name TEXT NOT NULL,
+    child_kind TEXT NOT NULL
+        CHECK (child_kind IN ('claude', 'codex', 'opencode', 'antigravity')),
+    exit_kind TEXT CHECK (exit_kind IS NULL OR exit_kind IN ('exited', 'signaled')),
+    exit_code INTEGER,
+    signal INTEGER,
+    capsule_path BLOB,
+    capsule_digest BLOB CHECK (capsule_digest IS NULL OR length(capsule_digest) = 32),
+    context_provenance TEXT NOT NULL,
+    child_session_id INTEGER REFERENCES child_sessions_v7(id) ON DELETE SET NULL,
+    UNIQUE (pair_id, sequence),
+    CHECK (
+        (status = 'pending'
+            AND completed_at IS NULL
+            AND exit_kind IS NULL AND exit_code IS NULL AND signal IS NULL)
+        OR (status IN ('spawn_failed', 'abandoned')
+            AND completed_at IS NOT NULL
+            AND exit_kind IS NULL AND exit_code IS NULL AND signal IS NULL)
+        OR (status = 'completed'
+            AND completed_at IS NOT NULL
+            AND (
+                (exit_kind = 'exited' AND exit_code IS NOT NULL AND signal IS NULL)
+                OR (exit_kind = 'signaled' AND signal IS NOT NULL AND exit_code IS NULL)
+            ))
+    )
+);
+
+CREATE TABLE exchange_messages_v7 (
+    id INTEGER PRIMARY KEY,
+    invocation_id TEXT NOT NULL REFERENCES invocations_v7(id) ON DELETE CASCADE,
+    direction TEXT NOT NULL CHECK (direction IN ('request', 'response')),
+    body BLOB NOT NULL,
+    body_encoding TEXT NOT NULL CHECK (body_encoding IN ('utf8', 'bytes')),
+    truncated INTEGER NOT NULL CHECK (truncated IN (0, 1)),
+    redaction_count INTEGER NOT NULL CHECK (redaction_count >= 0),
+    redaction_classes TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (invocation_id, direction)
+);
+
+INSERT INTO child_sessions_v7
+SELECT id, pair_id, child_kind, profile_hash, profile_schema_version, native_id,
+       status, created_at, last_seen, retired_at, retired_reason, workstream_id
+FROM child_sessions;
+
+INSERT INTO invocations_v7
+SELECT id, pair_id, sequence, status, started_at, completed_at, wrapper_pid,
+       command_digest, program_name, child_kind, exit_kind, exit_code, signal,
+       capsule_path, capsule_digest, context_provenance, child_session_id
+FROM invocations;
+
+INSERT INTO exchange_messages_v7
+SELECT id, invocation_id, direction, body, body_encoding, truncated,
+       redaction_count, redaction_classes, created_at
+FROM exchange_messages;
+
+DROP TABLE exchange_messages;
+DROP TABLE invocations;
+DROP TABLE child_sessions;
+
+ALTER TABLE child_sessions_v7 RENAME TO child_sessions;
+ALTER TABLE invocations_v7 RENAME TO invocations;
+ALTER TABLE exchange_messages_v7 RENAME TO exchange_messages;
 
 CREATE INDEX child_sessions_pair_id_idx ON child_sessions (pair_id);
 CREATE UNIQUE INDEX child_sessions_live_workstream_idx
@@ -867,6 +989,7 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V6_MIGRATION)?;
+            transaction.execute_batch(SCHEMA_SQL_V7_MIGRATION)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -878,6 +1001,7 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V6_MIGRATION)?;
+            transaction.execute_batch(SCHEMA_SQL_V7_MIGRATION)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -889,6 +1013,7 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V6_MIGRATION)?;
+            transaction.execute_batch(SCHEMA_SQL_V7_MIGRATION)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -899,6 +1024,7 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             transaction.execute_batch(SCHEMA_SQL_V4_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V6_MIGRATION)?;
+            transaction.execute_batch(SCHEMA_SQL_V7_MIGRATION)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -910,11 +1036,18 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             // `child_sessions_live_workstream_idx` appear.
             transaction.execute_batch(SCHEMA_SQL_V5_ADDITIONS)?;
             transaction.execute_batch(SCHEMA_SQL_V6_MIGRATION)?;
+            transaction.execute_batch(SCHEMA_SQL_V7_MIGRATION)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
         5 => {
             transaction.execute_batch(SCHEMA_SQL_V6_MIGRATION)?;
+            transaction.execute_batch(SCHEMA_SQL_V7_MIGRATION)?;
+            transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
+            transaction.commit()?;
+        }
+        6 => {
+            transaction.execute_batch(SCHEMA_SQL_V7_MIGRATION)?;
             transaction.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -1057,6 +1190,7 @@ pub(crate) enum ChildKind {
     Claude,
     Codex,
     OpenCode,
+    Antigravity,
 }
 
 impl ChildKind {
@@ -1065,6 +1199,7 @@ impl ChildKind {
             "claude" => Some(ChildKind::Claude),
             "codex" => Some(ChildKind::Codex),
             "opencode" => Some(ChildKind::OpenCode),
+            "antigravity" => Some(ChildKind::Antigravity),
             _ => None,
         }
     }
@@ -1076,6 +1211,7 @@ impl fmt::Display for ChildKind {
             ChildKind::Claude => "claude",
             ChildKind::Codex => "codex",
             ChildKind::OpenCode => "opencode",
+            ChildKind::Antigravity => "antigravity",
         };
         f.write_str(text)
     }
@@ -2613,7 +2749,12 @@ fn validate_child_session_native_id(
                 native_id.to_string(),
             ));
         }
-        ChildKind::Codex | ChildKind::OpenCode => {}
+        ChildKind::Antigravity if !antigravity_json::is_valid_conversation_id(native_id) => {
+            return Err(StoreError::CorruptChildSessionNativeId(
+                native_id.to_string(),
+            ));
+        }
+        ChildKind::Codex | ChildKind::OpenCode | ChildKind::Antigravity => {}
     }
     Ok(())
 }
@@ -3053,7 +3194,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_reaches_version_6_with_a_usable_ledger() {
+    fn fresh_database_reaches_version_7_with_a_usable_ledger() {
         let root = tempfile::tempdir().unwrap();
         let state_root = root.path().join("state");
         let store = Store::open_for_write(&state_root).unwrap();
@@ -3063,7 +3204,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, LEDGER_SCHEMA_VERSION);
-        assert_eq!(LEDGER_SCHEMA_VERSION, 6);
+        assert_eq!(LEDGER_SCHEMA_VERSION, 7);
 
         let invocation_count: i64 = store
             .conn
@@ -3825,7 +3966,133 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, LEDGER_SCHEMA_VERSION);
+        let foreign_key_errors: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+    }
+
+    #[test]
+    fn opening_a_v6_fixture_preserves_rows_and_enables_antigravity() {
+        let root = tempfile::tempdir().unwrap();
+        let state_root: PathBuf = root.path().join("state");
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let workspace_ref: WorkspaceRef = workspace(workspace_dir.path());
+        let identity_bytes: Vec<u8> = workspace_ref.identity_bytes();
+        let existing_pair_key: PairKey = PairKey::compute(
+            &identity_bytes,
+            Provider::Codex,
+            "supervisor-v6",
+            &id("existing-reviewer"),
+        );
+        std::fs::create_dir(&state_root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let db_path: PathBuf = state_root.join(DB_FILE_NAME);
+        {
+            let fixture_conn: Connection = Connection::open(&db_path).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V1).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V2_ADDITIONS).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V3_ADDITIONS).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V4_ADDITIONS).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V5_ADDITIONS).unwrap();
+            fixture_conn.execute_batch(SCHEMA_SQL_V6_MIGRATION).unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO workspaces (canonical_path, identity_kind, created_at)
+                     VALUES (?1, 'path', 1000)",
+                    params![identity_bytes],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO supervisor_sessions
+                         (provider, native_id, workspace_id, first_seen, last_seen)
+                     VALUES ('codex', 'supervisor-v6', 1, 1000, 1000)",
+                    [],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO pairs
+                         (pair_key, workspace_id, supervisor_session_id, subagent_id,
+                          created_at, last_seen)
+                     VALUES (?1, 1, 1, 'existing-reviewer', 1000, 1000)",
+                    params![existing_pair_key.as_bytes().as_slice()],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO child_sessions
+                         (pair_id, child_kind, profile_hash, profile_schema_version, native_id,
+                          status, created_at, last_seen, workstream_id)
+                     VALUES (1, 'opencode', ?1, ?2, 'ses_existing', 'active', 1000, 1000,
+                             'review')",
+                    params![vec![71u8; 32], i64::from(COMMAND_PROFILE_SCHEMA_VERSION)],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO invocations
+                         (id, pair_id, sequence, status, started_at, completed_at, wrapper_pid,
+                          command_digest, program_name, child_kind, exit_kind, exit_code,
+                          context_provenance, child_session_id)
+                     VALUES ('018f0000-0000-7000-8000-000000000071', 1, 1, 'completed',
+                             1000, 1001, 1, ?1, 'opencode', 'opencode', 'exited', 0, '{}', 1)",
+                    params![vec![72u8; 32]],
+                )
+                .unwrap();
+            fixture_conn
+                .execute(
+                    "INSERT INTO exchange_messages
+                         (invocation_id, direction, body, body_encoding, truncated,
+                          redaction_count, redaction_classes, created_at)
+                     VALUES ('018f0000-0000-7000-8000-000000000071', 'response',
+                             ?1, 'utf8', 0, 0, '[]', 1001)",
+                    params![b"preserved".to_vec()],
+                )
+                .unwrap();
+            fixture_conn
+                .pragma_update(None, "user_version", 6i64)
+                .unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut store: Store = Store::open_for_write(&state_root).unwrap();
+        let preserved: Vec<CompletedExchange> = store
+            .list_completed_exchanges(&existing_pair_key, None)
+            .unwrap();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].body, b"preserved");
+        let antigravity_pair: EnsuredPair = store
+            .ensure_pair(
+                &workspace_ref,
+                Provider::Antigravity,
+                "0222067a-9e42-4b76-9649-66b84fd6bb26",
+                &id("gemini-flash-reviewer"),
+            )
+            .unwrap();
+        let conversation: ChildSessionRecord = store
+            .assign_fresh_child_session(
+                &antigravity_pair.pair_key,
+                ChildKind::Antigravity,
+                "review",
+                &[73u8; 32],
+                "849c7c61-7baf-4c6b-8767-5704603f08ff",
+            )
+            .unwrap();
+        assert_eq!(conversation.child_kind, ChildKind::Antigravity);
         let foreign_key_errors: i64 = store
             .conn
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {

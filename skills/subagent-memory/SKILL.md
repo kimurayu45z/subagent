@@ -1,6 +1,6 @@
 ---
 name: subagent-memory
-description: Delegate bounded work to Codex, Claude Code, or OpenCode, choosing direct one-shot execution, exact native resume, or the subagent CLI's role-level audit and pull-based context. Covers recurring roles, cross-provider handoffs, permissions, structured output, and result review without treating a reused role ID as automatic task continuity.
+description: Delegate bounded work to Codex, Claude Code, OpenCode, or Google Antigravity CLI, choosing direct one-shot execution, exact native resume, or the subagent CLI's role-level audit and pull-based context. Covers recurring roles, cross-provider handoffs, permissions, structured output, and result review without treating a reused role ID as automatic task continuity.
 metadata:
   short-description: Delegate safely with durable context
 ---
@@ -15,7 +15,7 @@ responsible for scope, authorization, independent review, and the final result.
 
 ## Define the delegation contract
 
-Before starting Codex, Claude Code, or OpenCode:
+Before starting Codex, Claude Code, OpenCode, or Antigravity:
 
 1. State one outcome, the relevant files or subsystem, and what is out of scope.
 2. Specify read-only versus edit authority.
@@ -35,6 +35,7 @@ Before invoking a provider directly, read only its relevant reference:
 - [Codex execution](references/codex.md)
 - [Claude Code execution](references/claude-code.md)
 - [OpenCode execution](references/opencode.md)
+- [Antigravity CLI execution](references/antigravity.md)
 
 They cover model selection, headless output, permissions, customization loading,
 and native resume. The Claude reference replaces the separate
@@ -93,9 +94,10 @@ is active. Require `pair-inheritance` before using an ID handoff and
 continuity, and require `child-session-resume-codex` before relying on
 wrapper-managed Codex native continuity. Require
 `child-session-resume-opencode` before relying on wrapper-managed OpenCode
-native continuity. OpenCode supervisor auto-detection and transcript history
-are separate capabilities and may remain planned even when its child adapter is
-implemented.
+native continuity. Require `child-session-resume-antigravity` before relying on
+wrapper-managed Antigravity native continuity. OpenCode and Antigravity
+supervisor auto-detection and transcript history are separate capabilities and
+may remain planned even when their child adapters are implemented.
 
 If the desired capability is reported as planned or unavailable:
 
@@ -165,6 +167,7 @@ command as an argument vector:
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
 subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
 subagent --id big-pickle-reviewer -- opencode run "Review the current diff" --model opencode/big-pickle
+subagent --id gemini-flash-reviewer -- agy -p "Review the current diff" --model gemini-3.8-flash-high
 ```
 
 For interface inspection without starting the child:
@@ -184,6 +187,7 @@ For an actual managed run, use only the recognized MVP shapes:
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
 subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
 subagent --id big-pickle-reviewer -- opencode run "Review the current diff" --model opencode/big-pickle
+subagent --id gemini-flash-reviewer -- agy -p "Review the current diff" --model gemini-3.8-flash-high
 ```
 
 The wrapper preserves caller argv for task projection, audit digesting, and
@@ -221,6 +225,11 @@ subagent --id big-pickle-implementer --workstream issue-42 --fresh -- \
   opencode run "Implement the first slice" --model opencode/big-pickle
 subagent --id big-pickle-implementer --workstream issue-42 --resume -- \
   opencode run "Fix the failing test" --model opencode/big-pickle
+
+subagent --id gemini-flash-implementer --workstream issue-42 --fresh -- \
+  agy -p "Implement the first slice" --model gemini-3.8-flash-high
+subagent --id gemini-flash-implementer --workstream issue-42 --resume -- \
+  agy -p "Fix the failing test" --model gemini-3.8-flash-high
 ```
 
 Use exactly one of `--fresh` or `--resume` with `--workstream`. Resume must find
@@ -243,6 +252,18 @@ normally restores only text events to stdout; an explicit caller
 `--format json` keeps raw JSONL. Because OpenCode does not expose the immediate
 supervisor session to child tools, identify an OpenCode supervisor explicitly
 with `--supervisor opencode:SESSION_ID`.
+
+For managed Antigravity, place the complete task as one quoted argument
+immediately after `-p`/`--print`/`--prompt`; `agy -p --model MODEL TASK` is not
+a valid managed shape because the model flag occupies the task position. Do
+not pass caller-owned `--conversation`, `--continue`, `-c`, or interactive
+flags. The wrapper owns `stream-json` input/output so the context capsule and
+current request reach Antigravity as one typed user event, then closes stdin.
+An explicit caller `--output-format stream-json` preserves raw NDJSON; other
+caller input/output formats are incompatible with managed mode. If
+Antigravity is the supervisor, identify it explicitly with
+`--supervisor antigravity:CONVERSATION_ID`; its supervisor-history adapter may
+still be planned.
 
 Inspect and manage durable state with:
 
@@ -287,10 +308,11 @@ claims with actual files and command output, and disclose incomplete checks.
   diagnostics through its documented side channel.
 - Report unavailable, stale, truncated, or redacted context explicitly.
 - Codex supervisor transcript projection uses a bounded, read-only app-server
-  adapter and includes only visible user/agent text. Claude and OpenCode
-  supervisor history remain unavailable. Do not infer an OpenCode session from
-  process ancestry. Default `--context all` degrades best-effort when an adapter
-  is unavailable; required supervisor-only context fails before spawn.
+  adapter and includes only visible user/agent text. Claude, OpenCode, and
+  Antigravity supervisor history remain unavailable. Do not infer an OpenCode
+  or Antigravity session from process ancestry. Default `--context all`
+  degrades best-effort when an adapter is unavailable; required
+  supervisor-only context fails before spawn.
 - Treat common-credential redaction as damage reduction, not proof that stored
   prompts contain no secrets. Use `--no-record` for sensitive work.
 

@@ -1,7 +1,7 @@
 # subagent
 
-`subagent` is a Rust wrapper that gives Codex, Claude Code, and OpenCode delegations a
-role-level audit trail and a pull-based path to prior context. It complements a
+`subagent` is a Rust wrapper that gives Codex, Claude Code, OpenCode, and Google
+Antigravity CLI delegations a role-level audit trail and a pull-based path to prior context. It complements a
 precise task prompt and exact provider-native resume; it does not treat a reused
 role name as proof that two assignments are the same work.
 
@@ -40,6 +40,7 @@ lives alongside equivalent Codex guidance under this repository.
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
 subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
 subagent --id big-pickle-reviewer -- opencode run "Review the current diff" --model opencode/big-pickle
+subagent --id gemini-flash-reviewer -- agy -p "Review the current diff" --model gemini-3.8-flash-high
 ```
 
 The same `--id`, canonical working directory, and supervisor conversation reuse
@@ -56,12 +57,15 @@ subagent --id gpt-sol-reviewer --supervisor claude:SESSION_ID -- \
 For a Codex supervisor, requested `all`/`supervisor` context is enriched through
 the read-only `codex app-server thread/read` interface. The capsule allowlists
 visible user and agent messages; reasoning and raw tool records are excluded.
-Claude and OpenCode supervisor transcript discovery remain later adapter
-milestones. OpenCode does not currently expose its immediate supervisor session
-to a child process, so identify an OpenCode supervisor explicitly:
+Claude, OpenCode, and Antigravity supervisor transcript discovery remain later
+adapter milestones. OpenCode and Antigravity do not currently expose a reliable
+immediate supervisor session to a child process, so identify either explicitly:
 
 ```sh
 subagent --id gpt-sol-reviewer --supervisor opencode:ses_EXACT_ID -- \
+  codex exec "Review the current diff"
+subagent --id gpt-sol-reviewer \
+  --supervisor antigravity:EXACT_CONVERSATION_UUID -- \
   codex exec "Review the current diff"
 ```
 
@@ -92,7 +96,8 @@ subagent --id claude-haiku-architect \
 
 Everything after the first literal `--` belongs to the provider command and is
 never interpreted as another wrapper option. Managed mode recognizes
-`codex exec`, `claude -p`/`claude --print`, and `opencode run`; an explicit workstream validates
+`codex exec`, `claude -p`/`claude --print`, `opencode run`, and
+`agy -p`/`agy --print`/`agy --prompt`; an explicit workstream validates
 the supported task shape and adds wrapper-owned native continuity arguments
 only after hashing the caller command.
 
@@ -133,6 +138,23 @@ arguments is ambiguous; use one quoted token, the only token after an explicit
 `--`, or caller stdin. The logical `--id` names the actual model family and
 durable role, not the execution CLI, so prefer `gpt-luna-reviewer` or
 `big-pickle-reviewer` over `opencode-reviewer`.
+
+### Antigravity argument safety
+
+Pass the whole task as one quoted argument immediately after the print selector:
+
+```sh
+agy -p "Review the current diff" --model gemini-3.8-flash-high
+```
+
+Do not write `agy -p --model MODEL TASK`: `-p` consumes the next token as its
+prompt. Managed mode rejects caller-owned `--conversation`, `--continue`/`-c`,
+interactive flags, caller input formats, and output formats other than
+`stream-json`. The wrapper uses one typed NDJSON user event because ordinary
+positional print mode does not incorporate piped context; it closes stdin,
+validates a terminal `SUCCESS` result and matching conversation UUID, then
+normally prints only the response. Prefer a logical ID such as
+`gemini-flash-reviewer`, not `agy-reviewer`.
 
 Pair history records the task prompt and caller stdin, not provider launch flags.
 The exact child command remains correlatable through a digest without repeatedly
@@ -191,6 +213,14 @@ subagent --id big-pickle-implementer \
 subagent --id big-pickle-implementer \
   --workstream issue-42 --resume -- \
   opencode run "Fix the failing test from that slice" --model opencode/big-pickle
+
+subagent --id gemini-flash-implementer \
+  --workstream issue-42 --fresh -- \
+  agy -p "Implement the first slice" --model gemini-3.8-flash-high
+
+subagent --id gemini-flash-implementer \
+  --workstream issue-42 --resume -- \
+  agy -p "Fix the failing test from that slice" --model gemini-3.8-flash-high
 ```
 
 `--workstream` must be paired with exactly one of `--fresh` or `--resume`.
@@ -219,6 +249,15 @@ selects by recency. The wrapper normally restores text events to stdout, while
 an explicit caller `--format json` preserves raw JSONL. Malformed, truncated,
 conflicting, or mismatched transport cannot establish continuity and preserves
 the child exit status.
+
+Managed Antigravity always owns `--input-format stream-json` and
+`--output-format stream-json` so the capsule and current task arrive in one
+typed user event. A tracked fresh run stores the exact provider-issued UUID;
+resume passes only that UUID through `--conversation` and never selects by
+recency. A non-`SUCCESS`, malformed, conflicting, mismatched, or truncated
+result cannot activate continuity. Explicit caller `--output-format
+stream-json` preserves raw NDJSON; otherwise only terminal response text is
+rendered.
 
 Deterministic summary artifacts remain the offline default. Under pointer
 delivery they stay in the capsule for pull-based reading; they are not pasted

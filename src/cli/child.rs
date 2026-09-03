@@ -45,6 +45,12 @@ pub(crate) enum OpenCodeSessionMode<'a> {
     Resume(&'a str),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AntigravitySessionMode<'a> {
+    Fresh,
+    Resume(&'a str),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChildAdapterError {
     UnsupportedProgram(OsString),
@@ -58,6 +64,10 @@ pub(crate) enum ChildAdapterError {
     OpenCodeRequiresRun,
     OpenCodePromptPlacementAmbiguous,
     OpenCodeOptionUnsupported(&'static str),
+    AntigravityRequiresPrintMode,
+    AntigravityPromptPlacementAmbiguous,
+    AntigravityOptionUnsupported(&'static str),
+    AntigravityPromptNonUtf8,
 }
 
 impl fmt::Display for ChildAdapterError {
@@ -65,7 +75,7 @@ impl fmt::Display for ChildAdapterError {
         match self {
             ChildAdapterError::UnsupportedProgram(program) => write!(
                 f,
-                "managed context supports only `claude -p`, `codex exec`, and `opencode run` \
+                "managed context supports only `claude -p`, `codex exec`, `opencode run`, and `agy -p` \
                  in this build; \
                  got program {:?}. Use --context none --no-record for explicit passthrough",
                 program
@@ -120,6 +130,27 @@ impl fmt::Display for ChildAdapterError {
                  --workstream for native continuity, or use --context none --no-record \
                  passthrough"
             ),
+            ChildAdapterError::AntigravityRequiresPrintMode => write!(
+                f,
+                "managed Antigravity execution requires `agy -p TASK`, `agy --print TASK`, or \
+                 `agy --prompt TASK`; interactive mode is not supported"
+            ),
+            ChildAdapterError::AntigravityPromptPlacementAmbiguous => write!(
+                f,
+                "managed Antigravity execution requires one quoted task immediately after \
+                 `-p`/`--print`/`--prompt`"
+            ),
+            ChildAdapterError::AntigravityOptionUnsupported(flag) => write!(
+                f,
+                "Antigravity option {flag} is not supported by the managed adapter; use \
+                 wrapper --workstream for exact continuity, or use --context none \
+                 --no-record passthrough"
+            ),
+            ChildAdapterError::AntigravityPromptNonUtf8 => write!(
+                f,
+                "managed Antigravity prompts and caller stdin must be valid UTF-8 for the \
+                 stream-json transport"
+            ),
         }
     }
 }
@@ -140,6 +171,8 @@ pub(crate) fn recognize_managed_child(
         recognize_codex(args)
     } else if basename == OsStr::new("opencode") {
         recognize_opencode(args)
+    } else if basename == OsStr::new("agy") || basename == OsStr::new("antigravity") {
+        recognize_antigravity(args)
     } else {
         Err(ChildAdapterError::UnsupportedProgram(
             program.to_os_string(),
@@ -157,7 +190,7 @@ pub(crate) fn validate_managed_task_input(
     args: &[OsString],
     caller_stdin: &[u8],
 ) -> Result<(), ChildAdapterError> {
-    if !caller_stdin.is_empty() {
+    if !caller_stdin.is_empty() && kind != ChildKind::Antigravity {
         return Ok(());
     }
     match kind {
@@ -180,6 +213,16 @@ pub(crate) fn validate_managed_task_input(
                 Err(ChildAdapterError::OpenCodePromptPlacementAmbiguous)
             }
         }
+        ChildKind::Antigravity => {
+            let Some(index) = antigravity_prompt_index(args) else {
+                return Err(ChildAdapterError::AntigravityPromptPlacementAmbiguous);
+            };
+            if args[index].to_str().is_none() || std::str::from_utf8(caller_stdin).is_err() {
+                Err(ChildAdapterError::AntigravityPromptNonUtf8)
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -197,6 +240,9 @@ pub(crate) fn validate_managed_continuity_input(
                 "--format other than json",
             ));
         }
+        return validate_managed_task_input(kind, args, caller_stdin);
+    }
+    if kind == ChildKind::Antigravity {
         return validate_managed_task_input(kind, args, caller_stdin);
     }
     if kind == ChildKind::Claude {
@@ -264,6 +310,7 @@ fn likely_positional_prompt_index(kind: ChildKind, args: &[OsString]) -> Option<
         ChildKind::Claude => 0,
         ChildKind::Codex => 1,
         ChildKind::OpenCode => 1,
+        ChildKind::Antigravity => 0,
     };
     if args.len() <= first_index {
         return None;
@@ -281,6 +328,10 @@ fn likely_positional_prompt_index(kind: ChildKind, args: &[OsString]) -> Option<
         return Some(index);
     }
 
+    if kind == ChildKind::Antigravity {
+        return antigravity_prompt_index(args);
+    }
+
     let separator_prompt_index: Option<usize> = if kind == ChildKind::OpenCode {
         opencode_explicit_separator_prompt_index(args)
     } else {
@@ -290,7 +341,10 @@ fn likely_positional_prompt_index(kind: ChildKind, args: &[OsString]) -> Option<
         return Some(index);
     }
 
-    if matches!(kind, ChildKind::Claude | ChildKind::OpenCode) {
+    if matches!(
+        kind,
+        ChildKind::Claude | ChildKind::OpenCode | ChildKind::Antigravity
+    ) {
         return None;
     }
 
@@ -468,6 +522,23 @@ fn option_takes_value(kind: ChildKind, option: &OsStr) -> bool {
                     | "--replay-limit"
             )
         ),
+        ChildKind::Antigravity => matches!(
+            option.to_str(),
+            Some(
+                "--conversation"
+                    | "--output-format"
+                    | "--input-format"
+                    | "--json-schema"
+                    | "--log-file"
+                    | "--mode"
+                    | "--model"
+                    | "--agent"
+                    | "--project"
+                    | "--add-dir"
+                    | "--sandbox"
+                    | "--print-timeout"
+            )
+        ),
     }
 }
 
@@ -553,6 +624,66 @@ fn recognize_opencode(args: &[OsString]) -> Result<ChildKind, ChildAdapterError>
         }
     }
     Ok(ChildKind::OpenCode)
+}
+
+fn recognize_antigravity(args: &[OsString]) -> Result<ChildKind, ChildAdapterError> {
+    let selector_count: usize = args
+        .iter()
+        .filter(|argument: &&OsString| {
+            matches!(
+                argument.as_os_str().to_str(),
+                Some("-p" | "--print" | "--prompt")
+            )
+        })
+        .count();
+    if selector_count == 0 {
+        return Err(ChildAdapterError::AntigravityRequiresPrintMode);
+    }
+    if selector_count != 1 {
+        return Err(ChildAdapterError::AntigravityPromptPlacementAmbiguous);
+    }
+    for argument in args {
+        if let Some(text) = argument.to_str()
+            && text.len() > 2
+            && (text.starts_with("-c") || text.starts_with("-i"))
+            && !text.starts_with("--")
+        {
+            return Err(ChildAdapterError::AntigravityOptionUnsupported(
+                "attached native short option",
+            ));
+        }
+        let name: Option<&str> = profile_excluded_option_name(argument.as_os_str());
+        let unsupported: Option<&'static str> = match name {
+            Some("--conversation") => Some("--conversation"),
+            Some("--continue") | Some("-c") => Some("--continue/-c"),
+            Some("--prompt-interactive") | Some("-i") => Some("--prompt-interactive/-i"),
+            Some("--input-format") => Some("--input-format"),
+            Some("--output-format") if !antigravity_output_format_is_compatible(args) => {
+                Some("--output-format other than stream-json")
+            }
+            _ => None,
+        };
+        if let Some(flag) = unsupported {
+            return Err(ChildAdapterError::AntigravityOptionUnsupported(flag));
+        }
+    }
+    Ok(ChildKind::Antigravity)
+}
+
+fn antigravity_print_selector_index(args: &[OsString]) -> Option<usize> {
+    args.iter().position(|argument: &OsString| {
+        matches!(argument.to_str(), Some("-p" | "--print" | "--prompt"))
+    })
+}
+
+fn antigravity_prompt_index(args: &[OsString]) -> Option<usize> {
+    let selector_index: usize = antigravity_print_selector_index(args)?;
+    let prompt_index: usize = selector_index.saturating_add(1);
+    let prompt: &OsStr = args.get(prompt_index)?.as_os_str();
+    if looks_like_option(prompt) {
+        return None;
+    }
+    Some(prompt_index)
 }
 
 /// Stable SHA-256 digest of the exact child argv, including the program, with
@@ -670,6 +801,50 @@ pub(crate) fn inject_opencode_session_args(
     spawn_args
 }
 
+/// Builds the Antigravity argv used by every managed invocation. Its normal
+/// print mode does not merge piped stdin with the positional task, so the
+/// wrapper removes the caller's print selector/task and owns the stream-JSON
+/// input/output transport. Resume selects only the exact stored conversation.
+pub(crate) fn inject_antigravity_session_args(
+    caller_args: &[OsString],
+    mode: AntigravitySessionMode<'_>,
+) -> Vec<OsString> {
+    let selector_index: usize = antigravity_print_selector_index(caller_args)
+        .expect("recognized Antigravity argv has a print selector");
+    let prompt_index: usize = antigravity_prompt_index(caller_args)
+        .expect("validated Antigravity argv has a prompt after its selector");
+    let mut spawn_args: Vec<OsString> = Vec::with_capacity(caller_args.len().saturating_add(6));
+    let mut index: usize = 0;
+    while index < caller_args.len() {
+        if index == selector_index || index == prompt_index {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let argument: &OsString = &caller_args[index];
+        let name: Option<&str> = profile_excluded_option_name(argument.as_os_str());
+        if name == Some("--output-format") {
+            index = index.saturating_add(1);
+            if !option_has_inline_value(argument.as_os_str()) {
+                index = index.saturating_add(1);
+            }
+            continue;
+        }
+        spawn_args.push(argument.clone());
+        index = index.saturating_add(1);
+    }
+    spawn_args.extend([
+        OsString::from("--print="),
+        OsString::from("--input-format"),
+        OsString::from("stream-json"),
+        OsString::from("--output-format"),
+        OsString::from("stream-json"),
+    ]);
+    if let AntigravitySessionMode::Resume(native_id) = mode {
+        spawn_args.extend([OsString::from("--conversation"), OsString::from(native_id)]);
+    }
+    spawn_args
+}
+
 pub(crate) fn codex_json_requested(args: &[OsString]) -> bool {
     codex_provider_arguments(args).any(|argument: &OsString| {
         profile_excluded_option_name(argument.as_os_str()) == Some("--json")
@@ -700,6 +875,60 @@ pub(crate) fn opencode_json_requested(args: &[OsString]) -> bool {
         index = index.saturating_add(1);
     }
     false
+}
+
+pub(crate) fn antigravity_stream_json_requested(args: &[OsString]) -> bool {
+    let mut index: usize = 0;
+    while index < args.len() {
+        let argument: &OsStr = args[index].as_os_str();
+        let Some(text) = argument.to_str() else {
+            index = index.saturating_add(1);
+            continue;
+        };
+        if text == "--output-format" {
+            return args
+                .get(index.saturating_add(1))
+                .and_then(|value: &OsString| value.to_str())
+                == Some("stream-json");
+        }
+        if let Some(value) = text.strip_prefix("--output-format=") {
+            return value == "stream-json";
+        }
+        index = index.saturating_add(1);
+    }
+    false
+}
+
+fn antigravity_output_format_is_compatible(args: &[OsString]) -> bool {
+    let mut index: usize = 0;
+    let mut count: usize = 0;
+    while index < args.len() {
+        let argument: &OsStr = args[index].as_os_str();
+        let Some(text) = argument.to_str() else {
+            index = index.saturating_add(1);
+            continue;
+        };
+        if text == "--output-format" {
+            count = count.saturating_add(1);
+            if args
+                .get(index.saturating_add(1))
+                .and_then(|value: &OsString| value.to_str())
+                != Some("stream-json")
+            {
+                return false;
+            }
+            index = index.saturating_add(2);
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--output-format=") {
+            count = count.saturating_add(1);
+            if value != "stream-json" {
+                return false;
+            }
+        }
+        index = index.saturating_add(1);
+    }
+    count <= 1
 }
 
 fn opencode_format_is_compatible(args: &[OsString]) -> bool {
@@ -862,6 +1091,11 @@ fn excluded_profile_token_mask(kind: ChildKind, args: &[OsString]) -> Vec<bool> 
                 excluded[0] = true;
             }
         }
+        ChildKind::Antigravity => {
+            if let Some(index) = antigravity_print_selector_index(args) {
+                excluded[index] = true;
+            }
+        }
     }
 
     let task_index: Option<usize> = profile_task_index(kind, args);
@@ -921,6 +1155,7 @@ fn profile_task_index(kind: ChildKind, args: &[OsString]) -> Option<usize> {
         }
         ChildKind::OpenCode => opencode_prompt_immediately_after_run_index(args)
             .or_else(|| opencode_explicit_separator_prompt_index(args)),
+        ChildKind::Antigravity => antigravity_prompt_index(args),
     }
 }
 
@@ -975,6 +1210,17 @@ fn is_excluded_profile_option_name(kind: ChildKind, name: &str) -> bool {
                 | "--print-logs"
                 | "--log-level"
                 | "--thinking"
+        ),
+        ChildKind::Antigravity => matches!(
+            name,
+            "--conversation"
+                | "--continue"
+                | "-c"
+                | "--output-format"
+                | "--input-format"
+                | "--json-schema"
+                | "--log-file"
+                | "--print-timeout"
         ),
     }
 }
@@ -1686,5 +1932,120 @@ mod tests {
             combined,
             b"Positional prompt:\npositional task\n\nCaller stdin:\nadditional stdin"
         );
+    }
+
+    #[test]
+    fn recognizes_antigravity_aliases_and_rejects_unsafe_native_modes() {
+        for program in ["agy", "/usr/local/bin/antigravity"] {
+            let kind: ChildKind = recognize_managed_child(
+                OsStr::new(program),
+                &args(&["-p", "review this", "--model", "gemini-3.8-flash-high"]),
+            )
+            .unwrap();
+            assert_eq!(kind, ChildKind::Antigravity);
+        }
+        for unsupported in ["--conversation", "--continue", "-c", "-i"] {
+            let arguments: Vec<OsString> = args(&["-p", "review this", unsupported, "native-id"]);
+            assert!(matches!(
+                recognize_managed_child(OsStr::new("agy"), &arguments),
+                Err(ChildAdapterError::AntigravityOptionUnsupported(_))
+            ));
+        }
+        assert!(matches!(
+            recognize_managed_child(
+                OsStr::new("agy"),
+                &args(&["-p", "review", "--output-format", "json"])
+            ),
+            Err(ChildAdapterError::AntigravityOptionUnsupported(_))
+        ));
+    }
+
+    #[test]
+    fn antigravity_requires_prompt_adjacency_and_utf8() {
+        let misplaced: Vec<OsString> = args(&["-p", "--model", "gemini-3.8-flash-high", "review"]);
+        assert_eq!(
+            validate_managed_task_input(ChildKind::Antigravity, &misplaced, &[]),
+            Err(ChildAdapterError::AntigravityPromptPlacementAmbiguous)
+        );
+        assert_eq!(
+            validate_managed_task_input(ChildKind::Antigravity, &misplaced, b"piped task"),
+            Err(ChildAdapterError::AntigravityPromptPlacementAmbiguous)
+        );
+        let valid: Vec<OsString> =
+            args(&["--prompt", "review", "--model", "gemini-3.8-flash-high"]);
+        assert_eq!(
+            validate_managed_task_input(ChildKind::Antigravity, &valid, b"extra"),
+            Ok(())
+        );
+        assert_eq!(
+            project_task_request(ChildKind::Antigravity, &valid, &[]),
+            b"review"
+        );
+    }
+
+    #[test]
+    fn antigravity_transport_rewrites_task_and_injects_exact_resume() {
+        let caller: Vec<OsString> = args(&[
+            "-p",
+            "review this",
+            "--model",
+            "gemini-3.8-flash-high",
+            "--output-format",
+            "stream-json",
+        ]);
+        assert_eq!(
+            inject_antigravity_session_args(&caller, AntigravitySessionMode::Fresh),
+            args(&[
+                "--model",
+                "gemini-3.8-flash-high",
+                "--print=",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+            ])
+        );
+        assert_eq!(
+            inject_antigravity_session_args(
+                &caller,
+                AntigravitySessionMode::Resume("0222067a-9e42-4b76-9649-66b84fd6bb26")
+            ),
+            args(&[
+                "--model",
+                "gemini-3.8-flash-high",
+                "--print=",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--conversation",
+                "0222067a-9e42-4b76-9649-66b84fd6bb26",
+            ])
+        );
+    }
+
+    #[test]
+    fn antigravity_profile_ignores_task_and_transport_but_keeps_model() {
+        let workspace: &Path = Path::new("/workspace");
+        let first: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Antigravity,
+            program: OsStr::new("agy"),
+            working_directory: workspace,
+            args: &args(&["-p", "first", "--model", "gemini-3.8-flash-high"]),
+        });
+        let second: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Antigravity,
+            program: OsStr::new("agy"),
+            working_directory: workspace,
+            args: &args(&[
+                "--print",
+                "second",
+                "--model",
+                "gemini-3.8-flash-high",
+                "--output-format",
+                "stream-json",
+            ]),
+        });
+        assert_eq!(first, second);
     }
 }

@@ -30,6 +30,7 @@ pub(crate) enum Provider {
     Codex,
     Claude,
     OpenCode,
+    Antigravity,
 }
 
 impl Provider {
@@ -38,6 +39,7 @@ impl Provider {
             "codex" => Some(Provider::Codex),
             "claude" => Some(Provider::Claude),
             "opencode" => Some(Provider::OpenCode),
+            "antigravity" => Some(Provider::Antigravity),
             _ => None,
         }
     }
@@ -49,6 +51,7 @@ impl fmt::Display for Provider {
             Provider::Codex => "codex",
             Provider::Claude => "claude",
             Provider::OpenCode => "opencode",
+            Provider::Antigravity => "antigravity",
         };
         f.write_str(text)
     }
@@ -121,20 +124,20 @@ impl fmt::Display for SupervisorResolutionError {
         match self {
             SupervisorResolutionError::InvalidExplicit => write!(
                 f,
-                "invalid --supervisor value: expected codex:SESSION_ID, claude:SESSION_ID, or opencode:SESSION_ID"
+                "invalid --supervisor value: expected codex:SESSION_ID, claude:SESSION_ID, opencode:SESSION_ID, or antigravity:CONVERSATION_ID"
             ),
             SupervisorResolutionError::ManagedRefUnsupported => write!(
                 f,
                 "{SUBAGENT_SELF_REF_ENV} is set, but resolving a managed-parent supervisor \
                  reference from it (docs/design.md section 5, step 2) is not implemented in \
-                 this build; re-run with --supervisor codex:SESSION_ID or claude:SESSION_ID to \
+                 this build; re-run with an explicit --supervisor PROVIDER:SESSION_ID to \
                  name the supervisor explicitly"
             ),
             SupervisorResolutionError::AmbiguousNativeIds => write!(
                 f,
                 "both {CODEX_THREAD_ID_ENV} and {CLAUDE_CODE_SESSION_ID_ENV} are set; the immediate \
                  supervisor cannot be inferred safely -- re-run with --supervisor \
-                 codex:SESSION_ID or claude:SESSION_ID to name the supervisor explicitly"
+                 --supervisor PROVIDER:SESSION_ID to name the supervisor explicitly"
             ),
             SupervisorResolutionError::EmptyNativeId { var_name } => write!(
                 f,
@@ -145,7 +148,7 @@ impl fmt::Display for SupervisorResolutionError {
             SupervisorResolutionError::NonUtf8NativeId { var_name } => write!(
                 f,
                 "{var_name} contains a non-UTF-8 native session id and cannot be used safely -- \
-                 re-run with --supervisor codex:SESSION_ID or claude:SESSION_ID, or unset \
+                 re-run with an explicit --supervisor PROVIDER:SESSION_ID, or unset \
                  {var_name}"
             ),
             SupervisorResolutionError::MissingIdentity => write!(
@@ -284,6 +287,17 @@ mod tests {
         assert_eq!(resolved.provider, Provider::OpenCode);
         assert_eq!(resolved.session_id, "ses_xyz789");
         assert_eq!(resolved.detected_via, DetectionSource::Explicit);
+    }
+
+    #[test]
+    fn explicit_antigravity_reference_resolves() {
+        let resolved: SupervisorRef = resolve(
+            Some("antigravity:0222067a-9e42-4b76-9649-66b84fd6bb26"),
+            &DetectionEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.provider, Provider::Antigravity);
+        assert_eq!(resolved.session_id, "0222067a-9e42-4b76-9649-66b84fd6bb26");
     }
 
     #[test]

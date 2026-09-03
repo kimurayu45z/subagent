@@ -489,6 +489,109 @@ fn managed_opencode_workstream_observes_and_resumes_the_exact_session() {
 
 #[cfg(unix)]
 #[test]
+fn managed_antigravity_uses_stream_json_and_resumes_the_exact_conversation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let agy_path: PathBuf = workspace.path().join("agy");
+    let input_path: PathBuf = workspace.path().join("last-input.jsonl");
+    let conversation_id: &str = "0222067a-9e42-4b76-9649-66b84fd6bb26";
+    fs::write(
+        &agy_path,
+        "#!/bin/sh\n\
+         cat > \"$INPUT_PATH\"\n\
+         test \"$1\" = --model || exit 70\n\
+         test \"$2\" = gemini-3.8-flash-high || exit 71\n\
+         test \"$3\" = --print= || exit 72\n\
+         test \"$4\" = --input-format || exit 73\n\
+         test \"$5\" = stream-json || exit 74\n\
+         test \"$6\" = --output-format || exit 75\n\
+         test \"$7\" = stream-json || exit 76\n\
+         grep -F '\"event\":\"user\"' \"$INPUT_PATH\" >/dev/null || exit 77\n\
+         grep -F 'CURRENT AUTHORITATIVE REQUEST' \"$INPUT_PATH\" >/dev/null || exit 78\n\
+         if test \"$8\" = --conversation; then\n\
+           test \"$9\" = \"$CONVERSATION_ID\" || exit 79\n\
+           grep -F 'second task' \"$INPUT_PATH\" >/dev/null || exit 80\n\
+           response=RESUME_AGY\n\
+         else\n\
+           test -z \"$8\" || exit 81\n\
+           grep -F 'first task' \"$INPUT_PATH\" >/dev/null || exit 82\n\
+           response=FRESH_AGY\n\
+         fi\n\
+         printf '{\"event\":\"init\",\"conversation_id\":\"%s\"}\\n' \"$CONVERSATION_ID\"\n\
+         printf '{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"%s\",\"step_type\":\"future-compatible\"}}\\n' \"$CONVERSATION_ID\"\n\
+         printf '{\"event\":\"result\",\"result\":{\"conversation_id\":\"%s\",\"status\":\"SUCCESS\",\"response\":\"%s\\\\n\"}}\\n' \"$CONVERSATION_ID\" \"$response\"\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&agy_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&agy_path, permissions).unwrap();
+
+    let run = |flag: &str, task: &str| -> std::process::Output {
+        subagent_with_clean_supervisor_env(state_dir.path())
+            .current_dir(workspace.path())
+            .env("INPUT_PATH", &input_path)
+            .env("CONVERSATION_ID", conversation_id)
+            .args([
+                "--id",
+                "gemini-flash-implementer",
+                "--supervisor",
+                "antigravity:849c7c61-7baf-4c6b-8767-5704603f08ff",
+                "--context",
+                "pair",
+                "--workstream",
+                "issue-agy-1",
+                flag,
+                "--quiet",
+                "--",
+            ])
+            .arg(&agy_path)
+            .args(["-p", task, "--model", "gemini-3.8-flash-high"])
+            .output()
+            .unwrap()
+    };
+
+    let fresh: std::process::Output = run("--fresh", "first task");
+    assert!(
+        fresh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+    assert_eq!(fresh.stdout, b"FRESH_AGY\n");
+
+    let resumed: std::process::Output = run("--resume", "second task");
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(resumed.stdout, b"RESUME_AGY\n");
+
+    let connection: rusqlite::Connection =
+        rusqlite::Connection::open(state_dir.path().join("ledger.sqlite3")).unwrap();
+    let (native_id, kind, status): (String, String, String) = connection
+        .query_row(
+            "SELECT native_id, child_kind, status FROM child_sessions WHERE workstream_id = 'issue-agy-1'",
+            [],
+            |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(native_id, conversation_id);
+    assert_eq!(kind, "antigravity");
+    assert_eq!(status, "active");
+    let linked_invocations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM invocations WHERE child_session_id = (SELECT id FROM child_sessions WHERE native_id = ?1)",
+            [conversation_id],
+            |row: &rusqlite::Row<'_>| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(linked_invocations, 2);
+}
+
+#[cfg(unix)]
+#[test]
 fn managed_opencode_conflicting_resume_invalidates_the_stored_session() {
     use std::os::unix::fs::PermissionsExt;
 

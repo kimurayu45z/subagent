@@ -72,7 +72,7 @@ fn capabilities() -> Vec<Capability> {
         capability(
             "supervisor-detection-explicit-native",
             CapabilityState::Implemented,
-            "resolves an explicit --supervisor codex:ID, claude:ID, or opencode:ID, or exactly one \
+            "resolves an explicit --supervisor codex:ID, claude:ID, opencode:ID, or antigravity:ID, or exactly one \
              unambiguous, non-empty CODEX_THREAD_ID or CLAUDE_CODE_SESSION_ID (design.md \
              section 5, steps 1 and 3)",
         ),
@@ -108,7 +108,7 @@ fn capabilities() -> Vec<Capability> {
         capability(
             "child-session-store",
             CapabilityState::Implemented,
-            "SQLite schema version 6 stores workstream-scoped provider-native child sessions for Claude Code, Codex, and OpenCode, lifecycle state, and versioned command-profile hashes",
+            "SQLite schema version 7 stores workstream-scoped provider-native child sessions for Claude Code, Codex, OpenCode, and Antigravity, lifecycle state, and versioned command-profile hashes",
         ),
         capability(
             "child-session-resume-claude",
@@ -124,6 +124,11 @@ fn capabilities() -> Vec<Capability> {
             "child-session-resume-opencode",
             CapabilityState::Implemented,
             "OpenCode supports explicit --workstream with exactly one of --fresh or --resume; JSONL observation persists and verifies the exact native session ID",
+        ),
+        capability(
+            "child-session-resume-antigravity",
+            CapabilityState::Implemented,
+            "Antigravity supports explicit --workstream with exactly one of --fresh or --resume; stream-JSON observation persists and verifies the exact native conversation UUID",
         ),
         capability(
             "task-request-projection",
@@ -156,6 +161,11 @@ fn capabilities() -> Vec<Capability> {
             "the OpenCode supervisor-history adapter is not implemented yet; use an explicit opencode:SESSION_ID supervisor reference",
         ),
         capability(
+            "history-adapter-antigravity",
+            CapabilityState::Planned,
+            "the Antigravity supervisor-history adapter is not implemented yet; use an explicit antigravity:CONVERSATION_ID supervisor reference",
+        ),
+        capability(
             "summarizer-deterministic",
             CapabilityState::Implemented,
             "a bounded model-free summary of recent pair exchanges is materialized for pull-based reading and is injected through child stdin only with inline delivery",
@@ -181,9 +191,14 @@ fn capabilities() -> Vec<Capability> {
             "opencode run is supported with argument-preserving stdin bootstrap injection; tracked workstreams add a bounded JSONL observation transport and exact --session resume",
         ),
         capability(
+            "child-adapter-antigravity",
+            CapabilityState::Implemented,
+            "agy -p/--print/--prompt is supported through one typed stream-JSON user event; managed workstreams add exact --conversation resume and reject --continue",
+        ),
+        capability(
             "child-spawn",
             CapabilityState::Implemented,
-            "stdout/stderr forwarding and capture are bounded; tracked Codex and OpenCode JSONL is rendered after completion, while observation failures preserve captured output and child exit status",
+            "stdout/stderr forwarding and capture are bounded; tracked Codex/OpenCode and managed Antigravity JSONL are rendered after completion, while observation failures preserve captured output and child exit status",
         ),
     ]
 }

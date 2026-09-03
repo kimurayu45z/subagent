@@ -107,6 +107,11 @@ pub(crate) fn read_supervisor_history(
             "adapter_not_implemented",
             "the OpenCode supervisor-history adapter is not implemented yet",
         ),
+        Provider::Antigravity => unavailable(
+            "antigravity_transcript",
+            "not_implemented",
+            "the Antigravity supervisor-history adapter is not implemented yet",
+        ),
     }
 }
 
