@@ -57,9 +57,13 @@ subagent --id gpt-sol-reviewer --supervisor claude:SESSION_ID -- \
 For a Codex supervisor, requested `all`/`supervisor` context is enriched through
 the read-only `codex app-server thread/read` interface. The capsule allowlists
 visible user and agent messages; reasoning and raw tool records are excluded.
-Claude, OpenCode, and Antigravity supervisor transcript discovery remain later
-adapter milestones. OpenCode and Antigravity do not currently expose a reliable
-immediate supervisor session to a child process, so identify either explicitly:
+Antigravity has the same bounded visible-message projection when an exact
+conversation UUID is supplied and its CLI cache confirms that UUID belongs to
+the current canonical workspace. The cache is validation evidence only; it is
+never used to choose the supervisor. Claude and OpenCode transcript adapters
+remain later milestones. OpenCode and Antigravity do not currently expose a
+reliable immediate supervisor session to a child process, so identify either
+explicitly:
 
 ```sh
 subagent --id gpt-sol-reviewer --supervisor opencode:ses_EXACT_ID -- \
@@ -68,6 +72,12 @@ subagent --id gpt-sol-reviewer \
   --supervisor antigravity:EXACT_CONVERSATION_UUID -- \
   codex exec "Review the current diff"
 ```
+
+An older explicit Antigravity conversation may be rejected after another
+conversation becomes current in the same workspace. That conservative false
+negative prevents the workspace cache from becoming a recency-based identity
+selector; use pair context without supervisor history until hook-backed exact
+workspace evidence is available.
 
 ## Isolated experiments
 

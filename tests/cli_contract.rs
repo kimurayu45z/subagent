@@ -1471,6 +1471,81 @@ fn all_context_degrades_best_effort_and_manifests_unavailable_adapter() {
 
 #[cfg(unix)]
 #[test]
+fn explicit_antigravity_supervisor_projects_exact_workspace_transcript() {
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let home: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let claude_path: PathBuf = write_fake_claude(workspace.path(), "ANTIGRAVITY_HISTORY_OK");
+    let conversation_id: &str = "0222067a-9e42-4b76-9649-66b84fd6bb26";
+    let antigravity_root: PathBuf = home.path().join(".gemini").join("antigravity-cli");
+    let transcript_path: PathBuf = antigravity_root
+        .join("brain")
+        .join(conversation_id)
+        .join(".system_generated")
+        .join("logs")
+        .join("transcript.jsonl");
+    fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    fs::create_dir_all(antigravity_root.join("cache")).unwrap();
+    fs::write(
+        antigravity_root
+            .join("cache")
+            .join("last_conversations.json"),
+        serde_json::to_vec(&serde_json::json!({
+            workspace.path().to_string_lossy(): conversation_id
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &transcript_path,
+        concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"supervisor question"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"supervisor answer","thinking":"must stay private"}"#,
+            "\n",
+            r#"{"step_index":2,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"must stay hidden"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    subagent_with_clean_supervisor_env(state_dir.path())
+        .env("HOME", home.path())
+        .current_dir(workspace.path())
+        .args([
+            "--id",
+            "claude-haiku-antigravity-history-test",
+            "--supervisor",
+            &format!("antigravity:{conversation_id}"),
+            "--context",
+            "supervisor",
+            "--context-mode",
+            "required",
+            "--quiet",
+            "--",
+        ])
+        .arg(&claude_path)
+        .args(["-p", "review the supervisor context"])
+        .assert()
+        .success()
+        .stdout("ANTIGRAVITY_HISTORY_OK\n");
+
+    let capsule_dir: PathBuf = fs::read_dir(state_dir.path().join("context"))
+        .unwrap()
+        .next()
+        .expect("one capsule directory")
+        .unwrap()
+        .path();
+    let supervisor_history: String =
+        fs::read_to_string(capsule_dir.join("supervisor.jsonl")).unwrap();
+    assert!(supervisor_history.contains("supervisor question"));
+    assert!(supervisor_history.contains("supervisor answer"));
+    assert!(!supervisor_history.contains("must stay private"));
+    assert!(!supervisor_history.contains("must stay hidden"));
+}
+
+#[cfg(unix)]
+#[test]
 fn second_managed_run_receives_the_first_runs_response_in_its_bootstrap() {
     use std::os::unix::fs::PermissionsExt;
 

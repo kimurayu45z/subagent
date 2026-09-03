@@ -96,8 +96,9 @@ wrapper-managed Codex native continuity. Require
 `child-session-resume-opencode` before relying on wrapper-managed OpenCode
 native continuity. Require `child-session-resume-antigravity` before relying on
 wrapper-managed Antigravity native continuity. OpenCode and Antigravity
-supervisor auto-detection and transcript history are separate capabilities and
-may remain planned even when their child adapters are implemented.
+supervisor auto-detection and transcript history are separate capabilities.
+An installed build may support explicit Antigravity transcript history while
+automatic detection remains planned.
 
 If the desired capability is reported as planned or unavailable:
 
@@ -262,8 +263,10 @@ current request reach Antigravity as one typed user event, then closes stdin.
 An explicit caller `--output-format stream-json` preserves raw NDJSON; other
 caller input/output formats are incompatible with managed mode. If
 Antigravity is the supervisor, identify it explicitly with
-`--supervisor antigravity:CONVERSATION_ID`; its supervisor-history adapter may
-still be planned.
+`--supervisor antigravity:CONVERSATION_ID`. When doctor reports its history
+adapter implemented, supervisor context is available only while Antigravity's
+CLI cache validates that exact ID against the current canonical workspace; the
+cache is not an identity selector.
 
 Inspect and manage durable state with:
 
@@ -308,11 +311,13 @@ claims with actual files and command output, and disclose incomplete checks.
   diagnostics through its documented side channel.
 - Report unavailable, stale, truncated, or redacted context explicitly.
 - Codex supervisor transcript projection uses a bounded, read-only app-server
-  adapter and includes only visible user/agent text. Claude, OpenCode, and
-  Antigravity supervisor history remain unavailable. Do not infer an OpenCode
-  or Antigravity session from process ancestry. Default `--context all`
-  degrades best-effort when an adapter is unavailable; required
-  supervisor-only context fails before spawn.
+  adapter and includes only visible user/agent text. Antigravity can project
+  bounded completed visible messages for an explicit, workspace-validated
+  conversation UUID. Claude and OpenCode supervisor history remain
+  unavailable. Do not infer an OpenCode or Antigravity session from process
+  ancestry or a latest-session cache. Default `--context all` degrades
+  best-effort when an adapter is unavailable; required supervisor-only context
+  fails before spawn.
 - Treat common-credential redaction as damage reduction, not proof that stored
   prompts contain no secrets. Use `--no-record` for sensitive work.
 

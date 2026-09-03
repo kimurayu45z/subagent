@@ -1,11 +1,14 @@
 //! Read-only supervisor conversation adapters.
 //!
 //! The Codex adapter uses only app-server's `initialize` and `thread/read`
-//! methods. It projects an allowlist of visible message items and treats all
-//! other item kinds as untrusted provider internals that must not cross the
-//! supervisor/subordinate boundary.
+//! methods. The Antigravity adapter reads one explicit, workspace-validated
+//! CLI transcript. Both project an allowlist of visible message items and
+//! treat all other item kinds as untrusted provider internals that must not
+//! cross the supervisor/subordinate boundary.
 
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsStr;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -21,6 +24,9 @@ use super::supervisor::{Provider, SupervisorRef};
 const APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_STDOUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
+const MAX_ANTIGRAVITY_CACHE_BYTES: usize = 1024 * 1024;
+const MAX_ANTIGRAVITY_TRANSCRIPT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ANTIGRAVITY_VISIBLE_RECORDS: usize = 4096;
 const INITIALIZE_REQUEST_ID: u64 = 1;
 const THREAD_READ_REQUEST_ID: u64 = 2;
 
@@ -107,11 +113,293 @@ pub(crate) fn read_supervisor_history(
             "adapter_not_implemented",
             "the OpenCode supervisor-history adapter is not implemented yet",
         ),
-        Provider::Antigravity => unavailable(
+        Provider::Antigravity => {
+            read_antigravity_from_default_home(&supervisor.session_id, workspace)
+        }
+    }
+}
+
+fn read_antigravity_from_default_home(
+    conversation_id: &str,
+    workspace: &Path,
+) -> SupervisorHistory {
+    let Some(base_dirs) = directories::BaseDirs::new() else {
+        return unavailable(
             "antigravity_transcript",
-            "not_implemented",
-            "the Antigravity supervisor-history adapter is not implemented yet",
-        ),
+            "home_unavailable",
+            "could not resolve the user home directory for Antigravity CLI state",
+        );
+    };
+    let cli_state_root: PathBuf = base_dirs.home_dir().join(".gemini").join("antigravity-cli");
+    read_antigravity_from_state_root(&cli_state_root, conversation_id, workspace)
+}
+
+fn read_antigravity_from_state_root(
+    cli_state_root: &Path,
+    conversation_id: &str,
+    workspace: &Path,
+) -> SupervisorHistory {
+    if !super::antigravity_json::is_valid_conversation_id(conversation_id) {
+        return unavailable(
+            "antigravity_transcript",
+            "invalid_conversation_id",
+            "the requested Antigravity conversation ID is not a canonical UUID",
+        );
+    }
+
+    let canonical_workspace: PathBuf = match std::fs::canonicalize(workspace) {
+        Ok(path) => path,
+        Err(error) => {
+            return unavailable(
+                "antigravity_transcript",
+                "workspace_unavailable",
+                format!("could not canonicalize the current workspace: {error}"),
+            );
+        }
+    };
+    let cache_path: PathBuf = cli_state_root.join("cache").join("last_conversations.json");
+    let cache_bytes: Vec<u8> =
+        match read_bounded_regular_file(&cache_path, MAX_ANTIGRAVITY_CACHE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                return unavailable(
+                    "antigravity_transcript",
+                    "workspace_evidence_unavailable",
+                    format!(
+                        "could not read Antigravity's workspace-to-conversation cache: {reason}"
+                    ),
+                );
+            }
+        };
+    let cache: serde_json::Map<String, Value> = match serde_json::from_slice::<Value>(&cache_bytes)
+        .ok()
+        .and_then(|value: Value| value.as_object().cloned())
+    {
+        Some(cache) => cache,
+        None => {
+            return unavailable(
+                "antigravity_transcript",
+                "workspace_evidence_malformed",
+                "Antigravity's workspace-to-conversation cache is not a JSON object",
+            );
+        }
+    };
+    let mut workspace_conversations: BTreeSet<String> = BTreeSet::new();
+    for (raw_workspace, raw_conversation) in cache {
+        let Some(cached_conversation) = raw_conversation.as_str() else {
+            return unavailable(
+                "antigravity_transcript",
+                "workspace_evidence_malformed",
+                "Antigravity's workspace-to-conversation cache contains a non-string ID",
+            );
+        };
+        let cached_workspace: PathBuf = match std::fs::canonicalize(&raw_workspace) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if cached_workspace == canonical_workspace {
+            workspace_conversations.insert(cached_conversation.to_string());
+        }
+    }
+    if workspace_conversations.len() != 1 || !workspace_conversations.contains(conversation_id) {
+        return unavailable(
+            "antigravity_transcript",
+            "workspace_unverified",
+            "the exact requested Antigravity conversation is not the cache entry for the current canonical workspace; the cache is used only to validate an explicit ID, never to select one",
+        );
+    }
+
+    let canonical_root: PathBuf = match std::fs::canonicalize(cli_state_root) {
+        Ok(path) => path,
+        Err(error) => {
+            return unavailable(
+                "antigravity_transcript",
+                "state_root_unavailable",
+                format!("could not canonicalize Antigravity CLI state: {error}"),
+            );
+        }
+    };
+    let canonical_brain_root: PathBuf = match std::fs::canonicalize(canonical_root.join("brain")) {
+        Ok(path) => path,
+        Err(error) => {
+            return unavailable(
+                "antigravity_transcript",
+                "transcript_unavailable",
+                format!("could not canonicalize Antigravity's brain directory: {error}"),
+            );
+        }
+    };
+    if !canonical_brain_root.starts_with(&canonical_root) {
+        return unavailable(
+            "antigravity_transcript",
+            "unsafe_transcript_path",
+            "Antigravity's brain directory resolves outside its CLI state root",
+        );
+    }
+    let expected_path: PathBuf = canonical_brain_root
+        .join(conversation_id)
+        .join(".system_generated")
+        .join("logs")
+        .join("transcript.jsonl");
+    let canonical_transcript: PathBuf = match std::fs::canonicalize(&expected_path) {
+        Ok(path) => path,
+        Err(error) => {
+            return unavailable(
+                "antigravity_transcript",
+                "transcript_unavailable",
+                format!("could not locate the exact Antigravity transcript: {error}"),
+            );
+        }
+    };
+    let canonical_conversation_root: PathBuf = canonical_brain_root.join(conversation_id);
+    if !canonical_transcript.starts_with(&canonical_conversation_root)
+        || canonical_transcript.file_name() != Some(OsStr::new("transcript.jsonl"))
+    {
+        return unavailable(
+            "antigravity_transcript",
+            "unsafe_transcript_path",
+            "the Antigravity transcript resolves outside the exact conversation directory",
+        );
+    }
+
+    let transcript_bytes: Vec<u8> =
+        match read_bounded_regular_file(&canonical_transcript, MAX_ANTIGRAVITY_TRANSCRIPT_BYTES) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                return unavailable("antigravity_transcript", "transcript_unavailable", reason);
+            }
+        };
+    project_antigravity_transcript(&transcript_bytes, conversation_id)
+}
+
+fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut options: OpenOptions = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file: File = options
+        .open(path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    let metadata: std::fs::Metadata = file
+        .metadata()
+        .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
+        return Err(format!(
+            "{} exceeds the {max_bytes}-byte read limit",
+            path.display()
+        ));
+    }
+    let mut bytes: Vec<u8> = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(max_bytes)
+            .min(max_bytes),
+    );
+    file.take(
+        u64::try_from(max_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
+    )
+    .read_to_end(&mut bytes)
+    .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "{} grew beyond the {max_bytes}-byte read limit while being read",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn project_antigravity_transcript(bytes: &[u8], conversation_id: &str) -> SupervisorHistory {
+    let complete_bytes: &[u8] = match bytes.iter().rposition(|byte: &u8| *byte == b'\n') {
+        Some(index) => &bytes[..=index],
+        None if bytes.is_empty() => bytes,
+        None => &[],
+    };
+    let mut records: VecDeque<HistoryRecord> = VecDeque::new();
+    let mut skipped_item_count: usize = usize::from(complete_bytes.len() != bytes.len());
+    let mut sequence: u64 = 0;
+    for raw_line in complete_bytes.split(|byte: &u8| *byte == b'\n') {
+        if raw_line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let value: Value = match serde_json::from_slice(raw_line) {
+            Ok(value) => value,
+            Err(error) => {
+                return unavailable(
+                    "antigravity_transcript",
+                    "malformed_transcript",
+                    format!("Antigravity transcript contains malformed JSONL: {error}"),
+                );
+            }
+        };
+        let Some(item_type) = value.get("type").and_then(Value::as_str) else {
+            skipped_item_count = skipped_item_count.saturating_add(1);
+            continue;
+        };
+        let (expected_source, role, kind): (&str, HistoryRole, HistoryKind) = match item_type {
+            "USER_INPUT" => ("USER_EXPLICIT", HistoryRole::User, HistoryKind::UserMessage),
+            "PLANNER_RESPONSE" => ("MODEL", HistoryRole::Assistant, HistoryKind::AgentMessage),
+            _ => {
+                skipped_item_count = skipped_item_count.saturating_add(1);
+                continue;
+            }
+        };
+        let source: Option<&str> = value.get("source").and_then(Value::as_str);
+        let status: Option<&str> = value.get("status").and_then(Value::as_str);
+        let step_index: Option<u64> = value.get("step_index").and_then(Value::as_u64);
+        let content: Option<&str> = value.get("content").and_then(Value::as_str);
+        if source != Some(expected_source) || step_index.is_none() || content.is_none() {
+            return unavailable(
+                "antigravity_transcript",
+                "malformed_transcript",
+                format!("Antigravity {item_type} record is missing required typed fields"),
+            );
+        }
+        let Some(status) = status else {
+            return unavailable(
+                "antigravity_transcript",
+                "malformed_transcript",
+                format!("Antigravity {item_type} record has no string status"),
+            );
+        };
+        if status != "DONE" {
+            skipped_item_count = skipped_item_count.saturating_add(1);
+            continue;
+        }
+        let text: &str = content.expect("content was checked above");
+        if text.is_empty() {
+            skipped_item_count = skipped_item_count.saturating_add(1);
+            continue;
+        }
+        sequence = sequence.saturating_add(1);
+        records.push_back(HistoryRecord {
+            source_provider: Provider::Antigravity,
+            source_session_id: conversation_id.to_string(),
+            source_record_id: format!("step-{}", step_index.expect("step index was checked above")),
+            sequence,
+            timestamp: None,
+            role,
+            kind,
+            text: text.to_string(),
+        });
+        if records.len() > MAX_ANTIGRAVITY_VISIBLE_RECORDS {
+            records.pop_front();
+            skipped_item_count = skipped_item_count.saturating_add(1);
+        }
+    }
+
+    SupervisorHistory::Available {
+        adapter: "antigravity_transcript",
+        adapter_version: 1,
+        records: records.into_iter().collect(),
+        skipped_item_count,
     }
 }
 
@@ -586,6 +874,8 @@ fn unavailable(
 mod tests {
     use super::*;
 
+    const ANTIGRAVITY_ID: &str = "0222067a-9e42-4b76-9649-66b84fd6bb26";
+
     fn response(workspace: &Path, thread_id: &str, items: Value) -> Value {
         json!({
             "id": THREAD_READ_REQUEST_ID,
@@ -683,6 +973,160 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn antigravity_projects_only_completed_visible_messages() {
+        let transcript: Vec<u8> = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-09-03T00:00:00Z","content":"question"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-09-03T00:00:01Z","content":"answer","thinking":"private"}"#,
+            "\n",
+            r#"{"step_index":2,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"hidden"}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"RUNNING","content":"partial"}"#,
+            "\n",
+            r#"{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"unfinished"}"#,
+        )
+        .as_bytes()
+        .to_vec();
+
+        let projected: SupervisorHistory =
+            project_antigravity_transcript(&transcript, ANTIGRAVITY_ID);
+        let SupervisorHistory::Available {
+            adapter,
+            adapter_version,
+            records,
+            skipped_item_count,
+        } = projected
+        else {
+            panic!("expected available Antigravity history");
+        };
+        assert_eq!(adapter, "antigravity_transcript");
+        assert_eq!(adapter_version, 1);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].text, "question");
+        assert_eq!(records[1].text, "answer");
+        assert_eq!(records[0].source_record_id, "step-0");
+        assert_eq!(records[1].source_record_id, "step-1");
+        assert_eq!(skipped_item_count, 3);
+        let serialized: String = serde_json::to_string(&records).unwrap();
+        assert!(!serialized.contains("private"));
+        assert!(!serialized.contains("hidden"));
+        assert!(!serialized.contains("partial"));
+        assert!(!serialized.contains("unfinished"));
+    }
+
+    #[test]
+    fn antigravity_rejects_malformed_completed_visible_records() {
+        let transcript: &[u8] =
+            br#"{"step_index":0,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE"}
+"#;
+        assert!(matches!(
+            project_antigravity_transcript(transcript, ANTIGRAVITY_ID),
+            SupervisorHistory::Unavailable {
+                reason_kind: "malformed_transcript",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn antigravity_reads_exact_workspace_validated_transcript() {
+        let fixture: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let workspace: PathBuf = fixture.path().join("workspace");
+        let state_root: PathBuf = fixture.path().join("antigravity-cli");
+        let transcript_path: PathBuf = state_root
+            .join("brain")
+            .join(ANTIGRAVITY_ID)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(state_root.join("cache")).unwrap();
+        std::fs::write(
+            state_root.join("cache").join("last_conversations.json"),
+            serde_json::to_vec(&json!({workspace.to_string_lossy(): ANTIGRAVITY_ID})).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &transcript_path,
+            concat!(
+                r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"fixture question"}"#,
+                "\n",
+                r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"fixture answer"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let history: SupervisorHistory =
+            read_antigravity_from_state_root(&state_root, ANTIGRAVITY_ID, &workspace);
+        let SupervisorHistory::Available { records, .. } = history else {
+            panic!("expected exact transcript to be available");
+        };
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].text, "fixture answer");
+
+        let other_id: &str = "849c7c61-7baf-4c6b-8767-5704603f08ff";
+        assert!(matches!(
+            read_antigravity_from_state_root(&state_root, other_id, &workspace),
+            SupervisorHistory::Unavailable {
+                reason_kind: "workspace_unverified",
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_rejects_transcript_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let fixture: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let workspace: PathBuf = fixture.path().join("workspace");
+        let state_root: PathBuf = fixture.path().join("antigravity-cli");
+        let logs: PathBuf = state_root
+            .join("brain")
+            .join(ANTIGRAVITY_ID)
+            .join(".system_generated")
+            .join("logs");
+        let outside: PathBuf = fixture.path().join("outside.jsonl");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::create_dir_all(state_root.join("cache")).unwrap();
+        std::fs::write(&outside, b"{}\n").unwrap();
+        symlink(&outside, logs.join("transcript.jsonl")).unwrap();
+        std::fs::write(
+            state_root.join("cache").join("last_conversations.json"),
+            serde_json::to_vec(&json!({workspace.to_string_lossy(): ANTIGRAVITY_ID})).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            read_antigravity_from_state_root(&state_root, ANTIGRAVITY_ID, &workspace),
+            SupervisorHistory::Unavailable {
+                reason_kind: "unsafe_transcript_path",
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_rejects_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let fixture: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let fifo_path: PathBuf = fixture.path().join("transcript.jsonl");
+        let fifo_path_c: CString = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        let result: i32 = unsafe { libc::mkfifo(fifo_path_c.as_ptr(), 0o600) };
+        assert_eq!(result, 0);
+
+        let error: String = read_bounded_regular_file(&fifo_path, 1024).unwrap_err();
+        assert!(error.contains("not a regular file"));
     }
 
     #[cfg(unix)]

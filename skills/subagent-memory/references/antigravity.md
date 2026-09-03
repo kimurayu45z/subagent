@@ -56,10 +56,15 @@ subagent --id gpt-luna-reviewer \
   codex exec "Review the current diff" --model gpt-5.6-luna
 ```
 
-This establishes pair identity only. Check `history-adapter-antigravity`
-before requiring supervisor transcript context. Keep the logical ID tied to
-the model family/alias and durable role (`gemini-flash-reviewer`), not to the
-execution CLI (`agy-reviewer`).
+This always establishes pair identity. Check `history-adapter-antigravity`
+before requiring supervisor transcript context. When implemented, the adapter
+reads only the exact UUID's bounded CLI transcript and requires Antigravity's
+workspace cache to confirm that the same explicit UUID belongs to the current
+canonical workspace. It never chooses the cached latest conversation. If a
+newer conversation replaced the cache entry, the older explicit conversation's
+history is conservatively unavailable. Keep the logical ID tied to the model
+family/alias and durable role (`gemini-flash-reviewer`), not to the execution
+CLI (`agy-reviewer`).
 
 Treat the result as evidence, not acceptance. Inspect edits and rerun
 proportionate verification independently.

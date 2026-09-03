@@ -162,8 +162,8 @@ fn capabilities() -> Vec<Capability> {
         ),
         capability(
             "history-adapter-antigravity",
-            CapabilityState::Planned,
-            "the Antigravity supervisor-history adapter is not implemented yet; use an explicit antigravity:CONVERSATION_ID supervisor reference",
+            CapabilityState::Implemented,
+            "an explicit antigravity:CONVERSATION_ID can read the exact bounded CLI transcript after the current canonical workspace is validated against Antigravity's cache; the cache is never used to select a supervisor",
         ),
         capability(
             "summarizer-deterministic",
@@ -313,6 +313,22 @@ mod tests {
             .find(|capability: &&Capability| capability.name == "history-adapter-opencode")
             .unwrap();
         assert_eq!(history.state, CapabilityState::Planned);
+    }
+
+    #[test]
+    fn antigravity_child_resume_and_history_adapter_are_implemented() {
+        let capabilities: Vec<Capability> = capabilities();
+        for name in [
+            "child-session-resume-antigravity",
+            "child-adapter-antigravity",
+            "history-adapter-antigravity",
+        ] {
+            let capability: &Capability = capabilities
+                .iter()
+                .find(|capability: &&Capability| capability.name == name)
+                .unwrap();
+            assert_eq!(capability.state, CapabilityState::Implemented);
+        }
     }
 
     #[test]

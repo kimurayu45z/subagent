@@ -403,8 +403,10 @@ Cached incremental summaries remain unavailable. For a Codex
 supervisor, `--context all` enriches pair history on a best-effort basis;
 `--context supervisor --context-mode required` fails before spawning the
 delegated child when the exact thread cannot be read safely. Claude and
-OpenCode, and Antigravity supervisor history remain explicitly unavailable
-until their transcript adapters land.
+OpenCode supervisor history remain explicitly unavailable. Antigravity
+supervisor history is available only for an explicit canonical conversation
+UUID that is validated against the current canonical workspace; automatic
+Antigravity supervisor discovery remains unavailable.
 
 ## 8. History adapters
 
@@ -463,13 +465,31 @@ session signal or a versioned managed-parent protocol; process ancestry and
 ### 8.4 Antigravity supervisor
 
 Antigravity supervisor identity is explicit-only. The CLI accepts
-`--supervisor antigravity:CONVERSATION_ID` for pair identity, while its history
-adapter reports `unavailable`. Automatic detection, process-ancestry guesses,
-and selection of the most recent conversation are forbidden. A future adapter
-must use an upstream-supported exact conversation handle, validate the
-canonical workspace, and expose only bounded visible user/agent messages.
+`--supervisor antigravity:CONVERSATION_ID` and, for requested supervisor
+context, reads only
+`~/.gemini/antigravity-cli/brain/<exact-id>/.system_generated/logs/transcript.jsonl`.
+The ID must be a canonical UUID. The current canonical workspace must map to
+that same explicit UUID in Antigravity CLI's bounded
+`cache/last_conversations.json`; the cache is validation evidence and is never
+used to choose an identity. A mismatch is an unavailable adapter, not a reason
+to select the cached conversation. This intentionally causes a false negative
+for an older explicit conversation after a newer conversation becomes active
+in the same workspace.
 
-### 8.4 Normalized history
+The version 1 adapter bounds both cache and transcript reads, opens regular
+files without following a final symlink on Unix, verifies the canonical
+transcript remains below the exact conversation directory, tolerates an
+incomplete concurrently-written trailing line, and projects only completed
+`USER_INPUT`/`USER_EXPLICIT` and `PLANNER_RESPONSE`/`MODEL` text. System
+messages, thinking, tool activity, unknown records, incomplete records, and
+empty content are excluded. Malformed known visible records fail the entire
+snapshot rather than returning partial history.
+
+Automatic detection, process-ancestry guesses, and selection of the most
+recent conversation remain forbidden. Hook-backed exact identity/workspace
+evidence may later remove the cache's conservative false-negative behavior.
+
+### 8.5 Normalized history
 
 ```text
 HistoryRecord {
@@ -1005,7 +1025,7 @@ forwarding for ordinary runs, bounded tracked-Codex/OpenCode and managed-Antigra
 propagation, and
 actual `claude -p`, `codex exec`, `opencode run`, and `agy -p` child execution. `context`,
 `log`, `pairs`, `forget`, and `doctor` are operational. Managed-parent manifest
-resolution, hook-registry detection, the Claude, OpenCode, and Antigravity supervisor-history adapters,
+resolution, hook-registry detection, and the Claude and OpenCode supervisor-history adapters,
 workspace memory, configured agent aliases, and cached incremental
 summarization remain deferred and fail explicitly where requested. Managed
 Claude assigned-session start, managed Codex observed-thread start, and managed
@@ -1079,8 +1099,10 @@ larger compatibility surface.
 - exact provider-issued conversation UUID observation and `--conversation` resume (implemented);
 - SQLite schema version 7 migration admitting `antigravity` while preserving
   existing rows and foreign keys (implemented);
-- explicit `antigravity:CONVERSATION_ID` supervisor identity (implemented); and
-- automatic Antigravity supervisor detection and safe transcript projection
+- explicit `antigravity:CONVERSATION_ID` supervisor identity (implemented);
+- bounded exact-transcript visible-message projection with conservative
+  canonical-workspace cache validation (implemented); and
+- automatic Antigravity supervisor detection and hook-backed workspace evidence
   (planned).
 
 ### Slice 8: optional model summaries
@@ -1128,6 +1150,11 @@ larger compatibility surface.
   <https://opencode.ai/docs/permissions/>
 - Google Antigravity CLI:
   <https://antigravity.google/product/antigravity-cli>
+- Google Antigravity CLI resume and workspace cache:
+  <https://www.antigravity.google/docs/cli/commands/resume>
+- Google Antigravity transcript/status metadata and hooks:
+  <https://antigravity.google/docs/cli/statusline/>
+  <https://antigravity.google/docs/hooks>
 
 Provider adapters must be checked against the installed CLI version at runtime.
 The output of `--help` is capability evidence for that installation, not a
