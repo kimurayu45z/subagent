@@ -835,6 +835,16 @@ provider exit status or terminal `SUCCESS` establishes protocol completion,
 not completion of a requested mutation, which the parent verifies from the
 actual diff, artifact, or external side effect.
 
+Antigravity terminal permission is independent of its file-edit execution
+mode. Unconfigured commands default to Ask, including read-only commands, and
+are soft-denied in headless mode. Before dispatching command-dependent work,
+the caller must establish narrow effective `permissions.allow` rules, rely on
+an already-configured sandbox with `proceed-in-sandbox`, restructure the task
+to use workspace file tools without a terminal, or select another provider.
+The wrapper does not mutate persistent Antigravity permission settings and
+does not infer terminal authority from `--mode accept-edits`. A headless
+`/permissions` response is not treated as an effective-rule inventory.
+
 Antigravity's positional print mode does not merge piped stdin into the model
 prompt. Every managed Antigravity run therefore removes the caller's print
 selector and task only after projection/digest/profile calculation, adds

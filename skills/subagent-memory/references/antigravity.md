@@ -3,6 +3,12 @@
 Read this reference when directly invoking Google's Antigravity CLI (`agy`) or
 choosing an `agy` child command behind `subagent`.
 
+Authoritative references:
+
+- <https://antigravity.google/docs/cli/headless/>
+- <https://antigravity.google/docs/cli/permissions/>
+- <https://antigravity.google/docs/cli/sandbox/>
+
 ## Choose the execution shape
 
 Use a complete quoted task immediately after the print selector:
@@ -17,7 +23,8 @@ not concatenate an untrusted task into a shell command string.
 
 Headless print is an I/O mode, not a permission grant. Match the provider's
 execution mode to the authority already established for the task. On an
-installed build that advertises these modes, use `plan` for read-only work:
+installed build that advertises these modes, use `plan` when the task must not
+edit workspace files:
 
 ```sh
 agy -p "Review the current diff without modifying files" \
@@ -31,13 +38,62 @@ agy -p "Implement only the requested change" \
   --model gemini-3.8-flash-high --mode accept-edits
 ```
 
-`accept-edits` does not imply blanket approval for terminal commands, MCP
-tools, external access, or paths outside the provider workspace. Those remain
-subject to Antigravity's permission policy. If a headless tool is denied,
-inspect the stderr notice and then, only when needed and supported by the
-installed build, inspect `agy -p "/permissions" --output-format json`. Grant
-only a narrow rule already within the user's request. Do not add
-`--dangerously-skip-permissions` merely to make an unattended run proceed.
+`plan` and `accept-edits` do not approve terminal commands. Antigravity normally
+allows file operations inside the active workspace, but an unconfigured shell
+command defaults to Ask even when it is read-only. Headless mode cannot answer
+that prompt, so the command is soft-denied while the run may still exit zero.
+MCP tools, external access, and paths outside the provider workspace are also
+separate permission resources.
+
+## Preflight terminal work
+
+Before choosing Antigravity for a task that requires shell commands, require
+one of these conditions:
+
+1. The effective project, shared, or global permission policy already contains
+   narrow `permissions.allow` rules for the required command prefixes.
+2. Terminal sandboxing and `toolPermission: "proceed-in-sandbox"` have already
+   been deliberately configured, and every required command can run inside
+   that sandbox. `--sandbox` alone does not change Ask into automatic approval.
+3. The task is restructured so Gemini reads named workspace files without a
+   terminal, or another provider with suitable per-invocation permissions is
+   used.
+
+Do not launch a headless Antigravity task that depends on commands while none
+of these conditions holds. A role named `implementer`, an implementation verb
+in the prompt, and `--mode accept-edits` do not grant terminal authority.
+
+Manage permission rules interactively with `agy` followed by `/permissions`,
+prefer the project scope, and add only rules within the user's authorization.
+The headless `/permissions` response is not a reliable effective-rule listing.
+For manual global configuration, Antigravity reads
+`~/.gemini/antigravity-cli/settings.json`; do not modify that persistent user
+configuration without authorization. A narrowly scoped example is:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "command(git status --short)",
+      "command(git diff --no-ext-diff --no-textconv)"
+    ],
+    "deny": [
+      "command(git push)",
+      "command(git reset)",
+      "command(git clean)",
+      "command(rm)"
+    ]
+  }
+}
+```
+
+Rules use token-prefix matching, and Deny takes precedence over Ask, which
+takes precedence over Allow. A broad `command(*)` Ask rule therefore defeats a
+narrow command Allow rule. Tell the child the exact permitted command shapes;
+do not assume it will discover them. Audit each command's full semantics before
+allowing it. Do not add `--dangerously-skip-permissions` merely to make an
+unattended run proceed; it requires explicit authorization and an appropriately
+isolated environment.
 
 Verify `agy --version` and `agy --help` before depending on exact mode or
 permission behavior. For experiments, isolate XDG config, data, cache, and
