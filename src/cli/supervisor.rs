@@ -29,6 +29,7 @@ pub(crate) const CLAUDE_CODE_SESSION_ID_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 pub(crate) enum Provider {
     Codex,
     Claude,
+    Cursor,
     OpenCode,
     Antigravity,
 }
@@ -38,6 +39,7 @@ impl Provider {
         match raw {
             "codex" => Some(Provider::Codex),
             "claude" => Some(Provider::Claude),
+            "cursor" => Some(Provider::Cursor),
             "opencode" => Some(Provider::OpenCode),
             "antigravity" => Some(Provider::Antigravity),
             _ => None,
@@ -50,6 +52,7 @@ impl fmt::Display for Provider {
         let text: &str = match self {
             Provider::Codex => "codex",
             Provider::Claude => "claude",
+            Provider::Cursor => "cursor",
             Provider::OpenCode => "opencode",
             Provider::Antigravity => "antigravity",
         };
@@ -124,7 +127,7 @@ impl fmt::Display for SupervisorResolutionError {
         match self {
             SupervisorResolutionError::InvalidExplicit => write!(
                 f,
-                "invalid --supervisor value: expected codex:SESSION_ID, claude:SESSION_ID, opencode:SESSION_ID, or antigravity:CONVERSATION_ID"
+                "invalid --supervisor value: expected codex:SESSION_ID, claude:SESSION_ID, cursor:SESSION_ID, opencode:SESSION_ID, or antigravity:CONVERSATION_ID"
             ),
             SupervisorResolutionError::ManagedRefUnsupported => write!(
                 f,
@@ -286,6 +289,18 @@ mod tests {
             resolve(Some("opencode:ses_xyz789"), &DetectionEnv::default()).unwrap();
         assert_eq!(resolved.provider, Provider::OpenCode);
         assert_eq!(resolved.session_id, "ses_xyz789");
+        assert_eq!(resolved.detected_via, DetectionSource::Explicit);
+    }
+
+    #[test]
+    fn explicit_cursor_reference_resolves() {
+        let resolved: SupervisorRef = resolve(
+            Some("cursor:3eba5a93-e2ca-4596-8ada-b3069d83ca25"),
+            &DetectionEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.provider, Provider::Cursor);
+        assert_eq!(resolved.session_id, "3eba5a93-e2ca-4596-8ada-b3069d83ca25");
         assert_eq!(resolved.detected_via, DetectionSource::Explicit);
     }
 

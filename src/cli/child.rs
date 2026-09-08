@@ -51,6 +51,12 @@ pub(crate) enum AntigravitySessionMode<'a> {
     Resume(&'a str),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorSessionMode<'a> {
+    Fresh,
+    Resume(&'a str),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChildAdapterError {
     UnsupportedProgram(OsString),
@@ -68,6 +74,10 @@ pub(crate) enum ChildAdapterError {
     AntigravityPromptPlacementAmbiguous,
     AntigravityOptionUnsupported(&'static str),
     AntigravityPromptNonUtf8,
+    CursorRequiresPrintMode,
+    CursorPromptPlacementAmbiguous,
+    CursorOptionUnsupported(&'static str),
+    CursorPromptNonUtf8,
 }
 
 impl fmt::Display for ChildAdapterError {
@@ -75,7 +85,7 @@ impl fmt::Display for ChildAdapterError {
         match self {
             ChildAdapterError::UnsupportedProgram(program) => write!(
                 f,
-                "managed context supports only `claude -p`, `codex exec`, `opencode run`, and `agy -p` \
+                "managed context supports only `claude -p`, `codex exec`, `agent -p`/`cursor-agent -p`, `opencode run`, and `agy -p` \
                  in this build; \
                  got program {:?}. Use --context none --no-record for explicit passthrough",
                 program
@@ -151,6 +161,27 @@ impl fmt::Display for ChildAdapterError {
                 "managed Antigravity prompts and caller stdin must be valid UTF-8 for the \
                  stream-json transport"
             ),
+            ChildAdapterError::CursorRequiresPrintMode => write!(
+                f,
+                "managed Cursor execution requires `agent -p TASK`, `agent --print TASK`, or \
+                 the equivalent `cursor-agent` form; interactive mode is not supported"
+            ),
+            ChildAdapterError::CursorPromptPlacementAmbiguous => write!(
+                f,
+                "managed Cursor execution requires one quoted task immediately after \
+                 `-p`/`--print`"
+            ),
+            ChildAdapterError::CursorOptionUnsupported(flag) => write!(
+                f,
+                "Cursor option {flag} is not supported by the managed adapter; use wrapper \
+                 --workstream for exact continuity, run from the intended external worktree, \
+                 or use --context none --no-record passthrough"
+            ),
+            ChildAdapterError::CursorPromptNonUtf8 => write!(
+                f,
+                "managed Cursor prompts and caller stdin must be valid UTF-8 because Cursor \
+                 print mode does not consume the wrapper's stdin context bootstrap"
+            ),
         }
     }
 }
@@ -173,11 +204,18 @@ pub(crate) fn recognize_managed_child(
         recognize_opencode(args)
     } else if basename == OsStr::new("agy") || basename == OsStr::new("antigravity") {
         recognize_antigravity(args)
+    } else if is_cursor_program(program) {
+        recognize_cursor(args)
     } else {
         Err(ChildAdapterError::UnsupportedProgram(
             program.to_os_string(),
         ))
     }
+}
+
+pub(crate) fn is_cursor_program(program: &OsStr) -> bool {
+    let basename: &OsStr = Path::new(program).file_name().unwrap_or(program);
+    basename == OsStr::new("agent") || basename == OsStr::new("cursor-agent")
 }
 
 /// Rejects Claude Code and OpenCode argv that require guessing where provider option values end
@@ -190,7 +228,7 @@ pub(crate) fn validate_managed_task_input(
     args: &[OsString],
     caller_stdin: &[u8],
 ) -> Result<(), ChildAdapterError> {
-    if !caller_stdin.is_empty() && kind != ChildKind::Antigravity {
+    if !caller_stdin.is_empty() && !matches!(kind, ChildKind::Antigravity | ChildKind::Cursor) {
         return Ok(());
     }
     match kind {
@@ -223,6 +261,19 @@ pub(crate) fn validate_managed_task_input(
                 Ok(())
             }
         }
+        ChildKind::Cursor => {
+            let Some(index) = cursor_prompt_index(args) else {
+                return Err(ChildAdapterError::CursorPromptPlacementAmbiguous);
+            };
+            if !cursor_argument_shape_is_unambiguous(args) {
+                return Err(ChildAdapterError::CursorPromptPlacementAmbiguous);
+            }
+            if args[index].to_str().is_none() || std::str::from_utf8(caller_stdin).is_err() {
+                Err(ChildAdapterError::CursorPromptNonUtf8)
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -243,6 +294,14 @@ pub(crate) fn validate_managed_continuity_input(
         return validate_managed_task_input(kind, args, caller_stdin);
     }
     if kind == ChildKind::Antigravity {
+        return validate_managed_task_input(kind, args, caller_stdin);
+    }
+    if kind == ChildKind::Cursor {
+        if !cursor_output_format_is_compatible(args) {
+            return Err(ChildAdapterError::CursorOptionUnsupported(
+                "--output-format other than json",
+            ));
+        }
         return validate_managed_task_input(kind, args, caller_stdin);
     }
     if kind == ChildKind::Claude {
@@ -311,6 +370,7 @@ fn likely_positional_prompt_index(kind: ChildKind, args: &[OsString]) -> Option<
         ChildKind::Codex => 1,
         ChildKind::OpenCode => 1,
         ChildKind::Antigravity => 0,
+        ChildKind::Cursor => 0,
     };
     if args.len() <= first_index {
         return None;
@@ -332,6 +392,10 @@ fn likely_positional_prompt_index(kind: ChildKind, args: &[OsString]) -> Option<
         return antigravity_prompt_index(args);
     }
 
+    if kind == ChildKind::Cursor {
+        return cursor_prompt_index(args);
+    }
+
     let separator_prompt_index: Option<usize> = if kind == ChildKind::OpenCode {
         opencode_explicit_separator_prompt_index(args)
     } else {
@@ -343,7 +407,7 @@ fn likely_positional_prompt_index(kind: ChildKind, args: &[OsString]) -> Option<
 
     if matches!(
         kind,
-        ChildKind::Claude | ChildKind::OpenCode | ChildKind::Antigravity
+        ChildKind::Claude | ChildKind::OpenCode | ChildKind::Antigravity | ChildKind::Cursor
     ) {
         return None;
     }
@@ -539,6 +603,25 @@ fn option_takes_value(kind: ChildKind, option: &OsStr) -> bool {
                     | "--print-timeout"
             )
         ),
+        ChildKind::Cursor => matches!(
+            option.to_str(),
+            Some(
+                "--resume"
+                    | "--model"
+                    | "--output-format"
+                    | "--mode"
+                    | "--sandbox"
+                    | "--workspace"
+                    | "--add-dir"
+                    | "--endpoint"
+                    | "-e"
+                    | "--api-key"
+                    | "--header"
+                    | "-H"
+                    | "--worktree-base"
+                    | "--plugin-dir"
+            )
+        ),
     }
 }
 
@@ -670,6 +753,59 @@ fn recognize_antigravity(args: &[OsString]) -> Result<ChildKind, ChildAdapterErr
     Ok(ChildKind::Antigravity)
 }
 
+fn recognize_cursor(args: &[OsString]) -> Result<ChildKind, ChildAdapterError> {
+    let selector_count: usize = args
+        .iter()
+        .filter(|argument: &&OsString| {
+            matches!(argument.as_os_str().to_str(), Some("-p" | "--print"))
+        })
+        .count();
+    if selector_count == 0 {
+        return Err(ChildAdapterError::CursorRequiresPrintMode);
+    }
+    if selector_count != 1 {
+        return Err(ChildAdapterError::CursorPromptPlacementAmbiguous);
+    }
+    for argument in args {
+        if let Some(text) = argument.to_str()
+            && text.len() > 2
+            && !text.starts_with("--")
+            && (text.starts_with("-w") || text.starts_with("-H"))
+        {
+            return Err(ChildAdapterError::CursorOptionUnsupported(
+                "attached worktree or header short option",
+            ));
+        }
+        let name: Option<&str> = profile_excluded_option_name(argument.as_os_str());
+        let unsupported: Option<&'static str> = match name {
+            Some("--resume") => Some("--resume"),
+            Some("--continue") => Some("--continue"),
+            Some("--workspace") => Some("--workspace"),
+            Some("--worktree") | Some("-w") => Some("--worktree/-w"),
+            Some("--worktree-base") => Some("--worktree-base"),
+            Some("--skip-worktree-setup") => Some("--skip-worktree-setup"),
+            Some("--api-key") => Some("--api-key (use CURSOR_API_KEY instead)"),
+            Some("--header") | Some("-H") => {
+                Some("--header/-H (use provider configuration instead)")
+            }
+            Some("--stream-partial-output") => Some("--stream-partial-output"),
+            Some("--list-models")
+            | Some("--version")
+            | Some("-v")
+            | Some("--help")
+            | Some("-h") => Some("short-circuit help/version/model-list option"),
+            Some("--output-format") if !cursor_output_format_is_compatible(args) => {
+                Some("--output-format other than json")
+            }
+            _ => None,
+        };
+        if let Some(flag) = unsupported {
+            return Err(ChildAdapterError::CursorOptionUnsupported(flag));
+        }
+    }
+    Ok(ChildKind::Cursor)
+}
+
 fn antigravity_print_selector_index(args: &[OsString]) -> Option<usize> {
     args.iter().position(|argument: &OsString| {
         matches!(argument.to_str(), Some("-p" | "--print" | "--prompt"))
@@ -684,6 +820,57 @@ fn antigravity_prompt_index(args: &[OsString]) -> Option<usize> {
         return None;
     }
     Some(prompt_index)
+}
+
+fn cursor_print_selector_index(args: &[OsString]) -> Option<usize> {
+    args.iter()
+        .position(|argument: &OsString| matches!(argument.to_str(), Some("-p" | "--print")))
+}
+
+fn cursor_prompt_index(args: &[OsString]) -> Option<usize> {
+    let selector_index: usize = cursor_print_selector_index(args)?;
+    let prompt_index: usize = selector_index.saturating_add(1);
+    let prompt: &OsStr = args.get(prompt_index)?.as_os_str();
+    if looks_like_option(prompt) {
+        return None;
+    }
+    Some(prompt_index)
+}
+
+fn cursor_argument_shape_is_unambiguous(args: &[OsString]) -> bool {
+    let Some(selector_index) = cursor_print_selector_index(args) else {
+        return false;
+    };
+    let Some(prompt_index) = cursor_prompt_index(args) else {
+        return false;
+    };
+    let mut index: usize = 0;
+    while index < args.len() {
+        if index == selector_index || index == prompt_index {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let argument: &OsStr = args[index].as_os_str();
+        if argument == OsStr::new("--") || !looks_like_option(argument) {
+            return false;
+        }
+        if option_takes_value(ChildKind::Cursor, argument) && !option_has_inline_value(argument) {
+            let value_index: usize = index.saturating_add(1);
+            let Some(value) = args.get(value_index) else {
+                return false;
+            };
+            if value_index == selector_index
+                || value_index == prompt_index
+                || looks_like_option(value.as_os_str())
+            {
+                return false;
+            }
+            index = value_index.saturating_add(1);
+        } else {
+            index = index.saturating_add(1);
+        }
+    }
+    true
 }
 
 /// Stable SHA-256 digest of the exact child argv, including the program, with
@@ -845,6 +1032,44 @@ pub(crate) fn inject_antigravity_session_args(
     spawn_args
 }
 
+/// Builds the Cursor argv used by every managed invocation. Cursor print mode
+/// does not consume the wrapper's stdin context bootstrap, so the caller task
+/// is replaced by one wrapper-prepared prompt. The wrapper also owns terminal
+/// JSON output and, for resume, selects only the exact stored session UUID.
+pub(crate) fn inject_cursor_session_args(
+    caller_args: &[OsString],
+    prepared_prompt: &str,
+    mode: CursorSessionMode<'_>,
+) -> Vec<OsString> {
+    let prompt_index: usize =
+        cursor_prompt_index(caller_args).expect("validated Cursor argv has a print prompt");
+    let mut spawn_args: Vec<OsString> = Vec::with_capacity(caller_args.len().saturating_add(4));
+    let mut index: usize = 0;
+    while index < caller_args.len() {
+        if index == prompt_index {
+            spawn_args.push(OsString::from(prepared_prompt));
+            index = index.saturating_add(1);
+            continue;
+        }
+        let argument: &OsString = &caller_args[index];
+        let name: Option<&str> = profile_excluded_option_name(argument.as_os_str());
+        if name == Some("--output-format") {
+            index = index.saturating_add(1);
+            if !option_has_inline_value(argument.as_os_str()) {
+                index = index.saturating_add(1);
+            }
+            continue;
+        }
+        spawn_args.push(argument.clone());
+        index = index.saturating_add(1);
+    }
+    spawn_args.extend([OsString::from("--output-format"), OsString::from("json")]);
+    if let CursorSessionMode::Resume(native_id) = mode {
+        spawn_args.extend([OsString::from("--resume"), OsString::from(native_id)]);
+    }
+    spawn_args
+}
+
 pub(crate) fn codex_json_requested(args: &[OsString]) -> bool {
     codex_provider_arguments(args).any(|argument: &OsString| {
         profile_excluded_option_name(argument.as_os_str()) == Some("--json")
@@ -897,6 +1122,60 @@ pub(crate) fn antigravity_stream_json_requested(args: &[OsString]) -> bool {
         index = index.saturating_add(1);
     }
     false
+}
+
+pub(crate) fn cursor_json_requested(args: &[OsString]) -> bool {
+    let mut index: usize = 0;
+    while index < args.len() {
+        let argument: &OsStr = args[index].as_os_str();
+        let Some(text) = argument.to_str() else {
+            index = index.saturating_add(1);
+            continue;
+        };
+        if text == "--output-format" {
+            return args
+                .get(index.saturating_add(1))
+                .and_then(|value: &OsString| value.to_str())
+                == Some("json");
+        }
+        if let Some(value) = text.strip_prefix("--output-format=") {
+            return value == "json";
+        }
+        index = index.saturating_add(1);
+    }
+    false
+}
+
+fn cursor_output_format_is_compatible(args: &[OsString]) -> bool {
+    let mut index: usize = 0;
+    let mut count: usize = 0;
+    while index < args.len() {
+        let argument: &OsStr = args[index].as_os_str();
+        let Some(text) = argument.to_str() else {
+            index = index.saturating_add(1);
+            continue;
+        };
+        if text == "--output-format" {
+            count = count.saturating_add(1);
+            if args
+                .get(index.saturating_add(1))
+                .and_then(|value: &OsString| value.to_str())
+                != Some("json")
+            {
+                return false;
+            }
+            index = index.saturating_add(2);
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--output-format=") {
+            count = count.saturating_add(1);
+            if value != "json" {
+                return false;
+            }
+        }
+        index = index.saturating_add(1);
+    }
+    count <= 1
 }
 
 fn antigravity_output_format_is_compatible(args: &[OsString]) -> bool {
@@ -1096,6 +1375,11 @@ fn excluded_profile_token_mask(kind: ChildKind, args: &[OsString]) -> Vec<bool> 
                 excluded[index] = true;
             }
         }
+        ChildKind::Cursor => {
+            if let Some(index) = cursor_print_selector_index(args) {
+                excluded[index] = true;
+            }
+        }
     }
 
     let task_index: Option<usize> = profile_task_index(kind, args);
@@ -1156,6 +1440,7 @@ fn profile_task_index(kind: ChildKind, args: &[OsString]) -> Option<usize> {
         ChildKind::OpenCode => opencode_prompt_immediately_after_run_index(args)
             .or_else(|| opencode_explicit_separator_prompt_index(args)),
         ChildKind::Antigravity => antigravity_prompt_index(args),
+        ChildKind::Cursor => cursor_prompt_index(args),
     }
 }
 
@@ -1221,6 +1506,10 @@ fn is_excluded_profile_option_name(kind: ChildKind, name: &str) -> bool {
                 | "--json-schema"
                 | "--log-file"
                 | "--print-timeout"
+        ),
+        ChildKind::Cursor => matches!(
+            name,
+            "--resume" | "--continue" | "--output-format" | "--trust"
         ),
     }
 }
@@ -2047,5 +2336,132 @@ mod tests {
             ]),
         });
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn recognizes_cursor_aliases_and_rejects_unsafe_managed_modes() {
+        for program in ["agent", "/usr/local/bin/cursor-agent"] {
+            let kind: ChildKind = recognize_managed_child(
+                OsStr::new(program),
+                &args(&["--model", "cursor-grok-4.6-high", "-p", "review this"]),
+            )
+            .unwrap();
+            assert_eq!(kind, ChildKind::Cursor);
+        }
+        for unsupported in [
+            "--resume",
+            "--continue",
+            "--workspace",
+            "--worktree",
+            "--worktree-base",
+            "--skip-worktree-setup",
+            "--api-key",
+            "--header",
+            "-H",
+        ] {
+            let arguments: Vec<OsString> =
+                args(&["-p", "review this", unsupported, "caller-owned-value"]);
+            assert!(matches!(
+                recognize_managed_child(OsStr::new("agent"), &arguments),
+                Err(ChildAdapterError::CursorOptionUnsupported(_))
+            ));
+        }
+        assert!(matches!(
+            recognize_managed_child(
+                OsStr::new("agent"),
+                &args(&["-p", "review", "--output-format", "stream-json"])
+            ),
+            Err(ChildAdapterError::CursorOptionUnsupported(_))
+        ));
+        for attached in ["-wprivate", "-HAuthorization:secret"] {
+            assert!(matches!(
+                recognize_managed_child(OsStr::new("agent"), &args(&["-p", "review", attached])),
+                Err(ChildAdapterError::CursorOptionUnsupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn cursor_requires_adjacent_utf8_prompt_and_rewrites_transport() {
+        let misplaced: Vec<OsString> = args(&["-p", "--model", "cursor-grok-4.6-high", "review"]);
+        assert_eq!(
+            validate_managed_task_input(ChildKind::Cursor, &misplaced, b"piped task"),
+            Err(ChildAdapterError::CursorPromptPlacementAmbiguous)
+        );
+        let split_task: Vec<OsString> = args(&["-p", "review", "the", "diff"]);
+        assert_eq!(
+            validate_managed_task_input(ChildKind::Cursor, &split_task, &[]),
+            Err(ChildAdapterError::CursorPromptPlacementAmbiguous)
+        );
+
+        let caller: Vec<OsString> = args(&[
+            "--model",
+            "cursor-grok-4.6-high",
+            "-p",
+            "review this",
+            "--mode",
+            "plan",
+            "--output-format=json",
+        ]);
+        assert_eq!(
+            inject_cursor_session_args(
+                &caller,
+                "prepared request",
+                CursorSessionMode::Resume("3eba5a93-e2ca-4596-8ada-b3069d83ca25")
+            ),
+            args(&[
+                "--model",
+                "cursor-grok-4.6-high",
+                "-p",
+                "prepared request",
+                "--mode",
+                "plan",
+                "--output-format",
+                "json",
+                "--resume",
+                "3eba5a93-e2ca-4596-8ada-b3069d83ca25",
+            ])
+        );
+    }
+
+    #[test]
+    fn cursor_profile_ignores_task_transport_and_trust_but_keeps_permissions() {
+        let workspace: &Path = Path::new("/workspace");
+        let first: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Cursor,
+            program: OsStr::new("agent"),
+            working_directory: workspace,
+            args: &args(&[
+                "-p",
+                "first",
+                "--model",
+                "cursor-grok-4.6-high",
+                "--auto-review",
+            ]),
+        });
+        let second: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Cursor,
+            program: OsStr::new("agent"),
+            working_directory: workspace,
+            args: &args(&[
+                "--print",
+                "second",
+                "--model",
+                "cursor-grok-4.6-high",
+                "--auto-review",
+                "--trust",
+                "--output-format",
+                "json",
+            ]),
+        });
+        assert_eq!(first, second);
+
+        let force: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Cursor,
+            program: OsStr::new("agent"),
+            working_directory: workspace,
+            args: &args(&["-p", "third", "--model", "cursor-grok-4.6-high", "--force"]),
+        });
+        assert_ne!(first, force);
     }
 }

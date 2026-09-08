@@ -108,6 +108,11 @@ pub(crate) fn read_supervisor_history(
             "adapter_not_implemented",
             "the Claude Code supervisor-history adapter is not implemented yet",
         ),
+        Provider::Cursor => unavailable(
+            "cursor_transcript",
+            "adapter_not_implemented",
+            "the Cursor supervisor-history adapter is not implemented yet",
+        ),
         Provider::OpenCode => unavailable(
             "opencode_transcript",
             "adapter_not_implemented",

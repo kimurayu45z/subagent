@@ -2,6 +2,11 @@
 
 Read this before assigning concurrent source-writing tasks.
 
+Partition the task before starting children. Give every writer exclusive file
+or package ownership and record any dependency between assignments. Dispatch
+all ready independent writers before waiting for results; launching them one at
+a time forfeits the intended wall-clock benefit.
+
 ## When worktrees help
 
 Use separate worktrees when two or more tasks are genuinely independent, have a
@@ -18,6 +23,11 @@ Do not parallelize writers that edit the same files, depend on each other's
 uncommitted output, mutate shared external state, or require a single ordered
 migration. Use one owner or sequence those tasks instead. Read-only exploration
 usually does not need another worktree.
+
+Begin with two or three concurrent assignments so the parent can keep the
+ownership and integration map compact. Increase fan-out only when boundaries
+remain disjoint and each result can be accepted from a short artifact/commit
+index plus independent verification.
 
 ## Create deliberately
 

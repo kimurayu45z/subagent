@@ -1,6 +1,6 @@
 # subagent
 
-`subagent` is a Rust wrapper that gives Codex, Claude Code, OpenCode, and Google
+`subagent` is a Rust wrapper that gives Codex, Cursor Agent CLI, Claude Code, OpenCode, and Google
 Antigravity CLI delegations a role-level audit trail and a pull-based path to prior context. It complements a
 precise task prompt and exact provider-native resume; it does not treat a reused
 role name as proof that two assignments are the same work.
@@ -33,18 +33,23 @@ This skill supersedes the former `claude-code-subagent` skill from
 `kimurayu45z/codex-claude-subagent`; its Claude Code execution guidance now
 lives alongside equivalent Codex guidance under this repository.
 
-The skill entrypoint starts with a short route: use a provider CLI directly for
-a one-off task, use `subagent` for recurring-role or cross-provider history,
+The skill entrypoint starts by partitioning independent work and protecting the
+parent agent's context budget. It favors the least expensive capable model,
+dispatches ready independent assignments together, and asks children to return
+compact artifact indexes instead of transcripts. Use a provider CLI directly
+for a one-off task, use `subagent` for recurring-role or cross-provider history,
 and add `--workstream` only for one intentional native-session continuation.
 It does not launch a child when asked only to explain or review the skill.
-Detailed concepts, capability gates, result reporting, provider arguments, and
-Git worktree coordination are loaded from separate references only when needed.
+Detailed delegation strategy, concepts, capability gates, result reporting,
+provider arguments, and Git worktree coordination are loaded from separate
+references only when needed.
 
 ## Run
 
 ```sh
 # GPT-family examples first by project convention
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
+subagent --id cursor-grok-reviewer -- agent --model cursor-grok-4.6-high -p "Review the current diff" --mode plan
 subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
 subagent --id big-pickle-reviewer -- opencode run "Review the current diff" --model opencode/big-pickle
 subagent --id gemini-flash-reviewer -- agy -p "Review the current diff" --model gemini-3.8-flash-high
@@ -67,13 +72,15 @@ visible user and agent messages; reasoning and raw tool records are excluded.
 Antigravity has the same bounded visible-message projection when an exact
 conversation UUID is supplied and its CLI cache confirms that UUID belongs to
 the current canonical workspace. The cache is validation evidence only; it is
-never used to choose the supervisor. Claude and OpenCode transcript adapters
-remain later milestones. OpenCode and Antigravity do not currently expose a
+never used to choose the supervisor. Cursor, Claude, and OpenCode transcript adapters
+remain later milestones. Cursor, OpenCode, and Antigravity do not currently expose a
 reliable immediate supervisor session to a child process, so identify either
 explicitly:
 
 ```sh
 subagent --id gpt-sol-reviewer --supervisor opencode:ses_EXACT_ID -- \
+  codex exec "Review the current diff"
+subagent --id gpt-sol-reviewer --supervisor cursor:EXACT_SESSION_UUID -- \
   codex exec "Review the current diff"
 subagent --id gpt-sol-reviewer \
   --supervisor antigravity:EXACT_CONVERSATION_UUID -- \
@@ -106,7 +113,10 @@ worktree per independent writer and keep `subagent --workstream` conceptually
 separate: a worktree isolates files and branches, while a workstream continues
 one provider-native conversation. Sequence trivial changes when setup costs
 more than it saves, and do not parallelize writers that edit the same files or
-depend on each other's uncommitted results.
+depend on each other's uncommitted results. Launch all ready independent tasks
+before waiting, normally with a small fan-out of two or three, and have each
+child return only outcome, artifact paths or commit SHA, verification, and
+remaining risks.
 
 When a model-prefixed logical identity changes, declare a one-way handoff from
 the older identity. The source must exist in this same workspace and supervisor
@@ -120,7 +130,7 @@ subagent --id claude-haiku-architect \
 
 Everything after the first literal `--` belongs to the provider command and is
 never interpreted as another wrapper option. Managed mode recognizes
-`codex exec`, `claude -p`/`claude --print`, `opencode run`, and
+`codex exec`, `agent -p`/`cursor-agent -p`, `claude -p`/`claude --print`, `opencode run`, and
 `agy -p`/`agy --print`/`agy --prompt`; an explicit workstream validates
 the supported task shape and adds wrapper-owned native continuity arguments
 only after hashing the caller command.
@@ -147,6 +157,34 @@ not guess against this evolving grammar: they accept the immediate form above,
 an explicit `--` separator, or caller stdin, and reject other trailing-task
 forms before starting Claude. Programmatic callers should build an argument
 vector rather than one shell command string.
+
+### Cursor argument safety
+
+Pass the whole task as one quoted argument immediately after `-p`/`--print`:
+
+```sh
+agent --model cursor-grok-4.6-high -p "Review the current diff" \
+  --mode plan --auto-review
+```
+
+Cursor print mode does not consume the wrapper's stdin context bootstrap.
+Managed mode therefore combines the bounded capsule bootstrap, positional task,
+and any caller stdin into one UTF-8 prompt, owns `--output-format json`, validates
+the terminal success object and exact session UUID, and normally renders only
+`result`. An explicit caller `--output-format json` preserves raw JSON.
+
+Caller-owned `--resume` and `--continue` are rejected. So are Cursor's internal
+`--workspace` and `--worktree` options because they would make the actual edit
+root disagree with the wrapper's canonical workspace and command profile. For
+parallel work, create or select an external Git worktree first and run
+`subagent` from that directory. Managed mode also rejects `--api-key` and
+`--header`; use `CURSOR_API_KEY` or provider configuration so credentials do
+not enter argv/report surfaces.
+
+The wrapper never injects `--force`/`--yolo`. Prefer `--auto-review` with
+project-scoped Cursor permissions; use force only when the caller has explicitly
+accepted its broader command authority. `--trust` trusts only the current
+workspace and is not equivalent to force.
 
 ### OpenCode argument safety
 
@@ -227,6 +265,14 @@ subagent --id gpt-luna-implementer \
   codex exec "Fix the failing test from that slice" --model gpt-5.6-luna \
   --sandbox workspace-write
 
+subagent --id cursor-grok-implementer \
+  --workstream issue-42 --fresh -- \
+  agent --model cursor-grok-4.6-high -p "Implement the first slice" --auto-review
+
+subagent --id cursor-grok-implementer \
+  --workstream issue-42 --resume -- \
+  agent --model cursor-grok-4.6-high -p "Fix the failing test from that slice" --auto-review
+
 subagent --id claude-haiku-implementer \
   --workstream issue-42 --fresh -- \
   claude -p "Implement the first slice" --model haiku
@@ -270,6 +316,13 @@ exit code; the captured output is preserved and an unsafe session is not made
 resumable. Current `codex exec resume` does not accept several fresh-only flags,
 including sandbox, profile, and working-root options, so the wrapper retains
 them in compatibility hashing but omits them from the provider resume argv.
+
+Managed Cursor always owns terminal JSON and composes context into the single
+positional prompt. A tracked fresh run stores only the UUID returned by a
+successful terminal result; resume passes that exact UUID through `--resume`
+and rejects mismatches. It never uses `--continue` or a latest-session lookup.
+Malformed, failed, mismatched, or truncated output cannot activate continuity,
+while the provider exit status remains authoritative.
 
 Tracked OpenCode adds `--format json`, validates one consistent `ses_...`
 session ID, and requires a completed step with final text before activating the

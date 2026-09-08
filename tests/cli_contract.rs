@@ -592,6 +592,114 @@ fn managed_antigravity_uses_stream_json_and_resumes_the_exact_conversation() {
 
 #[cfg(unix)]
 #[test]
+fn managed_cursor_composes_context_and_resumes_the_exact_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let agent_path: PathBuf = workspace.path().join("agent");
+    let prompt_path: PathBuf = workspace.path().join("last-prompt.txt");
+    let session_id: &str = "3eba5a93-e2ca-4596-8ada-b3069d83ca25";
+    fs::write(
+        &agent_path,
+        "#!/bin/sh\n\
+         cat >/dev/null\n\
+         test \"$1\" = --model || exit 70\n\
+         test \"$2\" = cursor-grok-4.6-high || exit 71\n\
+         test \"$3\" = -p || exit 72\n\
+         printf '%s' \"$4\" > \"$PROMPT_PATH\"\n\
+         grep -F 'CURRENT AUTHORITATIVE REQUEST' \"$PROMPT_PATH\" >/dev/null || exit 73\n\
+         test \"$5\" = --mode || exit 74\n\
+         test \"$6\" = plan || exit 75\n\
+         test \"$7\" = --output-format || exit 76\n\
+         test \"$8\" = json || exit 77\n\
+         if test \"$9\" = --resume; then\n\
+           test \"${10}\" = \"$SESSION_ID\" || exit 78\n\
+           grep -F 'second task' \"$PROMPT_PATH\" >/dev/null || exit 79\n\
+           response=RESUME_CURSOR\n\
+         else\n\
+           test -z \"$9\" || exit 80\n\
+           grep -F 'first task' \"$PROMPT_PATH\" >/dev/null || exit 81\n\
+           response=FRESH_CURSOR\n\
+         fi\n\
+         printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"%s\",\"session_id\":\"%s\",\"usage\":{\"inputTokens\":1}}\\n' \"$response\" \"$SESSION_ID\"\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&agent_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&agent_path, permissions).unwrap();
+
+    let run = |flag: &str, task: &str| -> std::process::Output {
+        subagent_with_clean_supervisor_env(state_dir.path())
+            .current_dir(workspace.path())
+            .env("PROMPT_PATH", &prompt_path)
+            .env("SESSION_ID", session_id)
+            .args([
+                "--id",
+                "cursor-grok-implementer",
+                "--supervisor",
+                "cursor:supervisor-session",
+                "--context",
+                "pair",
+                "--workstream",
+                "issue-cursor-1",
+                flag,
+                "--quiet",
+                "--",
+            ])
+            .arg(&agent_path)
+            .args([
+                "--model",
+                "cursor-grok-4.6-high",
+                "-p",
+                task,
+                "--mode",
+                "plan",
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let fresh: std::process::Output = run("--fresh", "first task");
+    assert!(
+        fresh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+    assert_eq!(fresh.stdout, b"FRESH_CURSOR\n");
+
+    let resumed: std::process::Output = run("--resume", "second task");
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(resumed.stdout, b"RESUME_CURSOR\n");
+
+    let connection: rusqlite::Connection =
+        rusqlite::Connection::open(state_dir.path().join("ledger.sqlite3")).unwrap();
+    let (native_id, kind, status): (String, String, String) = connection
+        .query_row(
+            "SELECT native_id, child_kind, status FROM child_sessions WHERE workstream_id = 'issue-cursor-1'",
+            [],
+            |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(native_id, session_id);
+    assert_eq!(kind, "cursor");
+    assert_eq!(status, "active");
+    let linked_invocations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM invocations WHERE child_session_id = (SELECT id FROM child_sessions WHERE native_id = ?1)",
+            [session_id],
+            |row: &rusqlite::Row<'_>| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(linked_invocations, 2);
+}
+
+#[cfg(unix)]
+#[test]
 fn managed_opencode_conflicting_resume_invalidates_the_stored_session() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1251,6 +1359,27 @@ fn dry_run_writes_a_json_plan_report_preserving_child_arguments_verbatim() {
         assert_eq!(actual["encoding"], "utf8");
         assert_eq!(actual["value"], *expected_value);
     }
+}
+
+#[test]
+fn cursor_credential_argv_is_rejected_before_plan_report_or_ledger() {
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let temp_dir: tempfile::TempDir = isolated_state_dir();
+    let report_path: PathBuf = temp_dir.path().join("cursor-plan.json");
+    let secret: &str = "cursor-secret-must-not-be-reported";
+
+    let output: std::process::Output = subagent_with_resolvable_supervisor(state_dir.path())
+        .args(["--id", "cursor-reviewer", "--dry-run", "--report"])
+        .arg(&report_path)
+        .args(["--", "agent", "-p", "review", "--api-key", secret])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(WRAPPER_ERROR_EXIT));
+    assert!(!report_path.exists());
+    assert!(!state_dir.path().join("ledger.sqlite3").exists());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CURSOR_API_KEY"));
 }
 
 #[test]

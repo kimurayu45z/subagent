@@ -1,14 +1,19 @@
 ---
 name: subagent-memory
-description: Delegate bounded work to Codex, Claude Code, OpenCode, or Google Antigravity CLI using direct one-shot execution, exact native resume, or durable role-level context. Use when performing delegation; if the user only asks to explain or review this skill, discuss it without launching a child.
+description: Delegate bounded work to Codex, Cursor Agent CLI, Claude Code, OpenCode, or Google Antigravity CLI while minimizing parent context use and coordinating independent work in parallel. Supports direct one-shot execution, exact native resume, and durable role-level context. If the user only asks to explain or review this skill, discuss it without launching a child.
 metadata:
-  short-description: Delegate safely with durable context
+  short-description: Delegate efficiently with durable context
 ---
 
 # Subagent Delegation and Memory
 
 ## Quick route
 
+- First identify independent assignments and dispatch the ready ones together.
+  Keep overlapping, ordered, or integration-heavy work with one owner.
+- Protect the parent's context budget: do not fully explore work that a child
+  will explore again. Give bounded pointers and require a compact result, not a
+  transcript.
 - One-off task: invoke the provider CLI directly by default. Use `subagent`
   only when the user explicitly needs a durable audit/context trail or prior
   role history materially affects the task.
@@ -37,6 +42,11 @@ Before invoking a child, state:
 4. any prohibited actions such as commit, push, deploy, deletion, or external
    messages.
 
+Require the child to return only the outcome, changed files or artifact/commit
+references, verification, and unresolved risks. Set a small output budget when
+the provider supports one. Do not ask for narration of every command or the
+full exploration trace.
+
 Delegation never expands the user's authority. The parent remains responsible
 for reviewing changes, running proportionate verification, and deciding what
 to accept.
@@ -44,6 +54,7 @@ to accept.
 Read only the reference needed for the chosen provider:
 
 - [Codex execution](references/codex.md)
+- [Cursor execution](references/cursor.md)
 - [Claude Code execution](references/claude-code.md)
 - [OpenCode execution](references/opencode.md)
 - [Antigravity CLI execution](references/antigravity.md)
@@ -51,6 +62,8 @@ Read only the reference needed for the chosen provider:
 For terminology or feature gates, read
 [concepts](references/concepts.md) or
 [capabilities](references/capabilities.md) only when those details matter.
+For task partitioning, model escalation, and parent-context budgeting, read
+[efficient delegation](references/efficient-delegation.md).
 
 ## Choose direct or durable execution
 
@@ -59,10 +72,16 @@ history:
 
 ```sh
 codex exec "Review the current diff"
+agent --model cursor-grok-4.6-high -p "Review the current diff" --mode plan
 claude --model opus -p "Review this design"
 opencode run "Review the current diff" --model opencode/big-pickle
 agy --model gemini-3.8-flash-high -p "Review the current diff"
 ```
+
+Choose the least expensive model with a reasonable chance of completing the
+bounded task. Escalate when the task intrinsically needs deeper reasoning or
+when independent verification exposes a concrete failure or uncertainty; do
+not default every delegation to the largest model.
 
 Use `subagent` when earlier decisions or results may matter, work crosses
 providers, repeated re-exploration is measurable, or the user explicitly needs
@@ -70,6 +89,7 @@ a durable audit trail:
 
 ```sh
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
+subagent --id cursor-grok-reviewer -- agent --model cursor-grok-4.6-high -p "Review the current diff" --mode plan
 subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
 subagent --id big-pickle-reviewer -- opencode run "Review the current diff" --model opencode/big-pickle
 subagent --id gemini-flash-reviewer -- agy -p "Review the current diff" --model gemini-3.8-flash-high
@@ -141,20 +161,25 @@ subagent --id gpt-sol-reviewer --supervisor claude:SESSION_ID -- \
   codex exec "Review the current diff"
 ```
 
-Never choose an OpenCode or Antigravity supervisor by process ancestry or a
+Never choose a Cursor, OpenCode, or Antigravity supervisor by process ancestry or a
 latest-session guess. Provider history availability is separate from identity
 resolution; follow `subagent doctor` and the provider reference.
 
 ## Parallelize only independent work
 
-When parallel source-writing has a material speed benefit, use one isolated Git
-worktree per child only if tasks can proceed without editing the same files or
-depending on each other's uncommitted results. Sequence tiny changes when
-worktree setup and integration would cost more than the parallelism saves. Keep
-read-only explorers in the main checkout when safe. The parent owns task
-partitioning, integration order, conflict resolution, and final verification.
-Read [worktree coordination](references/worktrees.md) before creating or
-removing worktrees.
+At the start of a delegable task, classify ready work as independent read-only,
+independent writing, or dependent. Launch independent bounded assignments
+together instead of waiting for one before starting the next. Keep fan-out
+small enough that the parent can integrate the results without consuming more
+context than the children save.
+
+Read-only explorers may share the main checkout when safe. Concurrent writers
+need disjoint ownership and one isolated Git worktree each. Sequence tiny,
+overlapping, externally mutating, or ordered work when setup and integration
+would cost more than the parallelism saves. The parent owns task partitioning,
+integration order, conflict resolution, and final verification. Read
+[worktree coordination](references/worktrees.md) before creating or removing
+worktrees.
 
 ## Inspect and report
 

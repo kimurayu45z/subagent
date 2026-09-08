@@ -518,6 +518,23 @@ fn execute_with_env(
         );
         return wrapper_error_exit();
     }
+    let passthrough: bool = run_args.no_record && context == ContextScope::None;
+    if workstream.is_none() && !passthrough && super::child::is_cursor_program(&child_tokens[0]) {
+        let cursor_kind: store::ChildKind =
+            match super::child::recognize_managed_child(&child_tokens[0], &child_tokens[1..]) {
+                Ok(kind) => kind,
+                Err(adapter_error) => {
+                    let _ = writeln!(err, "subagent: {adapter_error}");
+                    return wrapper_error_exit();
+                }
+            };
+        if let Err(adapter_error) =
+            super::child::validate_managed_task_input(cursor_kind, &child_tokens[1..], caller_stdin)
+        {
+            let _ = writeln!(err, "subagent: {adapter_error}");
+            return wrapper_error_exit();
+        }
+    }
     let summarizer: SummarizerChoice = SummarizerChoice::resolve(run_args.summarizer.as_deref());
     if let SummarizerChoice::Alias(alias) = &summarizer
         && !super::summarizer::supports_alias(alias)

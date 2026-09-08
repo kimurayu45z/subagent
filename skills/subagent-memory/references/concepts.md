@@ -13,8 +13,8 @@ Read this glossary only when choosing identity, continuity, or context scope.
 - **Workstream (`--workstream`)**: a named intentional chain within a pair. It
   selects wrapper-managed provider-native continuity and requires exactly one
   of `--fresh` or `--resume`.
-- **Provider-native session**: the Codex thread, Claude session, OpenCode
-  session, or Antigravity conversation bound to a workstream and command
+- **Provider-native session**: the Codex thread, Cursor or Claude session,
+  OpenCode session, or Antigravity conversation bound to a workstream and command
   profile. It is distinct from both the logical ID and the supervisor ID.
 
 ## Stored context

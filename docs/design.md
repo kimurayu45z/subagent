@@ -2,7 +2,7 @@
 
 Status: Draft, canonical
 
-Implementation milestone: managed Codex, Claude Code, OpenCode, and Antigravity workstream continuity
+Implementation milestone: managed Codex, Cursor, Claude Code, OpenCode, and Antigravity workstream continuity
 
 This document is the current normative design for `subagent`. Dated discussion,
 alternatives, and decision history belong under `docs/meeting-notes/` and do not
@@ -14,7 +14,7 @@ direction was chosen; this document remains authoritative if wording diverges.
 ## 1. Purpose
 
 `subagent` is a Rust CLI that preserves useful context across delegations among
-Codex, Claude Code, OpenCode, and Google Antigravity CLI. Any supported product
+Codex, Cursor Agent CLI, Claude Code, OpenCode, and Google Antigravity CLI. Any supported product
 may be the supervisor or the subordinate, subject to its available identity and history adapters.
 
 The primary invocation form is:
@@ -27,6 +27,7 @@ For example:
 
 ```sh
 subagent --id gpt-sol-reviewer -- codex exec "Review the current diff"
+subagent --id cursor-grok-reviewer -- agent --model cursor-grok-4.6-high -p "Review the current diff" --mode plan
 subagent --id claude-opus-architect -- claude -p "Review this design" --model opus
 subagent --id big-pickle-reviewer -- opencode run "Review the current diff" --model opencode/big-pickle
 subagent --id gemini-flash-reviewer -- agy -p "Review the current diff" --model gemini-3.8-flash-high
@@ -51,7 +52,7 @@ behind adapters and must not silently narrow the supported platform set.
 
 - Preserve delegation memory without requiring the supervisor to restate all
   prior context.
-- Support cross-provider supervision among Codex, Claude Code, OpenCode, and Antigravity
+- Support cross-provider supervision among Codex, Cursor, Claude Code, OpenCode, and Antigravity
   without guessing an unavailable immediate supervisor identity.
 - Keep provider-native session identity separate from the user's logical
   subordinate identity.
@@ -83,7 +84,7 @@ behind adapters and must not silently narrow the supported platform set.
 
 ```text
 SupervisorRef {
-    provider: codex | claude | opencode | antigravity,
+    provider: codex | claude | cursor | opencode | antigravity,
     session_id: provider-defined string,
     workspace_root: absolute path,
     detected_via: explicit | managed_ref | native_env | hook_registry,
@@ -93,6 +94,10 @@ SupervisorRef {
 
 For Codex, the native session identifier is normally `CODEX_THREAD_ID`. For
 Claude Code, it is normally `CLAUDE_CODE_SESSION_ID`.
+Cursor supervisor identity is accepted through explicit
+`--supervisor cursor:SESSION_ID`; automatic detection and transcript projection
+are not implemented because the CLI exposes no documented immediate-parent ID
+to child processes.
 OpenCode supervisor identity is accepted through explicit
 `--supervisor opencode:SESSION_ID`; automatic detection is not implemented
 because OpenCode does not currently expose the immediate session ID to child
@@ -140,7 +145,7 @@ examples.
 Concrete model versions (for example a dated release string) and
 execution/API providers (for example `openai`, `anthropic`, `bedrock`, or
 `vertex`) must not be encoded in the logical ID. Record that information
-separately in the child profile (see section 13.5), not in `SubagentId`,
+separately in the child profile (see section 13.6), not in `SubagentId`,
 so that a provider or hosting change does not fragment pair history that
 should stay attached to the same durable role.
 
@@ -376,13 +381,15 @@ For each managed run, `subagent` performs the following sequence:
 8. Materialize a per-run context capsule.
 9. Resolve an exact active child runtime session for `--resume`. For `--fresh`,
    assign Claude's caller-controlled ID before spawn, observe Codex's native
-   thread ID after the child starts, observe OpenCode's native session ID from
-   its JSON event stream, or observe Antigravity's native conversation UUID
-   from its stream-JSON result.
+   thread ID after the child starts, observe Cursor's native session UUID from
+   its terminal JSON result, observe OpenCode's native session ID from its JSON
+   event stream, or observe Antigravity's native conversation UUID from its
+   stream-JSON result.
 10. Record and link the pending invocation, then spawn the child.
 11. Forward signals and stderr. Stream ordinary stdout; for tracked Codex or
-    OpenCode and every managed Antigravity run, capture bounded JSONL and render
-    final assistant text unless the caller explicitly requested raw provider JSON.
+    OpenCode and every managed Cursor or Antigravity run, capture bounded JSON
+    and render final assistant text unless the caller explicitly requested raw
+    provider JSON.
 12. Promote a successfully confirmed native session from `assigned` to
     `active`.
 13. Record the final response, exit state, duration, context provenance, and
@@ -397,13 +404,14 @@ from its own context capsule.
 
 Codex supervisor-history reading is implemented for step 5. Managed Claude
 assigned-session start/resume, managed Codex observed-thread start/resume, and
-managed OpenCode observed-session start/resume, and managed Antigravity
-observed-conversation start/resume are implemented for steps 9 through 12.
+managed Cursor and OpenCode observed-session start/resume, and managed
+Antigravity observed-conversation start/resume are implemented for steps 9
+through 12.
 Cached incremental summaries remain unavailable. For a Codex
 supervisor, `--context all` enriches pair history on a best-effort basis;
 `--context supervisor --context-mode required` fails before spawning the
 delegated child when the exact thread cannot be read safely. Claude and
-OpenCode supervisor history remain explicitly unavailable. Antigravity
+Cursor, Claude, and OpenCode supervisor history remain explicitly unavailable. Antigravity
 supervisor history is available only for an explicit canonical conversation
 UUID that is validated against the current canonical workspace; automatic
 Antigravity supervisor discovery remains unavailable.
@@ -451,7 +459,16 @@ Transcript parsing is versioned and tolerant of non-message records. The
 `parentUuid` relationship must be respected when necessary to avoid treating
 side chains as a single linear conversation.
 
-### 8.3 OpenCode supervisor
+### 8.3 Cursor supervisor
+
+Cursor supervisor identity is explicit-only in the current milestone. The CLI
+accepts `--supervisor cursor:SESSION_ID` for pair identity, but the history
+adapter reports `unavailable`. A future adapter requires a documented exact
+session export or transcript query tied to the canonical workspace. It must
+never infer the immediate parent through process ancestry, `--continue`, or a
+latest-chat lookup.
+
+### 8.4 OpenCode supervisor
 
 OpenCode supervisor identity is explicit-only in the current milestone. The
 CLI accepts `--supervisor opencode:SESSION_ID` for pair identity, but the
@@ -462,7 +479,7 @@ by recency. Automatic detection requires an upstream-supported immediate
 session signal or a versioned managed-parent protocol; process ancestry and
 "latest session" heuristics are not acceptable.
 
-### 8.4 Antigravity supervisor
+### 8.5 Antigravity supervisor
 
 Antigravity supervisor identity is explicit-only. The CLI accepts
 `--supervisor antigravity:CONVERSATION_ID` and, for requested supervisor
@@ -574,14 +591,15 @@ summaries(id, scope_kind, scope_id, source_digest, summary_digest,
           summarizer_id, template_version, redaction_version, created_at)
 ```
 
-The MVP uses SQLite `user_version = 6`. It implements `workspaces`,
+The MVP uses SQLite `user_version = 8`. It implements `workspaces`,
 `supervisor_sessions`, `pairs`, `pair_inheritance`, `invocations`, and
 `exchange_messages`, plus workstream-scoped provider-native continuity in
 `child_sessions` and the nullable `invocations.child_session_id` link. Claude
-assignment and exact resume plus Codex/OpenCode observed-session resume consume
-this substrate. Version 6 rebuilds the child-facing tables transactionally to
-extend their `child_kind` constraints with `opencode`, copying all existing
-rows and preserving foreign-key relationships. Legacy pre-version-5 rows
+assignment and exact resume plus Codex/Cursor/OpenCode/Antigravity
+observed-session resume consume this substrate. Versions 6, 7, and 8 rebuild
+the child-facing tables transactionally to extend their `child_kind`
+constraints with `opencode`, `antigravity`, and `cursor`, respectively, copying
+all existing rows and preserving foreign-key relationships. Legacy pre-version-5 rows
 retain a null workstream and remain auditable but are never resumable. It
 enforces one pair row for each workspace/supervisor-session/subagent tuple and
 allocates monotonically increasing per-pair invocation sequences under an
@@ -782,7 +800,7 @@ fresh-only flags (`--oss`, local provider, profile, sandbox/approval mode, and
 working root/additional directory) remain in the caller-derived command profile
 but are omitted from resume argv, allowing Codex to reuse the persisted thread
 configuration. Fresh-only color is also omitted from resume and remains an
-output-shaping profile exclusion under section 13.5. Unknown flags remain
+output-shaping profile exclusion under section 13.6. Unknown flags remain
 default-included in the profile and are forwarded. Full app-server-driven child
 execution remains an optional future mode for streaming and richer
 cancellation; exact native resume does not depend on it.
@@ -866,7 +884,46 @@ activation still wait for terminal validation. A mismatch/conflict invalidates
 the stored resumed session as provider-rejected; other failures leave it
 unconfirmed and preserve the child exit status.
 
-### 13.5 Command profiles
+### 13.5 Cursor child
+
+The managed adapter recognizes executable basenames `agent` and
+`cursor-agent` in non-interactive `-p`/`--print` mode. The complete task must
+be one quoted UTF-8 token immediately after the print selector. Caller stdin,
+when present, is treated as part of the current request rather than as a
+transport channel.
+
+Cursor print mode does not consume the wrapper's stdin context bootstrap.
+Every managed Cursor run therefore replaces the projected task only after
+command digest and profile calculation, composes the capsule bootstrap plus the
+current authoritative request into one positional prompt, closes stdin, and
+owns `--output-format json`. The terminal object must have `type=result`,
+`subtype=success`, `is_error=false`, a non-empty string `result`, and a
+canonical UUID `session_id`. Unknown fields such as usage counters are ignored.
+Output capture is bounded to 32 MiB. Caller-owned JSON preserves the raw object;
+otherwise the wrapper renders only `result` with a trailing newline.
+
+Managed mode rejects caller `--resume` and `--continue`; tracked fresh stores
+the provider-issued UUID only after successful observation, while tracked
+resume passes the exact stored UUID through `--resume` and verifies equality.
+It never selects the latest chat. A mismatch invalidates the resumed session;
+malformed, failed, empty, or truncated output leaves continuity unconfirmed and
+preserves the provider exit status.
+
+Cursor's internal `--workspace`, `--worktree`/`-w`, `--worktree-base`, and
+`--skip-worktree-setup` are rejected because they can make the provider's edit
+root differ from the canonical workspace committed into pair identity and the
+command profile. Parallel managed work uses an externally created Git worktree
+and starts `subagent` from that exact directory. Credential-bearing
+`--api-key` and `--header` argv are also rejected; use environment or provider
+configuration instead.
+
+The wrapper never injects `--force`/`--yolo`. `--auto-review`, permission
+configuration, sandbox mode, and an explicit caller force flag remain part of
+the caller's authorization choice; permission-affecting changes stay in the
+command profile. `--trust` is a per-workspace trust acknowledgement, not a
+blanket command grant, and is excluded from profile compatibility.
+
+### 13.6 Command profiles
 
 A child session is resumable only when its profile remains compatible. The
 versioned profile hash is SHA-256 over length-framed fields: child kind, exact
@@ -891,7 +948,7 @@ Command-profile schema version 2 makes option exclusions provider-specific.
 This prevents OpenCode's short `-c`/`-s` continuity flags from excluding Codex
 configuration or sandbox arguments that happen to use the same spelling.
 
-Schema version 7 stores at most one live `assigned` or `active` child session
+Schema version 8 stores at most one live `assigned` or `active` child session
 for each pair, child kind, and non-null workstream. Deliberate replacement
 produces a terminal `retired` row; provider rejection produces a terminal
 `invalid` row. Historical rows remain for audit, and deleting a pair cascades
@@ -900,7 +957,7 @@ cannot satisfy a resume lookup. Fresh replacement and insertion share one
 immediate transaction, so an insertion failure rolls back retirement.
 `workstream_id` remains outside `PairKey` to preserve the role-level ledger.
 
-### 13.6 Claude prompt placement
+### 13.7 Claude prompt placement
 
 Several Claude Code options accept variable-length value lists, including tool,
 directory, beta, file, and MCP configuration options in the currently installed
@@ -1018,13 +1075,25 @@ Command arrays are stored and executed as argument vectors, not shell strings.
   useful and checks installed capabilities before relying on them.
 
 The skill uses progressive disclosure. Its entrypoint contains the quick route,
-authorization boundary, representative direct/wrapped/continued calls, and the
-summary-first context rule. Provider argument details, identity terminology,
-doctor capability gates, compact parent reporting, and Git worktree coordination
-live in references that are read only when relevant. A request to explain or
-review the skill is a meta request and must not itself launch a child merely
-because the skill is named. An explicit request for another agent's opinion is
-still a valid delegation request.
+parent-context budget, authorization boundary, representative
+direct/wrapped/continued calls, and the summary-first context rule. Detailed
+delegation economics, provider arguments, identity terminology, doctor
+capability gates, compact parent reporting, and Git worktree coordination live
+in references that are read only when relevant. A request to explain or review
+the skill is a meta request and must not itself launch a child merely because
+the skill is named. An explicit request for another agent's opinion is still a
+valid delegation request.
+
+The parent-context rule avoids duplicate exploration. The parent inspects only
+enough to define scope, ownership, artifacts, and verification before
+delegating; it does not first perform the same full analysis assigned to a
+child. Child final responses are compact indexes containing outcome, artifact
+paths or commit identifiers, verification, and remaining risks. Substantial
+work lives in repository files or explicit artifacts. The parent reads full
+child transcripts or tool logs only to resolve a specific ambiguity, failure,
+or audit request. Model selection starts with the least expensive model likely
+to complete the bounded task and escalates using concrete failed verification,
+ambiguity, or a reasoning gap rather than defaulting to the largest model.
 
 The context rule is summary-first and bounded: keep the current task
 self-contained, consult `summary.md` only when prior decisions may matter, then
@@ -1038,6 +1107,14 @@ parallel speed benefit exceeds setup and integration cost; tiny changes may be
 faster sequentially. Overlapping or ordered changes stay sequential. Worktree
 creation, branch creation, commit, push, integration, and removal remain subject
 to the user's authorization and dirty-worktree protections.
+
+Before waiting on a child, the parent dispatches all currently ready independent
+assignments. Read-only work may share a checkout when safe; writers require
+disjoint ownership and isolated worktrees. A normal initial fan-out of two or
+three bounds coordination cost, and may grow only while ownership, dependencies,
+and acceptance evidence remain compact. Parallelism must reduce total elapsed
+work after accounting for setup, review, conflicts, integration, and combined
+verification.
 
 Slice 0 deliberately excludes supervisor discovery, persistence, history
 adapters, context injection, native child resume, and summarization. Its purpose
@@ -1056,20 +1133,20 @@ is to test the vocabulary and workflow before committing to those mechanisms.
 
 Implementation status: the usable MVP implements explicit supervisor
 references, unambiguous native Codex/Claude environment detection, canonical
-path-based workspace identity, conversation `PairKey` derivation, the version 7
+path-based workspace identity, conversation `PairKey` derivation, the version 8
 SQLite pair/exchange ledger and workstream-scoped child-session substrate,
 common-credential redaction, deterministic recent
 history summaries, explicit one-way same-conversation pair inheritance,
 owner-only context capsules with explicit pointer/inline delivery, raw stream
-forwarding for ordinary runs, bounded tracked-Codex/OpenCode and managed-Antigravity rendering, signal
+forwarding for ordinary runs, bounded tracked-Codex/OpenCode and managed-Cursor/Antigravity rendering, signal
 propagation, and
-actual `claude -p`, `codex exec`, `opencode run`, and `agy -p` child execution. `context`,
+actual `claude -p`, `codex exec`, `agent -p`, `opencode run`, and `agy -p` child execution. `context`,
 `log`, `pairs`, `forget`, and `doctor` are operational. Managed-parent manifest
-resolution, hook-registry detection, and the Claude and OpenCode supervisor-history adapters,
+resolution, hook-registry detection, and the Claude, Cursor, and OpenCode supervisor-history adapters,
 workspace memory, configured agent aliases, and cached incremental
 summarization remain deferred and fail explicitly where requested. Managed
 Claude assigned-session start, managed Codex observed-thread start, and managed
-OpenCode observed-session start and Antigravity observed-conversation start support exact active-session resume. The Codex app-server supervisor-history
+Cursor and OpenCode observed-session start and Antigravity observed-conversation start support exact active-session resume. The Codex app-server supervisor-history
 adapter is implemented with bounded, read-only, allowlisted projection.
 
 Repository CI runs formatting, Clippy with warnings denied, and all-target,
@@ -1151,6 +1228,17 @@ larger compatibility surface.
 - incremental structured summaries;
 - leases, timeouts, deterministic fallback, and cache rebase.
 
+### Slice 9: managed Cursor runtime continuity
+
+- `agent -p` and `cursor-agent -p` recognition with strict task placement (implemented);
+- one composed UTF-8 prompt and bounded terminal JSON validation (implemented);
+- exact provider-issued session UUID observation and `--resume` (implemented);
+- SQLite schema version 8 migration admitting `cursor` while preserving
+  existing rows and foreign keys (implemented);
+- explicit `cursor:SESSION_ID` supervisor identity (implemented);
+- managed internal-worktree and credential-argv rejection (implemented); and
+- automatic Cursor supervisor detection and safe transcript projection (planned).
+
 ## 18. Acceptance criteria
 
 - Repeated calls with one pair reuse its pair history and do not expose another
@@ -1158,7 +1246,7 @@ larger compatibility surface.
 - Conversation scope and workspace scope are visibly distinct in capsules and
   logs.
 - Nested cross-provider tests select the immediate Codex, Claude Code,
-  OpenCode, or Antigravity supervisor or fail explicitly.
+  Cursor, OpenCode, or Antigravity supervisor or fail explicitly.
 - Child stdout is byte-identical with and without wrapping for passthrough
   fixtures.
 - Exit code `42` remains `42`; Unix signal termination remains signal

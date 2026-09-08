@@ -3,7 +3,8 @@
 //! This module implements the CLI shell described in `docs/design.md`
 //! section 6 ("CLI contract"), supervisor identity resolution, and the
 //! workspace-scoped pair store, durable exchange ledger, context capsule,
-//! and managed child-process backend for Claude print mode and Codex exec.
+//! and managed child-process backends for Codex, Cursor, Claude Code,
+//! OpenCode, and Antigravity.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -15,6 +16,7 @@ mod capsule;
 mod child;
 mod codex_json;
 mod context_cmd;
+mod cursor_json;
 mod doctor_cmd;
 mod forget_cmd;
 mod history;
@@ -54,7 +56,7 @@ pub(crate) enum OutputFormat {
 }
 
 const HELP_TEXT: &str = "\
-subagent - preserve delegation context across Codex, Claude Code, OpenCode, and Antigravity sub-agent invocations
+subagent - preserve delegation context across Codex, Claude Code, Cursor, OpenCode, and Antigravity sub-agent invocations
 
 USAGE:
     subagent --id ID [RUN-OPTIONS] -- COMMAND [ARG...]

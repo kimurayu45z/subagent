@@ -30,7 +30,7 @@ bypass required-context failure merely to make a child start.
 If both Codex and Claude native supervisor IDs are inherited, the immediate
 supervisor is ambiguous. Pass `--supervisor PROVIDER:SESSION_ID` or stop.
 
-OpenCode and Antigravity automatic supervisor detection may remain unavailable
+Cursor, OpenCode, and Antigravity automatic supervisor detection may remain unavailable
 even when their child execution and exact resume adapters work. Antigravity
 history, when implemented, can still require an explicit conversation UUID and
 current-workspace validation.

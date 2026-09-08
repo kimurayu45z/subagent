@@ -72,7 +72,7 @@ fn capabilities() -> Vec<Capability> {
         capability(
             "supervisor-detection-explicit-native",
             CapabilityState::Implemented,
-            "resolves an explicit --supervisor codex:ID, claude:ID, opencode:ID, or antigravity:ID, or exactly one \
+            "resolves an explicit --supervisor codex:ID, claude:ID, cursor:ID, opencode:ID, or antigravity:ID, or exactly one \
              unambiguous, non-empty CODEX_THREAD_ID or CLAUDE_CODE_SESSION_ID (design.md \
              section 5, steps 1 and 3)",
         ),
@@ -108,7 +108,12 @@ fn capabilities() -> Vec<Capability> {
         capability(
             "child-session-store",
             CapabilityState::Implemented,
-            "SQLite schema version 7 stores workstream-scoped provider-native child sessions for Claude Code, Codex, OpenCode, and Antigravity, lifecycle state, and versioned command-profile hashes",
+            "SQLite schema version 8 stores workstream-scoped provider-native child sessions for Codex, Cursor, Claude Code, OpenCode, and Antigravity, lifecycle state, and versioned command-profile hashes",
+        ),
+        capability(
+            "child-session-resume-cursor",
+            CapabilityState::Implemented,
+            "Cursor supports explicit --workstream with exactly one of --fresh or --resume; terminal JSON observation persists and verifies the exact native session UUID",
         ),
         capability(
             "child-session-resume-claude",
@@ -116,9 +121,19 @@ fn capabilities() -> Vec<Capability> {
             "Claude Code supports explicit --workstream with exactly one of --fresh or --resume; exact active-session and profile matching fail closed before spawn",
         ),
         capability(
+            "history-adapter-cursor",
+            CapabilityState::Planned,
+            "the Cursor supervisor-history adapter is not implemented yet; use an explicit cursor:SESSION_ID supervisor reference for pair identity only",
+        ),
+        capability(
             "child-session-resume-codex",
             CapabilityState::Implemented,
             "Codex supports explicit --workstream with exactly one of --fresh or --resume; JSONL observation persists and verifies the exact native thread ID",
+        ),
+        capability(
+            "child-adapter-cursor",
+            CapabilityState::Implemented,
+            "agent -p/--print and cursor-agent equivalents are supported through one wrapper-composed prompt and terminal JSON; managed workstreams add exact --resume and reject native continuity, internal worktree, workspace override, and credential argv",
         ),
         capability(
             "child-session-resume-opencode",
@@ -198,7 +213,7 @@ fn capabilities() -> Vec<Capability> {
         capability(
             "child-spawn",
             CapabilityState::Implemented,
-            "stdout/stderr forwarding and capture are bounded; tracked Codex/OpenCode and managed Antigravity JSONL are rendered after completion, while observation failures preserve captured output and child exit status",
+            "stdout/stderr forwarding and capture are bounded; tracked Codex/OpenCode and managed Cursor/Antigravity JSON are rendered after completion, while observation failures preserve captured output and child exit status",
         ),
     ]
 }
@@ -296,6 +311,23 @@ mod tests {
             .find(|capability| capability.name == "child-session-resume-codex")
             .unwrap();
         assert_eq!(managed_resume.state, CapabilityState::Implemented);
+    }
+
+    #[test]
+    fn managed_cursor_resume_and_child_adapter_are_implemented() {
+        let capabilities: Vec<Capability> = capabilities();
+        for name in ["child-session-resume-cursor", "child-adapter-cursor"] {
+            let capability: &Capability = capabilities
+                .iter()
+                .find(|capability: &&Capability| capability.name == name)
+                .unwrap();
+            assert_eq!(capability.state, CapabilityState::Implemented);
+        }
+        let history: &Capability = capabilities
+            .iter()
+            .find(|capability: &&Capability| capability.name == "history-adapter-cursor")
+            .unwrap();
+        assert_eq!(history.state, CapabilityState::Planned);
     }
 
     #[test]
