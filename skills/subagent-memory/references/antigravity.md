@@ -55,7 +55,9 @@ one of these conditions:
 2. Terminal sandboxing and `toolPermission: "proceed-in-sandbox"` have already
    been deliberately configured, and every required command can run inside
    that sandbox. `--sandbox` alone does not change Ask into automatic approval.
-3. The task is restructured so Gemini reads named workspace files without a
+3. The user has explicitly authorized broad unattended execution in a suitably
+   isolated environment, and the managed call uses `--authority full`.
+4. The task is restructured so Gemini reads named workspace files without a
    terminal, or another provider with suitable per-invocation permissions is
    used.
 
@@ -91,9 +93,10 @@ Rules use token-prefix matching, and Deny takes precedence over Ask, which
 takes precedence over Allow. A broad `command(*)` Ask rule therefore defeats a
 narrow command Allow rule. Tell the child the exact permitted command shapes;
 do not assume it will discover them. Audit each command's full semantics before
-allowing it. Do not add `--dangerously-skip-permissions` merely to make an
-unattended run proceed; it requires explicit authorization and an appropriately
-isolated environment.
+allowing it. Do not add `--dangerously-skip-permissions` directly merely to
+make an unattended run proceed. For an explicitly authorized managed run, use
+wrapper `--authority full`; it maps to that broad provider option and is not a
+workspace-only boundary. Read [the common authority contract](authority.md).
 
 Verify `agy --version` and `agy --help` before depending on exact mode or
 permission behavior. For experiments, isolate XDG config, data, cache, and
@@ -119,6 +122,15 @@ subagent --id gemini-flash-implementer --workstream issue-42 --fresh -- \
 subagent --id gemini-flash-implementer --workstream issue-42 --resume -- \
   agy -p "Fix the failing test" --model gemini-3.8-flash-high \
     --mode accept-edits
+```
+
+When commands are required and broad unattended authority has been explicitly
+authorized, put the decision on the wrapper:
+
+```sh
+subagent --id gemini-flash-reviewer --authority full -- \
+  agy -p "Inspect the current diff yourself and return concise findings" \
+    --model gemini-3.8-flash-high --mode plan
 ```
 
 The execution mode is part of the command profile. Do not add or change it on
@@ -151,7 +163,8 @@ history is conservatively unavailable. Keep the logical ID tied to the model
 family/alias and durable role (`gemini-flash-reviewer`), not to the execution
 CLI (`agy-reviewer`).
 
-Treat the result as evidence, not acceptance. A zero exit status or terminal
-`SUCCESS` confirms provider-protocol completion, not that a requested edit or
-other side effect happened. Inspect the expected diff or artifact, account for
-permission denials, and rerun proportionate verification independently.
+Treat the result as evidence, not acceptance. A terminal `SUCCESS` with denied
+actions and an empty response is a managed failure even if `agy` exits zero;
+the wrapper returns 125 without dumping raw transport by default. Never make
+the parent read or inline the diff as a permission workaround. Inspect the
+expected diff or artifact and rerun proportionate verification independently.

@@ -12,6 +12,7 @@ use std::process::ExitCode;
 
 mod agent_cmd;
 mod antigravity_json;
+mod authority;
 mod capsule;
 mod child;
 mod codex_json;
@@ -78,6 +79,7 @@ RUN OPTIONS:
     --context pair|supervisor|all|none
     --context-mode required|best-effort
     --context-delivery pointer|inline
+    --authority inherit|full       Child execution authority (default inherit)
     --summarizer deterministic|haiku|luna|none
     --summarize-above-bytes BYTES  Model summary threshold (default 16384)
     --max-context-bytes BYTES

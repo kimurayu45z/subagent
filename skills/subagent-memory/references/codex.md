@@ -21,6 +21,10 @@ Use `codex exec` for non-interactive work. Match filesystem authority to the
 task and do not use dangerous approval or sandbox bypasses merely to avoid
 designing permissions.
 
+For a managed run that has explicit authorization for broad unattended
+execution, use wrapper `--authority full` rather than passing a raw bypass
+flag. Read [the common authority contract](authority.md).
+
 Read-only example:
 
 ```sh
@@ -75,8 +79,9 @@ The managed task must be immediately after `exec`, after an explicit `--`, or
 on stdin. Do not combine a workstream with `--ephemeral`. The wrapper adds
 `--json`, observes and verifies `thread.started`, and normally renders the last
 completed agent message after Codex exits. If the caller explicitly requests
-`--json`, raw JSONL remains on stdout. Observation errors preserve the child
-exit status and captured output but do not establish resumable continuity.
+`--json`, raw JSONL remains on stdout. Observation errors preserve a nonzero
+child exit, promote exit-zero protocol failure to wrapper exit 125, keep raw
+transport off normal stdout, and do not establish resumable continuity.
 
 The installed `codex exec resume` grammar may omit flags accepted by fresh
 `exec`. The adapter keeps known fresh-only launch settings such as sandbox,

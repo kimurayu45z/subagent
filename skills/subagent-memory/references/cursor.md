@@ -23,6 +23,10 @@ a headless prompt; it broadly allows commands unless explicitly denied.
 known workspace has not been trusted, headless execution can exit before a
 model turn and ask for an interactive trust decision or explicit `--trust`.
 
+For a managed run with explicit broad unattended authorization, use wrapper
+`--authority full` instead of passing `--force`/`--yolo` directly. Read
+[the common authority contract](authority.md).
+
 Cursor accepts `CURSOR_API_KEY`. Do not put API keys or sensitive headers in
 argv, reports, logs, or delegation prompts.
 
