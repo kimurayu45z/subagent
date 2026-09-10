@@ -22,6 +22,10 @@ child's permissions within the user's stated scope. For isolated experiments,
 use isolated XDG directories and an explicit restrictive configuration rather
 than modifying the user's normal OpenCode state.
 
+For a managed run with explicit broad unattended authorization, use wrapper
+`--authority full` instead of passing `--auto` directly. Read
+[the common authority contract](authority.md).
+
 ## Native session continuity
 
 Direct OpenCode resume selects an exact session with `--session SESSION_ID`.

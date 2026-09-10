@@ -18,6 +18,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use serde::Serialize;
 
+use super::authority::AuthorityProfile;
 use super::id::SubagentId;
 use super::report::{OsStringJson, Report, ReportStatus, write_json_atomic};
 use super::state_dir;
@@ -186,6 +187,11 @@ struct RunArgs {
     #[arg(long = "context-delivery", value_enum)]
     context_delivery: Option<ContextDelivery>,
 
+    /// Provider-neutral unattended authority. `full` maps to the provider's
+    /// broad native bypass and is not workspace confinement.
+    #[arg(long, value_enum)]
+    authority: Option<AuthorityProfile>,
+
     #[arg(long)]
     summarizer: Option<String>,
 
@@ -261,6 +267,7 @@ struct RunPlan {
     context: ContextScope,
     context_mode: ContextMode,
     context_delivery: ContextDelivery,
+    authority: AuthorityProfile,
     summarizer: SummarizerChoice,
     summarize_above_bytes: u64,
     max_context_bytes: Option<u64>,
@@ -283,6 +290,7 @@ struct RunPlanReport {
     context: ContextScope,
     context_mode: ContextMode,
     context_delivery: ContextDelivery,
+    authority: AuthorityProfile,
     summarizer: SummarizerChoice,
     summarize_above_bytes: u64,
     max_context_bytes: Option<u64>,
@@ -306,6 +314,7 @@ impl From<&RunPlan> for RunPlanReport {
             context: plan.context,
             context_mode: plan.context_mode,
             context_delivery: plan.context_delivery,
+            authority: plan.authority,
             summarizer: plan.summarizer.clone(),
             summarize_above_bytes: plan.summarize_above_bytes,
             max_context_bytes: plan.max_context_bytes,
@@ -519,6 +528,35 @@ fn execute_with_env(
         return wrapper_error_exit();
     }
     let passthrough: bool = run_args.no_record && context == ContextScope::None;
+    let authority: AuthorityProfile = run_args.authority.unwrap_or_default();
+    if passthrough && authority != AuthorityProfile::Inherit {
+        let _ = writeln!(
+            err,
+            "subagent: --authority full requires managed execution; passthrough preserves the caller's child argv unchanged"
+        );
+        return wrapper_error_exit();
+    }
+    let caller_child_args: &[OsString] = &child_tokens[1..];
+    let effective_child_args: Vec<OsString> =
+        match super::child::recognize_managed_child(&child_tokens[0], caller_child_args) {
+            Ok(kind) => {
+                if let Err(adapter_error) =
+                    super::child::validate_caller_authority_args(kind, caller_child_args)
+                {
+                    let _ = writeln!(err, "subagent: {adapter_error}");
+                    return wrapper_error_exit();
+                }
+                super::child::apply_authority_profile(kind, caller_child_args, authority)
+            }
+            Err(adapter_error) if authority == AuthorityProfile::Full => {
+                let _ = writeln!(
+                    err,
+                    "subagent: cannot apply --authority full: {adapter_error}"
+                );
+                return wrapper_error_exit();
+            }
+            Err(_adapter_error) => caller_child_args.to_vec(),
+        };
     if workstream.is_none() && !passthrough && super::child::is_cursor_program(&child_tokens[0]) {
         let cursor_kind: store::ChildKind =
             match super::child::recognize_managed_child(&child_tokens[0], &child_tokens[1..]) {
@@ -605,6 +643,7 @@ fn execute_with_env(
         context,
         context_mode: run_args.context_mode.unwrap_or(ContextMode::Required),
         context_delivery: run_args.context_delivery.unwrap_or_default(),
+        authority,
         summarizer,
         summarize_above_bytes,
         max_context_bytes: run_args.max_context_bytes,
@@ -613,7 +652,7 @@ fn execute_with_env(
         no_record: run_args.no_record,
         quiet: run_args.quiet,
         program: child_tokens[0].clone(),
-        args: child_tokens[1..].to_vec(),
+        args: effective_child_args,
         ensured_pair,
     };
 
@@ -694,6 +733,7 @@ fn execute_with_env(
                 context_scope: plan.context,
                 context_mode: plan.context_mode,
                 context_delivery: plan.context_delivery,
+                authority: plan.authority,
                 summarizer: &plan.summarizer,
                 summarize_above_bytes: plan.summarize_above_bytes,
                 max_context_bytes: plan.max_context_bytes,
@@ -826,6 +866,7 @@ fn print_human_plan(plan: &RunPlan, dry_run: bool, err: &mut dyn Write) {
     let _ = writeln!(err, "  context:           {}", plan.context);
     let _ = writeln!(err, "  context-mode:      {}", plan.context_mode);
     let _ = writeln!(err, "  context-delivery:  {}", plan.context_delivery);
+    let _ = writeln!(err, "  authority:         {}", plan.authority);
     let _ = writeln!(err, "  summarizer:        {}", plan.summarizer);
     let _ = writeln!(
         err,
@@ -1208,6 +1249,64 @@ mod tests {
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(!err.contains("backend not implemented"));
         assert!(err.contains("claude"));
+    }
+
+    #[test]
+    fn dry_run_reports_and_applies_full_authority() {
+        let args: Vec<OsString> = os(&[
+            "--id",
+            "gemini-flash-reviewer",
+            "--authority",
+            "full",
+            "--dry-run",
+            "--",
+            "agy",
+            "-p",
+            "review the current diff",
+            "--mode",
+            "plan",
+        ]);
+        let (code, _out, err) = run(&args, None);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.contains("authority:         full"));
+        assert!(err.contains("--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn broad_native_authority_requires_the_wrapper_profile() {
+        let args: Vec<OsString> = os(&[
+            "--id",
+            "gemini-flash-reviewer",
+            "--dry-run",
+            "--",
+            "agy",
+            "-p",
+            "review",
+            "--dangerously-skip-permissions",
+        ]);
+        let (code, _out, err) = run(&args, None);
+        assert_eq!(code, wrapper_error_exit());
+        assert!(err.contains("--authority full"));
+    }
+
+    #[test]
+    fn passthrough_rejects_wrapper_authority_instead_of_rewriting_child_argv() {
+        let args: Vec<OsString> = os(&[
+            "--memory",
+            "none",
+            "--context",
+            "none",
+            "--no-record",
+            "--authority",
+            "full",
+            "--",
+            "agy",
+            "-p",
+            "review",
+        ]);
+        let (code, _out, err) = run(&args, None);
+        assert_eq!(code, wrapper_error_exit());
+        assert!(err.contains("passthrough"));
     }
 
     #[test]

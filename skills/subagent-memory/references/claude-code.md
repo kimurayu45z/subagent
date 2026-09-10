@@ -125,6 +125,9 @@ Never use `--dangerously-skip-permissions` merely to avoid designing
 permissions. It requires explicit authorization in an appropriately isolated
 environment, with explicit deny rules retained where useful.
 
+For a managed run with that authorization, select wrapper `--authority full`
+instead of passing the raw flag. Read [the common authority contract](authority.md).
+
 ## Decide whether to load customization
 
 Normal `claude -p` loads trusted user/project customization. `--bare` improves

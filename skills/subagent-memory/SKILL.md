@@ -14,14 +14,18 @@ metadata:
 - Protect the parent's context budget: do not fully explore work that a child
   will explore again. Give bounded pointers and require a compact result, not a
   transcript.
-- One-off task: invoke the provider CLI directly by default. Use `subagent`
-  only when the user explicitly needs a durable audit/context trail or prior
-  role history materially affects the task.
+- One-off task: invoke the provider CLI directly when its permission preflight
+  and exit/result semantics are reliable. Use `subagent` when command-dependent
+  headless work needs the common authority and no-usable-output contract, or
+  when the user needs a durable audit/context trail or prior role history.
 - Recurring role or cross-provider history: use `subagent`.
 - Intentional continuation of one child session: use `--workstream` with
   exactly one of `--fresh` or `--resume`.
 - Before relying on memory, history discovery, resume, or summarization: run
   `subagent doctor` and require the relevant capability to be implemented.
+- Before command-dependent headless work, choose authority deliberately. Keep
+  the default `--authority inherit`; use `--authority full` only with explicit
+  user authorization in an appropriately isolated environment.
 - Parallel work on independent Git changes: use a separate Git worktree per
   writer; read [worktree coordination](references/worktrees.md).
 - Asking about this skill itself: explain, review, or edit it directly. Do not
@@ -51,6 +55,14 @@ Delegation never expands the user's authority. The parent remains responsible
 for reviewing changes, running proportionate verification, and deciding what
 to accept.
 
+For managed runs, do not pass provider-specific broad bypass flags directly.
+Use the common `--authority full` boundary when authorized; it is broad
+provider authority, not workspace confinement, and becomes part of native
+session compatibility. An exit-zero child with no usable result is a failed
+delegation. Do not compensate by reading, serializing, summarizing, or inlining
+a large workspace diff in the parent prompt. Adjust child authority, narrow the
+task, or use another provider.
+
 Read only the reference needed for the chosen provider:
 
 - [Codex execution](references/codex.md)
@@ -62,6 +74,8 @@ Read only the reference needed for the chosen provider:
 For terminology or feature gates, read
 [concepts](references/concepts.md) or
 [capabilities](references/capabilities.md) only when those details matter.
+For command-dependent headless work, read
+[authority and managed results](references/authority.md).
 For task partitioning, model escalation, and parent-context budgeting, read
 [efficient delegation](references/efficient-delegation.md).
 

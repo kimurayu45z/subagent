@@ -592,6 +592,146 @@ fn managed_antigravity_uses_stream_json_and_resumes_the_exact_conversation() {
 
 #[cfg(unix)]
 #[test]
+fn full_authority_is_explicitly_mapped_to_antigravity() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let agy_path: PathBuf = workspace.path().join("agy");
+    let conversation_id: &str = "849c7c61-7baf-4c6b-8767-5704603f08ff";
+    fs::write(
+        &agy_path,
+        "#!/bin/sh\n\
+         cat >/dev/null\n\
+         test \"$1\" = --model || exit 70\n\
+         test \"$2\" = gemini-3.8-flash-high || exit 71\n\
+         test \"$3\" = --dangerously-skip-permissions || exit 72\n\
+         test \"$4\" = --print= || exit 73\n\
+         test \"$5\" = --input-format || exit 74\n\
+         test \"$6\" = stream-json || exit 75\n\
+         test \"$7\" = --output-format || exit 76\n\
+         test \"$8\" = stream-json || exit 77\n\
+         test -z \"$9\" || exit 78\n\
+         printf '{\"event\":\"init\",\"conversation_id\":\"%s\"}\\n' \"$CONVERSATION_ID\"\n\
+         printf '{\"event\":\"result\",\"result\":{\"conversation_id\":\"%s\",\"status\":\"SUCCESS\",\"response\":\"reviewed\\\\n\"}}\\n' \"$CONVERSATION_ID\"\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&agy_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&agy_path, permissions).unwrap();
+
+    subagent_with_clean_supervisor_env(state_dir.path())
+        .current_dir(workspace.path())
+        .env("CONVERSATION_ID", conversation_id)
+        .args([
+            "--id",
+            "gemini-flash-reviewer",
+            "--supervisor",
+            "codex:contract-test-thread",
+            "--context",
+            "pair",
+            "--authority",
+            "full",
+            "--quiet",
+            "--",
+        ])
+        .arg(&agy_path)
+        .args([
+            "-p",
+            "review the current diff",
+            "--model",
+            "gemini-3.8-flash-high",
+        ])
+        .assert()
+        .success()
+        .stdout("reviewed\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn antigravity_exit_zero_permission_denial_is_a_concise_wrapper_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let agy_path: PathBuf = workspace.path().join("agy");
+    let conversation_id: &str = "b6164706-4202-4d5f-9f70-5687c96023d6";
+    fs::write(
+        &agy_path,
+        "#!/bin/sh\n\
+         cat >/dev/null\n\
+         printf '{\"event\":\"init\",\"conversation_id\":\"%s\"}\\n' \"$CONVERSATION_ID\"\n\
+         printf '{\"event\":\"result\",\"result\":{\"conversation_id\":\"%s\",\"status\":\"SUCCESS\",\"response\":\"\",\"denied_actions\":[{\"action\":\"command\",\"display_name\":\"RunCommand\"}]}}\\n' \"$CONVERSATION_ID\"\n\
+         exit 0\n",
+    )
+    .unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&agy_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&agy_path, permissions).unwrap();
+
+    subagent_with_clean_supervisor_env(state_dir.path())
+        .current_dir(workspace.path())
+        .env("CONVERSATION_ID", conversation_id)
+        .args([
+            "--id",
+            "gemini-flash-reviewer",
+            "--supervisor",
+            "codex:contract-test-thread",
+            "--context",
+            "pair",
+            "--quiet",
+            "--",
+        ])
+        .arg(&agy_path)
+        .args([
+            "-p",
+            "review the current diff",
+            "--model",
+            "gemini-3.8-flash-high",
+        ])
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stdout(predicate::str::is_empty())
+        .stderr(
+            predicate::str::contains("headless tool permission")
+                .and(predicate::str::contains("--authority full"))
+                .and(predicate::str::contains("Do not read, materialize")),
+        );
+}
+
+#[cfg(unix)]
+#[test]
+fn any_managed_child_exit_zero_without_output_is_not_success() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir: tempfile::TempDir = isolated_state_dir();
+    let workspace: tempfile::TempDir = isolated_state_dir();
+    let claude_path: PathBuf = workspace.path().join("claude");
+    fs::write(&claude_path, "#!/bin/sh\ncat >/dev/null\nexit 0\n").unwrap();
+    let mut permissions: fs::Permissions = fs::metadata(&claude_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&claude_path, permissions).unwrap();
+
+    subagent_with_resolvable_supervisor(state_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--id",
+            "claude-sonnet-reviewer",
+            "--context",
+            "pair",
+            "--quiet",
+            "--",
+        ])
+        .arg(&claude_path)
+        .args(["-p", "review the current diff"])
+        .assert()
+        .code(WRAPPER_ERROR_EXIT)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("without a usable response"));
+}
+
+#[cfg(unix)]
+#[test]
 fn managed_cursor_composes_context_and_resumes_the_exact_session() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -759,7 +899,8 @@ fn managed_opencode_conflicting_resume_invalidates_the_stored_session() {
     assert_eq!(fresh.stdout, b"FRESH_OK\n");
 
     let conflicting: std::process::Output = run("--resume");
-    assert!(conflicting.status.success());
+    assert_eq!(conflicting.status.code(), Some(WRAPPER_ERROR_EXIT));
+    assert!(conflicting.stdout.is_empty());
     assert!(
         String::from_utf8_lossy(&conflicting.stderr).contains("conflicting top-level sessionIDs")
     );
@@ -782,7 +923,7 @@ fn managed_opencode_conflicting_resume_invalidates_the_stored_session() {
 
 #[cfg(unix)]
 #[test]
-fn managed_codex_preserves_caller_json_and_child_exit_on_observation_failure() {
+fn managed_codex_preserves_explicit_raw_json_and_fails_closed_on_invalid_results() {
     use std::os::unix::fs::PermissionsExt;
 
     let state_dir: tempfile::TempDir = isolated_state_dir();
@@ -841,15 +982,15 @@ fn managed_codex_preserves_caller_json_and_child_exit_on_observation_failure() {
     base("malformed", "malformed-task")
         .assert()
         .code(42)
-        .stdout("not-json\n")
+        .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains(
             "could not confirm Codex native continuity",
         ));
 
     base("malformed-success", "malformed-success")
         .assert()
-        .success()
-        .stdout("still-not-json\n")
+        .code(WRAPPER_ERROR_EXIT)
+        .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains(
             "could not confirm Codex native continuity",
         ));
@@ -923,8 +1064,8 @@ fn managed_codex_resume_invalidates_a_mismatched_native_thread() {
     assert_eq!(fresh.stdout, b"FRESH_OK\n");
 
     let resumed: std::process::Output = run("--resume", "second");
-    assert!(resumed.status.success());
-    assert!(String::from_utf8_lossy(&resumed.stdout).contains(mismatched_thread));
+    assert_eq!(resumed.status.code(), Some(WRAPPER_ERROR_EXIT));
+    assert!(resumed.stdout.is_empty());
     assert!(String::from_utf8_lossy(&resumed.stderr).contains("requires"));
 
     let connection: rusqlite::Connection =

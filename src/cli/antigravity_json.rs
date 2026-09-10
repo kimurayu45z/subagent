@@ -30,6 +30,7 @@ pub(crate) enum ProtocolError {
     UnsuccessfulResult(String),
     MissingResponse,
     EmptyResponse,
+    PermissionDenied(Vec<String>),
 }
 
 impl fmt::Display for ProtocolError {
@@ -75,11 +76,28 @@ impl fmt::Display for ProtocolError {
             ProtocolError::EmptyResponse => {
                 formatter.write_str("Antigravity terminal result response was empty")
             }
+            ProtocolError::PermissionDenied(actions) => write!(
+                formatter,
+                "Antigravity headless tool permission was denied ({})",
+                actions.join(", ")
+            ),
         }
     }
 }
 
 impl std::error::Error for ProtocolError {}
+
+impl ProtocolError {
+    pub(crate) fn indicates_permission_denial_or_no_output(&self) -> bool {
+        matches!(
+            self,
+            ProtocolError::MissingResult
+                | ProtocolError::MissingResponse
+                | ProtocolError::EmptyResponse
+                | ProtocolError::PermissionDenied(_)
+        )
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct InputEvent<'a> {
@@ -106,6 +124,13 @@ struct ResultEvent {
     conversation_id: Option<String>,
     status: Option<String>,
     response: Option<String>,
+    denied_actions: Option<Vec<DeniedAction>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeniedAction {
+    action: Option<String>,
+    display_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,8 +211,27 @@ pub(crate) fn observe(
     if status != "SUCCESS" {
         return Err(ProtocolError::UnsuccessfulResult(status));
     }
+    let denied_actions: Vec<DeniedAction> = result.denied_actions.unwrap_or_default();
+    let response_is_empty: bool = result
+        .response
+        .as_deref()
+        .map(str::trim)
+        .map(str::is_empty)
+        .unwrap_or(true);
+    if !denied_actions.is_empty() && response_is_empty {
+        let actions: Vec<String> = denied_actions
+            .into_iter()
+            .map(|denied: DeniedAction| {
+                denied
+                    .display_name
+                    .or(denied.action)
+                    .unwrap_or_else(|| "unknown tool".to_string())
+            })
+            .collect();
+        return Err(ProtocolError::PermissionDenied(actions));
+    }
     let response: String = result.response.ok_or(ProtocolError::MissingResponse)?;
-    if response.is_empty() {
+    if response.trim().is_empty() {
         return Err(ProtocolError::EmptyResponse);
     }
     Ok(Observation {
@@ -271,5 +315,23 @@ mod tests {
         assert!(!is_valid_conversation_id(
             "0222067a9e424b76964966b84fd6bb26"
         ));
+    }
+
+    #[test]
+    fn rejects_exit_zero_style_success_with_denied_action_and_no_response() {
+        let output: String = format!(
+            "{{\"event\":\"init\",\"conversation_id\":\"{ID}\"}}\n\
+             {{\"event\":\"result\",\"result\":{{\"conversation_id\":\"{ID}\",\"status\":\"SUCCESS\",\"response\":\"   \",\"denied_actions\":[{{\"action\":\"command\",\"display_name\":\"RunCommand\"}}]}}}}\n"
+        );
+        assert_eq!(
+            observe(output.as_bytes(), false, None),
+            Err(ProtocolError::PermissionDenied(vec![
+                "RunCommand".to_string()
+            ]))
+        );
+        assert!(
+            ProtocolError::PermissionDenied(vec!["RunCommand".to_string()])
+                .indicates_permission_denial_or_no_output()
+        );
     }
 }

@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use super::antigravity_json;
+use super::authority::AuthorityProfile;
 use super::capsule::{self, Capsule, CapsuleRequest, InheritedHistory};
 use super::child::{
     self, AntigravitySessionMode, ClaudeSessionMode, CodexSessionMode, CommandProfile,
@@ -57,6 +58,7 @@ pub(crate) struct ManagedRunRequest<'a> {
     pub context_scope: ContextScope,
     pub context_mode: ContextMode,
     pub context_delivery: ContextDelivery,
+    pub authority: AuthorityProfile,
     pub summarizer: &'a SummarizerChoice,
     pub summarize_above_bytes: u64,
     pub max_context_bytes: Option<u64>,
@@ -240,6 +242,7 @@ pub(crate) fn execute(
     let provenance: String = context_provenance(
         request.context_scope,
         request.context_delivery,
+        request.authority,
         request.native_continuity,
         request.workstream,
         &supervisor_history,
@@ -512,6 +515,26 @@ pub(crate) fn execute(
     };
 
     report_forwarding_errors(&outcome, err);
+    if child_exit_succeeded(outcome.exit)
+        && !observed_transport
+        && !has_usable_output(&outcome.stdout_capture)
+    {
+        let _ = writeln!(
+            err,
+            "subagent: managed child exited 0 without a usable response; a headless permission denial or incomplete run is not success. Grant only intended authority with --authority, or choose another provider. Do not read, materialize, or inline workspace artifacts in the parent prompt as a fallback."
+        );
+        outcome.exit = managed_result_failure_exit(outcome.exit);
+        outcome.stdout_capture = b"[managed child produced no usable response]".to_vec();
+        return complete_and_return(
+            &mut ledger,
+            &begun.invocation_id,
+            outcome,
+            None,
+            pair,
+            err,
+            request.forward_signals,
+        );
+    }
     let mut native_session_confirmed: bool = child_exit_succeeded(outcome.exit);
     if tracked_codex {
         let expected_thread_id: Option<&str> =
@@ -544,18 +567,9 @@ pub(crate) fn execute(
                         ChildSessionRetirement::ProviderRejected,
                     );
                 }
-                if !caller_requested_codex_json
-                    && let Err(error) = out
-                        .write_all(&outcome.stdout_capture)
-                        .and_then(|()| out.flush())
-                {
-                    let _ = writeln!(
-                        err,
-                        "subagent: warning: fallback Codex stdout forwarding failed: {error}"
-                    );
-                }
                 let diagnostic: String =
                     format!("[Codex continuity unconfirmed: {protocol_error}]");
+                outcome.exit = managed_result_failure_exit(outcome.exit);
                 outcome.stdout_capture = diagnostic.into_bytes();
                 return complete_and_return(
                     &mut ledger,
@@ -669,18 +683,9 @@ pub(crate) fn execute(
                         ChildSessionRetirement::ProviderRejected,
                     );
                 }
-                if !caller_requested_opencode_json
-                    && let Err(error) = out
-                        .write_all(&outcome.stdout_capture)
-                        .and_then(|()| out.flush())
-                {
-                    let _ = writeln!(
-                        err,
-                        "subagent: warning: fallback OpenCode stdout forwarding failed: {error}"
-                    );
-                }
                 let diagnostic: String =
                     format!("[OpenCode continuity unconfirmed: {protocol_error}]");
+                outcome.exit = managed_result_failure_exit(outcome.exit);
                 outcome.stdout_capture = diagnostic.into_bytes();
                 return complete_and_return(
                     &mut ledger,
@@ -778,10 +783,7 @@ pub(crate) fn execute(
         ) {
             Ok(observation) => observation,
             Err(protocol_error) => {
-                let _ = writeln!(
-                    err,
-                    "subagent: warning: could not confirm Antigravity result or native continuity: {protocol_error}"
-                );
+                report_antigravity_result_failure(&protocol_error, err);
                 if matches!(
                     protocol_error,
                     antigravity_json::ProtocolError::ConversationIdMismatch { .. }
@@ -794,18 +796,9 @@ pub(crate) fn execute(
                         ChildSessionRetirement::ProviderRejected,
                     );
                 }
-                if !caller_requested_antigravity_json
-                    && let Err(error) = out
-                        .write_all(&outcome.stdout_capture)
-                        .and_then(|()| out.flush())
-                {
-                    let _ = writeln!(
-                        err,
-                        "subagent: warning: fallback Antigravity stdout forwarding failed: {error}"
-                    );
-                }
                 let diagnostic: String =
                     format!("[Antigravity result unconfirmed: {protocol_error}]");
+                outcome.exit = managed_result_failure_exit(outcome.exit);
                 outcome.stdout_capture = diagnostic.into_bytes();
                 return complete_and_return(
                     &mut ledger,
@@ -907,17 +900,8 @@ pub(crate) fn execute(
                         ChildSessionRetirement::ProviderRejected,
                     );
                 }
-                if !caller_requested_cursor_json
-                    && let Err(error) = out
-                        .write_all(&outcome.stdout_capture)
-                        .and_then(|()| out.flush())
-                {
-                    let _ = writeln!(
-                        err,
-                        "subagent: warning: fallback Cursor stdout forwarding failed: {error}"
-                    );
-                }
                 let diagnostic: String = format!("[Cursor result unconfirmed: {protocol_error}]");
+                outcome.exit = managed_result_failure_exit(outcome.exit);
                 outcome.stdout_capture = diagnostic.into_bytes();
                 return complete_and_return(
                     &mut ledger,
@@ -1155,6 +1139,8 @@ fn execute_unrecorded(
             env_removals: Vec::new(),
             max_capture_bytes: if managed_antigravity || managed_cursor {
                 MAX_PROVIDER_JSON_TRANSPORT_BYTES
+            } else if request.context_scope != ContextScope::None && child_kind.is_some() {
+                MAX_RECORDED_RESPONSE_BYTES
             } else {
                 0
             },
@@ -1176,6 +1162,20 @@ fn execute_unrecorded(
     match result {
         Ok(outcome) => {
             report_forwarding_errors(&outcome, err);
+            let managed_child: bool =
+                request.context_scope != ContextScope::None && child_kind.is_some();
+            if managed_child
+                && child_exit_succeeded(outcome.exit)
+                && !managed_antigravity
+                && !managed_cursor
+                && !has_usable_output(&outcome.stdout_capture)
+            {
+                let _ = writeln!(
+                    err,
+                    "subagent: managed child exited 0 without a usable response; a headless permission denial or incomplete run is not success. Grant only intended authority with --authority, or choose another provider. Do not read, materialize, or inline workspace artifacts in the parent prompt as a fallback."
+                );
+                return wrapper_error_exit();
+            }
             if managed_antigravity {
                 let observation: antigravity_json::Observation = match antigravity_json::observe(
                     &outcome.stdout_capture,
@@ -1184,14 +1184,8 @@ fn execute_unrecorded(
                 ) {
                     Ok(observation) => observation,
                     Err(protocol_error) => {
-                        let _ = writeln!(
-                            err,
-                            "subagent: could not confirm Antigravity result: {protocol_error}"
-                        );
-                        if !caller_requested_raw {
-                            let _ = out.write_all(&outcome.stdout_capture);
-                        }
-                        return child_exit_code(outcome.exit);
+                        report_antigravity_result_failure(&protocol_error, err);
+                        return managed_result_failure_code(outcome.exit);
                     }
                 };
                 if !caller_requested_raw {
@@ -1214,10 +1208,7 @@ fn execute_unrecorded(
                             err,
                             "subagent: could not confirm Cursor result: {protocol_error}"
                         );
-                        if !caller_requested_raw {
-                            let _ = out.write_all(&outcome.stdout_capture);
-                        }
-                        return child_exit_code(outcome.exit);
+                        return managed_result_failure_code(outcome.exit);
                     }
                 };
                 if !caller_requested_raw {
@@ -1436,6 +1427,7 @@ fn prepare_cursor_prompt(
 fn context_provenance(
     scope: ContextScope,
     delivery: ContextDelivery,
+    authority: AuthorityProfile,
     native_continuity: NativeContinuity,
     workstream: Option<&WorkstreamId>,
     supervisor_history: &SupervisorHistory,
@@ -1454,7 +1446,7 @@ fn context_provenance(
         .map(|id: &WorkstreamId| format!("\"{}\"", id.as_str()))
         .unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"pair\":\"{pair}\",\"supervisor\":\"{supervisor}\",\"delivery\":\"{delivery}\",\"native_continuity\":\"{native_continuity}\",\"workstream\":{workstream_json}}}"
+        "{{\"pair\":\"{pair}\",\"supervisor\":\"{supervisor}\",\"delivery\":\"{delivery}\",\"authority\":\"{authority}\",\"native_continuity\":\"{native_continuity}\",\"workstream\":{workstream_json}}}"
     )
 }
 
@@ -1501,6 +1493,35 @@ pub(crate) fn resolve_resume_session(
 
 fn child_exit_succeeded(exit: ChildExit) -> bool {
     matches!(exit, ChildExit::Exited(0))
+}
+
+fn has_usable_output(output: &[u8]) -> bool {
+    output.iter().any(|byte: &u8| !byte.is_ascii_whitespace())
+}
+
+fn managed_result_failure_exit(exit: ChildExit) -> ChildExit {
+    if child_exit_succeeded(exit) {
+        ChildExit::Exited(i32::from(super::WRAPPER_ERROR_EXIT))
+    } else {
+        exit
+    }
+}
+
+fn managed_result_failure_code(exit: ChildExit) -> ExitCode {
+    child_exit_code(managed_result_failure_exit(exit))
+}
+
+fn report_antigravity_result_failure(error: &antigravity_json::ProtocolError, err: &mut dyn Write) {
+    let _ = writeln!(
+        err,
+        "subagent: could not confirm Antigravity result: {error}"
+    );
+    if error.indicates_permission_denial_or_no_output() {
+        let _ = writeln!(
+            err,
+            "subagent: headless tool permission may have been denied. Re-run with --authority full only when the user granted provider-wide tool authority; Antigravity does not confine that bypass to the workspace. Do not read, materialize, summarize, or inline the diff in the parent prompt."
+        );
+    }
 }
 
 fn report_forwarding_errors(outcome: &ChildOutcome, err: &mut dyn Write) {

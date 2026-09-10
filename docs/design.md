@@ -329,6 +329,7 @@ mode and do not receive managed session behavior.
 --context pair|supervisor|all|none
 --context-mode required|best-effort
 --context-delivery pointer|inline
+--authority inherit|full
 --summarizer deterministic|haiku|luna|none
 --summarize-above-bytes BYTES
 --max-context-bytes BYTES
@@ -348,6 +349,7 @@ Defaults are:
 - best-effort supervisor transcript enrichment, reported as `unavailable` when
   it cannot be read;
 - `--context-delivery pointer`;
+- `--authority inherit`;
 - deterministic summarization;
 - a 16 KiB model-summarization threshold when an opt-in model alias is selected;
 - no model process for history below that threshold; and
@@ -394,6 +396,44 @@ For each managed run, `subagent` performs the following sequence:
     `active`.
 13. Record the final response, exit state, duration, context provenance, and
     child runtime handle in one completion transaction.
+
+### 7.1 Provider-neutral execution authority
+
+Managed execution represents unattended authority as a wrapper-owned profile,
+not as provider-specific flags hidden in child argv:
+
+| Profile | Meaning |
+| --- | --- |
+| `inherit` | Preserve the provider's configured permission behavior. |
+| `full` | Use the provider's broad non-interactive bypass after explicit user authorization. |
+
+`full` maps to Codex `--dangerously-bypass-approvals-and-sandbox`, Claude Code
+and Antigravity `--dangerously-skip-permissions`, Cursor `--force`, and OpenCode
+`--auto`. These are provider-wide capabilities, not a workspace-only sandbox.
+The wrapper does not imply that `plan`, `accept-edits`, trust, or a role name
+narrows those capabilities.
+
+Managed callers cannot pass the mapped broad flags directly. They select
+`--authority full`, making the decision visible in dry-run output, reports,
+provenance, and the effective command profile. Changing authority therefore
+requires a fresh native workstream. Explicit passthrough mode owns its argv and
+cannot combine with a wrapper authority override.
+
+### 7.2 Managed result contract
+
+Provider exit zero is necessary but not sufficient for managed success. A
+non-structured child must return usable stdout. A structured child must satisfy
+its adapter protocol and return a usable final response; permission-denied,
+empty, malformed, mismatched-session, truncated, or incomplete results fail the
+wrapper. When the provider itself returned zero, the wrapper exits 125. A real
+nonzero provider exit is preserved.
+
+On a structured protocol failure, bounded raw transport is retained for local
+diagnosis and recording but is not copied to the parent's stdout unless raw
+structured output was explicitly requested. Diagnostics identify the failure
+class and corrective boundary. The parent must not compensate by reading,
+materializing, summarizing, or inlining large workspace state such as a Git diff
+into another child prompt.
 
 The current request is already part of the child prompt and must not be injected
 again through pair history. For future invocations, the exchange ledger stores
@@ -789,7 +829,8 @@ When the wrapper owns `--json`, stdout is buffered until the child finishes and
 the last agent message is rendered with one trailing newline. Caller-owned
 `--json` remains raw JSONL. Malformed, non-UTF-8, conflicting, truncated, or
 missing-thread transport emits a warning and cannot establish a live session;
-captured output and the child's exit status are preserved. A resumed native ID
+the wrapper preserves a nonzero child exit and promotes an exit-zero protocol
+failure to exit 125 without copying raw transport to normal stdout. A resumed native ID
 mismatch invalidates that session as `provider_rejected`. `CODEX_THREAD_ID`,
 `CLAUDE_CODE_SESSION_ID`, and `SUBAGENT_SELF_REF` are removed from the tracked
 Codex child's environment so inherited supervisor identity cannot alter child
@@ -830,7 +871,8 @@ invalidates the stored row on mismatch; it never uses `--continue` or recency.
 When the wrapper owns JSON output, it joins text events in order and restores a
 trailing newline. Caller-owned `--format json` preserves raw JSONL. Malformed,
 non-UTF-8, conflicting, truncated, incomplete, or missing-session output cannot
-confirm continuity, while the child exit status remains authoritative.
+confirm continuity. The wrapper preserves a nonzero child exit and promotes an
+exit-zero protocol failure to exit 125.
 Tracked OpenCode removes inherited `CODEX_THREAD_ID`,
 `CLAUDE_CODE_SESSION_ID`, and `SUBAGENT_SELF_REF` before spawn so a supervisor
 identity cannot alter child selection.
@@ -841,9 +883,11 @@ The MVP recognizes executable basenames `agy` and `antigravity` in print mode.
 The complete UTF-8 task must be one quoted token immediately after
 `-p`/`--print`/`--prompt`; managed execution rejects ambiguous placement,
 caller `--conversation`, `--continue`/`-c`, interactive modes, caller input
-formats, and output formats other than `stream-json`. The wrapper never injects
-`--dangerously-skip-permissions`; provider tool permission remains within the
-caller's authorization boundary.
+formats, and output formats other than `stream-json`. The wrapper injects
+`--dangerously-skip-permissions` only when the caller explicitly selects the
+provider-neutral `--authority full` profile. Managed callers cannot smuggle the
+raw flag through child argv. This is broad provider-wide authority, not
+workspace confinement.
 
 Headless print transport does not grant file or command authority. The caller
 must select an installed Antigravity execution mode consistent with the task's
@@ -857,8 +901,9 @@ Antigravity terminal permission is independent of its file-edit execution
 mode. Unconfigured commands default to Ask, including read-only commands, and
 are soft-denied in headless mode. Before dispatching command-dependent work,
 the caller must establish narrow effective `permissions.allow` rules, rely on
-an already-configured sandbox with `proceed-in-sandbox`, restructure the task
-to use workspace file tools without a terminal, or select another provider.
+an already-configured sandbox with `proceed-in-sandbox`, explicitly authorize
+`--authority full` in a suitably isolated environment, restructure the task to
+use workspace file tools without a terminal, or select another provider.
 The wrapper does not mutate persistent Antigravity permission settings and
 does not infer terminal authority from `--mode accept-edits`. A headless
 `/permissions` response is not treated as an effective-rule inventory.
@@ -872,7 +917,10 @@ stdin. Structured serialization, never string interpolation, protects the
 event boundary. Output capture is bounded to 32 MiB. Unknown events and fields
 are tolerated, while known `init`, `step_update`, and terminal `result`
 conversation IDs must be valid, consistent UUIDs. Exactly one terminal result
-with status `SUCCESS` and a non-empty response is required.
+with status `SUCCESS` and a non-empty response is required. A terminal success
+with denied actions and no response is a managed permission failure even when
+Antigravity exits zero; the wrapper returns 125 and emits only a concise
+diagnostic by default.
 
 A managed call without a workstream uses the transport but does not persist
 native continuity. Tracked fresh stores the provider-issued UUID only after
@@ -882,7 +930,8 @@ Default output is terminal response text with a trailing newline. Explicit
 caller `--output-format stream-json` preserves raw NDJSON, but persistence and
 activation still wait for terminal validation. A mismatch/conflict invalidates
 the stored resumed session as provider-rejected; other failures leave it
-unconfirmed and preserve the child exit status.
+unconfirmed. The wrapper preserves a nonzero child exit and promotes an
+exit-zero protocol failure to exit 125.
 
 ### 13.5 Cursor child
 
@@ -917,11 +966,12 @@ and starts `subagent` from that exact directory. Credential-bearing
 `--api-key` and `--header` argv are also rejected; use environment or provider
 configuration instead.
 
-The wrapper never injects `--force`/`--yolo`. `--auto-review`, permission
-configuration, sandbox mode, and an explicit caller force flag remain part of
-the caller's authorization choice; permission-affecting changes stay in the
-command profile. `--trust` is a per-workspace trust acknowledgement, not a
-blanket command grant, and is excluded from profile compatibility.
+The wrapper injects `--force` only for an explicit `--authority full` managed
+run and rejects caller-owned `--force`/`--yolo`. `--auto-review`, permission
+configuration, and sandbox mode remain part of the provider policy; authority
+changes stay in the command profile. `--trust` is a per-workspace trust
+acknowledgement, not a blanket command grant, and is excluded from profile
+compatibility.
 
 ### 13.6 Command profiles
 

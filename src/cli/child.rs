@@ -16,6 +16,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
+use super::authority::AuthorityProfile;
 use super::store::ChildKind;
 
 const COMMAND_DIGEST_DOMAIN: &[u8] = b"subagent.command.v1\n";
@@ -78,6 +79,7 @@ pub(crate) enum ChildAdapterError {
     CursorPromptPlacementAmbiguous,
     CursorOptionUnsupported(&'static str),
     CursorPromptNonUtf8,
+    ProviderAuthorityOptionUnsupported(&'static str),
 }
 
 impl fmt::Display for ChildAdapterError {
@@ -182,6 +184,12 @@ impl fmt::Display for ChildAdapterError {
                 "managed Cursor prompts and caller stdin must be valid UTF-8 because Cursor \
                  print mode does not consume the wrapper's stdin context bootstrap"
             ),
+            ChildAdapterError::ProviderAuthorityOptionUnsupported(flag) => write!(
+                f,
+                "provider authority option {flag} is not accepted in managed argv; use wrapper \
+                 --authority full so the broad grant is explicit and auditable, or use \
+                 --memory none --context none --no-record passthrough"
+            ),
         }
     }
 }
@@ -216,6 +224,72 @@ pub(crate) fn recognize_managed_child(
 pub(crate) fn is_cursor_program(program: &OsStr) -> bool {
     let basename: &OsStr = Path::new(program).file_name().unwrap_or(program);
     basename == OsStr::new("agent") || basename == OsStr::new("cursor-agent")
+}
+
+/// Rejects provider-native broad-authority flags from managed caller argv.
+/// The equivalent grant must be expressed through [`AuthorityProfile`] so it
+/// remains visible on wrapper plan/report surfaces and in profile hashing.
+pub(crate) fn validate_caller_authority_args(
+    kind: ChildKind,
+    args: &[OsString],
+) -> Result<(), ChildAdapterError> {
+    for (index, argument) in args.iter().enumerate() {
+        let name: Option<&str> = profile_excluded_option_name(argument.as_os_str());
+        let broad_option: Option<&'static str> = match (kind, name) {
+            (ChildKind::Codex, Some("--dangerously-bypass-approvals-and-sandbox")) => {
+                Some("--dangerously-bypass-approvals-and-sandbox")
+            }
+            (ChildKind::Claude, Some("--dangerously-skip-permissions")) => {
+                Some("--dangerously-skip-permissions")
+            }
+            (ChildKind::Claude, Some("--permission-mode"))
+                if option_value(args, index, "--permission-mode") == Some("bypassPermissions") =>
+            {
+                Some("--permission-mode bypassPermissions")
+            }
+            (ChildKind::Cursor, Some("--force" | "-f" | "--yolo")) => Some("--force/--yolo"),
+            (ChildKind::OpenCode, Some("--auto")) => Some("--auto"),
+            (ChildKind::Antigravity, Some("--dangerously-skip-permissions")) => {
+                Some("--dangerously-skip-permissions")
+            }
+            _ => None,
+        };
+        if let Some(flag) = broad_option {
+            return Err(ChildAdapterError::ProviderAuthorityOptionUnsupported(flag));
+        }
+    }
+    Ok(())
+}
+
+/// Applies the wrapper-owned provider-neutral authority profile to managed
+/// child argv. `full` deliberately maps to each provider's broadest unattended
+/// mode; it is not described as workspace confinement.
+pub(crate) fn apply_authority_profile(
+    kind: ChildKind,
+    caller_args: &[OsString],
+    authority: AuthorityProfile,
+) -> Vec<OsString> {
+    let mut effective_args: Vec<OsString> = caller_args.to_vec();
+    if authority == AuthorityProfile::Inherit {
+        return effective_args;
+    }
+    let flag: &'static str = match kind {
+        ChildKind::Codex => "--dangerously-bypass-approvals-and-sandbox",
+        ChildKind::Claude => "--dangerously-skip-permissions",
+        ChildKind::Cursor => "--force",
+        ChildKind::OpenCode => "--auto",
+        ChildKind::Antigravity => "--dangerously-skip-permissions",
+    };
+    effective_args.push(OsString::from(flag));
+    effective_args
+}
+
+fn option_value<'a>(args: &'a [OsString], index: usize, name: &str) -> Option<&'a str> {
+    let text: &str = args.get(index)?.to_str()?;
+    if let Some((option_name, value)) = text.split_once('=') {
+        return (option_name == name).then_some(value);
+    }
+    args.get(index.saturating_add(1))?.to_str()
 }
 
 /// Rejects Claude Code and OpenCode argv that require guessing where provider option values end
@@ -2336,6 +2410,93 @@ mod tests {
             ]),
         });
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn full_authority_maps_explicitly_for_every_managed_provider() {
+        let cases: [(ChildKind, Vec<OsString>, &str); 5] = [
+            (
+                ChildKind::Codex,
+                args(&["exec", "task"]),
+                "--dangerously-bypass-approvals-and-sandbox",
+            ),
+            (
+                ChildKind::Claude,
+                args(&["-p", "task"]),
+                "--dangerously-skip-permissions",
+            ),
+            (ChildKind::Cursor, args(&["-p", "task"]), "--force"),
+            (ChildKind::OpenCode, args(&["run", "task"]), "--auto"),
+            (
+                ChildKind::Antigravity,
+                args(&["-p", "task"]),
+                "--dangerously-skip-permissions",
+            ),
+        ];
+        for (kind, caller_args, expected_flag) in cases {
+            let inherited: Vec<OsString> =
+                apply_authority_profile(kind, &caller_args, AuthorityProfile::Inherit);
+            assert_eq!(inherited, caller_args);
+            let full: Vec<OsString> =
+                apply_authority_profile(kind, &caller_args, AuthorityProfile::Full);
+            assert_eq!(full.last(), Some(&OsString::from(expected_flag)));
+        }
+    }
+
+    #[test]
+    fn managed_callers_cannot_hide_broad_provider_authority_in_child_argv() {
+        let cases: [(ChildKind, Vec<OsString>); 6] = [
+            (
+                ChildKind::Codex,
+                args(&["exec", "task", "--dangerously-bypass-approvals-and-sandbox"]),
+            ),
+            (
+                ChildKind::Claude,
+                args(&["-p", "task", "--dangerously-skip-permissions"]),
+            ),
+            (
+                ChildKind::Claude,
+                args(&["-p", "task", "--permission-mode=bypassPermissions"]),
+            ),
+            (ChildKind::Cursor, args(&["-p", "task", "--yolo"])),
+            (ChildKind::OpenCode, args(&["run", "task", "--auto"])),
+            (
+                ChildKind::Antigravity,
+                args(&["-p", "task", "--dangerously-skip-permissions"]),
+            ),
+        ];
+        for (kind, caller_args) in cases {
+            assert!(matches!(
+                validate_caller_authority_args(kind, &caller_args),
+                Err(ChildAdapterError::ProviderAuthorityOptionUnsupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn full_authority_changes_native_session_profile() {
+        let workspace: &Path = Path::new("/workspace");
+        let caller_args: Vec<OsString> = args(&["-p", "task", "--model", "gemini-3.8-flash-high"]);
+        let inherited_args: Vec<OsString> = apply_authority_profile(
+            ChildKind::Antigravity,
+            &caller_args,
+            AuthorityProfile::Inherit,
+        );
+        let full_args: Vec<OsString> =
+            apply_authority_profile(ChildKind::Antigravity, &caller_args, AuthorityProfile::Full);
+        let inherited: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Antigravity,
+            program: OsStr::new("agy"),
+            working_directory: workspace,
+            args: &inherited_args,
+        });
+        let full: ProfileHash = command_profile_hash(&CommandProfile {
+            child_kind: ChildKind::Antigravity,
+            program: OsStr::new("agy"),
+            working_directory: workspace,
+            args: &full_args,
+        });
+        assert_ne!(inherited, full);
     }
 
     #[test]

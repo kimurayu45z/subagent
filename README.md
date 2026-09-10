@@ -37,8 +37,10 @@ The skill entrypoint starts by partitioning independent work and protecting the
 parent agent's context budget. It favors the least expensive capable model,
 dispatches ready independent assignments together, and asks children to return
 compact artifact indexes instead of transcripts. Use a provider CLI directly
-for a one-off task, use `subagent` for recurring-role or cross-provider history,
-and add `--workstream` only for one intentional native-session continuation.
+for a one-off only when its headless permission and result semantics are
+reliable; use `subagent` for the common authority/no-output contract,
+recurring-role or cross-provider history, and add `--workstream` only for one
+intentional native-session continuation.
 It does not launch a child when asked only to explain or review the skill.
 Detailed delegation strategy, concepts, capability gates, result reporting,
 provider arguments, and Git worktree coordination are loaded from separate
@@ -181,10 +183,10 @@ parallel work, create or select an external Git worktree first and run
 `--header`; use `CURSOR_API_KEY` or provider configuration so credentials do
 not enter argv/report surfaces.
 
-The wrapper never injects `--force`/`--yolo`. Prefer `--auto-review` with
-project-scoped Cursor permissions; use force only when the caller has explicitly
-accepted its broader command authority. `--trust` trusts only the current
-workspace and is not equivalent to force.
+Broad unattended authority is selected through the provider-neutral wrapper
+option `--authority full`, not by hiding provider bypass flags in child argv.
+`full` maps to Cursor `--force`; `--trust` trusts only the current workspace and
+is not equivalent to force.
 
 ### OpenCode argument safety
 
@@ -221,6 +223,43 @@ normally prints only the response. Prefer a logical ID such as
 Pair history records the task prompt and caller stdin, not provider launch flags.
 The exact child command remains correlatable through a digest without repeatedly
 injecting model and sandbox options into later context.
+
+### Headless authority and result safety
+
+Managed runs default to `--authority inherit`, which leaves provider permission
+policy unchanged. When the user has explicitly authorized broad unattended
+execution in an appropriately isolated workspace, select it once at the wrapper
+boundary:
+
+```sh
+subagent --id gemini-flash-reviewer --authority full -- \
+  agy -p "Inspect the current Git diff yourself and return concise findings" \
+    --model gemini-3.8-flash-high --mode plan
+```
+
+`--authority full` is deliberately provider-neutral but not workspace-confined:
+
+| Child | Effective provider option |
+| --- | --- |
+| `codex exec` | `--dangerously-bypass-approvals-and-sandbox` |
+| `claude -p` | `--dangerously-skip-permissions` |
+| `agent -p` / `cursor-agent -p` | `--force` |
+| `opencode run` | `--auto` |
+| `agy -p` | `--dangerously-skip-permissions` |
+
+Managed mode rejects these broad provider flags when supplied directly; use
+the wrapper option so the effective authority is visible in dry-runs, reports,
+and native-session compatibility checks. Explicit passthrough mode
+(`--memory none --context none --no-record`) remains caller-owned and cannot be
+combined with wrapper authority.
+
+A managed provider exit of zero is not success when it produces no usable
+result. Structured adapters also recognize protocol failures such as a
+headless permission denial. The wrapper returns exit 125 with concise
+diagnostics and does not dump raw transport to the parent by default. Never
+work around a child permission failure by reading, materializing, summarizing,
+or inlining the repository diff in the parent prompt; grant appropriate child
+authority, narrow the task, or select another provider.
 
 ### Choose how prior context is delivered
 
@@ -311,9 +350,10 @@ Tracked Codex requires its prompt immediately after `exec`, after an explicit
 thread to resume. The wrapper observes Codex JSONL in a bounded buffer, stores
 the exact `thread.started` ID, and renders the final agent message after the
 child exits. If the caller explicitly supplies `--json`, raw JSONL remains the
-stdout contract. Malformed or mismatched observation never replaces the child
-exit code; the captured output is preserved and an unsafe session is not made
-resumable. Current `codex exec resume` does not accept several fresh-only flags,
+stdout contract. Malformed or mismatched observation preserves a nonzero child
+exit; an exit-zero protocol failure becomes wrapper exit 125, raw transport
+stays off normal stdout, and an unsafe session is not made resumable. Current
+`codex exec resume` does not accept several fresh-only flags,
 including sandbox, profile, and working-root options, so the wrapper retains
 them in compatibility hashing but omits them from the provider resume argv.
 
@@ -321,16 +361,18 @@ Managed Cursor always owns terminal JSON and composes context into the single
 positional prompt. A tracked fresh run stores only the UUID returned by a
 successful terminal result; resume passes that exact UUID through `--resume`
 and rejects mismatches. It never uses `--continue` or a latest-session lookup.
-Malformed, failed, mismatched, or truncated output cannot activate continuity,
-while the provider exit status remains authoritative.
+Malformed, failed, mismatched, or truncated output cannot activate continuity.
+A nonzero provider exit is preserved; an exit-zero protocol failure becomes
+wrapper exit 125.
 
 Tracked OpenCode adds `--format json`, validates one consistent `ses_...`
 session ID, and requires a completed step with final text before activating the
 session. Resume passes only the exact stored ID through `--session`; it never
 selects by recency. The wrapper normally restores text events to stdout, while
 an explicit caller `--format json` preserves raw JSONL. Malformed, truncated,
-conflicting, or mismatched transport cannot establish continuity and preserves
-the child exit status.
+conflicting, or mismatched transport cannot establish continuity. A nonzero
+provider exit is preserved; an exit-zero protocol failure becomes wrapper exit
+125.
 
 Managed Antigravity always owns `--input-format stream-json` and
 `--output-format stream-json` so the capsule and current task arrive in one
