@@ -89,6 +89,8 @@ RUN OPTIONS:
     --no-record
     --dry-run
     --quiet
+    --progress-interval SECONDS    Wrapper liveness heartbeat interval
+                                   (default 60; 0 disables; --quiet suppresses)
     --report PATH                  Write a JSON report describing the plan
                                     (or the reason a real run did not start)
                                     to PATH.

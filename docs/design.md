@@ -339,6 +339,7 @@ mode and do not receive managed session behavior.
 --no-record
 --dry-run
 --quiet
+--progress-interval SECONDS
 ```
 
 Defaults are:
@@ -355,6 +356,9 @@ Defaults are:
 - no model process for history below that threshold; and
 - untracked provider-native continuity unless a recognized child workstream explicitly
   selects `--fresh` or `--resume`; and
+- a provider-neutral stderr liveness heartbeat every 60 seconds while the child
+  is running (`0` disables it, accepted nonzero values are 5 through 3600
+  seconds, and `--quiet` suppresses it); and
 - recording enabled.
 
 `--dry-run` performs discovery and idempotent identity preparation but does not
@@ -1035,6 +1039,12 @@ After a successful spawn:
 - the child's stdout bytes are forwarded without wrapper output;
 - the child's stderr bytes are forwarded without rewriting;
 - wrapper diagnostics go to stderr and can be suppressed with `--quiet`;
+- unless suppressed or disabled, the wrapper emits a periodic stderr heartbeat
+  containing only `child=running`, monotonic elapsed time, time since the last
+  child stdout/stderr bytes, and cumulative stdout/stderr byte counts;
+- the heartbeat proves only that the wrapper still observes a running process.
+  It does not infer review, editing, testing, forward progress, or eventual
+  completion, and it does not impose an idle timeout;
 - the child's ordinary exit status is returned unchanged;
 - on Unix, termination by signal is reproduced by forwarding and re-raising the
   signal when possible;
@@ -1144,6 +1154,17 @@ child transcripts or tool logs only to resolve a specific ambiguity, failure,
 or audit request. Model selection starts with the least expensive model likely
 to complete the bounded task and escalates using concrete failed verification,
 ambiguity, or a reasoning gap rather than defaulting to the largest model.
+
+Waiting is also context-bounded. For a long-running managed child, the parent
+waits on the existing invocation at roughly one-minute intervals and treats an
+unchanged liveness heartbeat as a reason to wait again, not as a user-facing
+semantic-progress event. If the host requires periodic status, the parent emits
+only a minimal liveness line. It does not run auxiliary process, file-count,
+Git-status, or partial-diff inspections on every interval. The parent reports
+detail only for a state transition that affects the user: completion, failure,
+an input or authority request, a task-specific deadline, or a genuinely
+meaningful milestone already emitted by the child. It inspects the child-owned
+worktree after handoff unless recovery evidence requires earlier diagnosis.
 
 The context rule is summary-first and bounded: keep the current task
 self-contained, consult `summary.md` only when prior decisions may matter, then

@@ -1469,6 +1469,7 @@ fn dry_run_writes_a_json_plan_report_preserving_child_arguments_verbatim() {
     assert_eq!(report["status"], "ok");
     assert_eq!(report["body"]["id"], "reviewer");
     assert_eq!(report["body"]["context_delivery"], "pointer");
+    assert_eq!(report["body"]["progress_interval_seconds"], 60);
     assert_eq!(report["body"]["program"]["encoding"], "utf8");
     assert_eq!(report["body"]["program"]["value"], "claude");
     assert_eq!(report["body"]["supervisor"]["provider"], "codex");

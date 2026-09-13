@@ -127,6 +127,7 @@ pub(crate) fn summarize(
             forward_stdout: true,
             forward_signals: false,
             timeout: Some(TIMEOUT),
+            progress_interval: None,
         },
         &mut discarded_stdout,
         &mut discarded_stderr,

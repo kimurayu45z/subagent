@@ -14,6 +14,7 @@ use std::fmt;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
 use serde::Serialize;
@@ -31,6 +32,9 @@ use super::{handle_clap_error, split_on_double_dash, wrapper_error_exit};
 const SUBAGENT_ID_ENV: &str = "SUBAGENT_ID";
 const DEFAULT_SUMMARIZE_ABOVE_BYTES: u64 = 16 * 1024;
 const MAX_SUMMARIZE_ABOVE_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_PROGRESS_INTERVAL_SECONDS: u64 = 60;
+const MIN_PROGRESS_INTERVAL_SECONDS: u64 = 5;
+const MAX_PROGRESS_INTERVAL_SECONDS: u64 = 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -219,6 +223,10 @@ struct RunArgs {
     #[arg(long)]
     quiet: bool,
 
+    /// Wrapper liveness heartbeat interval in seconds. Zero disables it.
+    #[arg(long = "progress-interval")]
+    progress_interval_seconds: Option<u64>,
+
     /// Not part of `docs/design.md` section 6.2's "principal run options"
     /// list; see the README-equivalent discussion in the implementation
     /// notes for why an explicit machine-report destination was added for
@@ -275,6 +283,7 @@ struct RunPlan {
     native_continuity: NativeContinuity,
     no_record: bool,
     quiet: bool,
+    progress_interval_seconds: u64,
     program: OsString,
     args: Vec<OsString>,
     ensured_pair: Option<store::EnsuredPair>,
@@ -298,6 +307,7 @@ struct RunPlanReport {
     native_continuity: NativeContinuity,
     no_record: bool,
     quiet: bool,
+    progress_interval_seconds: u64,
     program: OsStringJson,
     args: Vec<OsStringJson>,
     ensured_pair: Option<EnsuredPairReport>,
@@ -322,6 +332,7 @@ impl From<&RunPlan> for RunPlanReport {
             native_continuity: plan.native_continuity,
             no_record: plan.no_record,
             quiet: plan.quiet,
+            progress_interval_seconds: plan.progress_interval_seconds,
             program: OsStringJson::from_os_str(&plan.program),
             args: plan
                 .args
@@ -593,6 +604,19 @@ fn execute_with_env(
         );
         return wrapper_error_exit();
     }
+    let progress_interval_seconds: u64 = run_args
+        .progress_interval_seconds
+        .unwrap_or(DEFAULT_PROGRESS_INTERVAL_SECONDS);
+    if progress_interval_seconds != 0
+        && !(MIN_PROGRESS_INTERVAL_SECONDS..=MAX_PROGRESS_INTERVAL_SECONDS)
+            .contains(&progress_interval_seconds)
+    {
+        let _ = writeln!(
+            err,
+            "subagent: --progress-interval must be 0 (disabled) or between {MIN_PROGRESS_INTERVAL_SECONDS} and {MAX_PROGRESS_INTERVAL_SECONDS} seconds"
+        );
+        return wrapper_error_exit();
+    }
 
     let supervisor_required: bool = memory != MemoryMode::None || !run_args.no_record;
     let supervisor: Option<SupervisorRef> = if supervisor_required || run_args.supervisor.is_some()
@@ -651,6 +675,7 @@ fn execute_with_env(
         native_continuity,
         no_record: run_args.no_record,
         quiet: run_args.quiet,
+        progress_interval_seconds,
         program: child_tokens[0].clone(),
         args: effective_child_args,
         ensured_pair,
@@ -741,6 +766,8 @@ fn execute_with_env(
                 native_continuity: plan.native_continuity,
                 no_record: plan.no_record,
                 quiet: plan.quiet,
+                progress_interval: (!plan.quiet && plan.progress_interval_seconds != 0)
+                    .then(|| Duration::from_secs(plan.progress_interval_seconds)),
                 forward_signals,
             },
             out,
@@ -880,6 +907,12 @@ fn print_human_plan(plan: &RunPlan, dry_run: bool, err: &mut dyn Write) {
             .map(|bytes| bytes.to_string())
             .unwrap_or_else(|| "<unset>".to_string())
     );
+    let progress_display: String = if plan.progress_interval_seconds == 0 {
+        "disabled".to_string()
+    } else {
+        format!("{} seconds", plan.progress_interval_seconds)
+    };
+    let _ = writeln!(err, "  progress interval: {progress_display}");
     let workstream_display: &str = plan
         .workstream
         .as_ref()
@@ -1354,6 +1387,46 @@ mod tests {
         let (code, _out, err) = run(&args, None);
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(err.is_empty());
+    }
+
+    #[test]
+    fn dry_run_reports_the_default_progress_interval() {
+        let args = os(&["--id", "reviewer", "--dry-run", "--", "claude"]);
+        let (code, _out, err) = run(&args, None);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.contains("progress interval: 60 seconds"));
+    }
+
+    #[test]
+    fn zero_progress_interval_disables_heartbeats() {
+        let args = os(&[
+            "--id",
+            "reviewer",
+            "--dry-run",
+            "--progress-interval",
+            "0",
+            "--",
+            "claude",
+        ]);
+        let (code, _out, err) = run(&args, None);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.contains("progress interval: disabled"));
+    }
+
+    #[test]
+    fn progress_interval_rejects_values_below_the_minimum() {
+        let args = os(&[
+            "--id",
+            "reviewer",
+            "--dry-run",
+            "--progress-interval",
+            "4",
+            "--",
+            "claude",
+        ]);
+        let (code, _out, err) = run(&args, None);
+        assert_eq!(code, wrapper_error_exit());
+        assert!(err.contains("must be 0 (disabled) or between 5 and 3600 seconds"));
     }
 
     #[test]

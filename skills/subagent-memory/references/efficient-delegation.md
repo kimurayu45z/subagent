@@ -69,3 +69,42 @@ planned order.
 Parallelism is worthwhile when expected time saved exceeds setup, review,
 conflict, and combined-verification cost. If that test fails, use one child or
 perform a short sequence instead.
+
+## Wait on evidence, not a fixed silence timer
+
+For managed work expected to take more than a couple of minutes, leave the
+wrapper's progress heartbeat enabled. It reports a running child, monotonic
+elapsed time, time since the last child output byte, and cumulative stdout and
+stderr byte counts. It does not expose prompt text, paths, session IDs, child
+arguments, or output bodies.
+
+Do not terminate a child merely because it has not produced a final response
+within an arbitrary two-, five-, or eight-minute window while wrapper
+heartbeats continue. Wait on the same process or PTY session for about 60
+seconds at a time. When the result contains only another liveness heartbeat,
+wait again without semantic-progress commentary when the host permits. If the
+host requires a periodic update, emit one minimal liveness line without file
+counts, inferred phases, or repeated history. Do not run `ps`, file counts,
+`git status`, or partial-diff checks merely to manufacture an update. If useful
+independent parent work exists, do it; otherwise remain idle. A heartbeat means
+process liveness only; it is not evidence that the model is reasoning well,
+using tools, modifying files, or approaching completion.
+
+Investigate or stop when there is stronger evidence: the provider exits, the
+wrapper heartbeat stops unexpectedly, a rate-limit or connection failure is
+reported, the child requests unavailable authority, the user interrupts, or a
+task-specific hard deadline is reached. Prolonged `output-idle` growth can
+justify diagnosis, but is not by itself a universal timeout because some
+provider CLIs buffer all useful output until completion.
+
+Report a wait result only when it changes what the user needs to know: the child
+completed, failed, requested input or authority, reached a task-specific hard
+deadline, or emitted a genuine milestone. Inspect the child-owned worktree
+after it returns; inspect earlier only to diagnose missing heartbeats or another
+concrete failure. Do not infer milestones from file counts or a partial diff.
+
+The default interval is 60 seconds. Use `--progress-interval SECONDS` for a
+different interval, `--progress-interval 0` to disable it, and `--quiet` only
+when the caller deliberately does not need wrapper liveness diagnostics.
+Direct provider CLI calls cannot rely on this common heartbeat contract; use a
+managed `subagent` call when supervised waiting matters.

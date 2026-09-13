@@ -76,6 +76,9 @@ pub(crate) struct ChildRunRequest<'a> {
     pub forward_stdout: bool,
     pub forward_signals: bool,
     pub timeout: Option<Duration>,
+    /// Provider-neutral wrapper liveness diagnostics. These report only
+    /// process/I/O metadata and never interpret the child's task state.
+    pub progress_interval: Option<Duration>,
 }
 
 /// Spawns one child, writes the prepared bootstrap/caller stdin, tees both
@@ -147,24 +150,41 @@ pub(crate) fn run_child(
     let mut stderr_closed: bool = false;
     let mut exit_status: Option<ExitStatus> = None;
     let started: Instant = Instant::now();
+    let mut last_output_at: Instant = started;
+    let mut stdout_bytes: u64 = 0;
+    let mut stderr_bytes: u64 = 0;
+    let mut stderr_needs_separator: bool = false;
+    let progress_interval: Option<Duration> = request
+        .progress_interval
+        .filter(|interval: &Duration| !interval.is_zero());
+    let mut next_progress_elapsed: Option<Duration> = progress_interval;
     let mut timed_out: bool = false;
     #[cfg(unix)]
     let mut forwarded_signal: i32 = 0;
 
     while exit_status.is_none() || !stdout_closed || !stderr_closed {
         match receiver.recv_timeout(WAIT_POLL_INTERVAL) {
-            Ok(event) => handle_stream_event(
-                event,
-                out,
-                err,
-                &mut stdout_capture,
-                request.max_capture_bytes,
-                request.forward_stdout,
-                &mut stdout_truncated,
-                &mut forwarding_errors,
-                &mut stdout_closed,
-                &mut stderr_closed,
-            ),
+            Ok(event) => {
+                observe_stream_event(
+                    &event,
+                    &mut last_output_at,
+                    &mut stdout_bytes,
+                    &mut stderr_bytes,
+                    &mut stderr_needs_separator,
+                );
+                handle_stream_event(
+                    event,
+                    out,
+                    err,
+                    &mut stdout_capture,
+                    request.max_capture_bytes,
+                    request.forward_stdout,
+                    &mut stdout_truncated,
+                    &mut forwarding_errors,
+                    &mut stdout_closed,
+                    &mut stderr_closed,
+                );
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 stdout_closed = true;
@@ -190,6 +210,22 @@ pub(crate) fn run_child(
 
         if exit_status.is_none() {
             exit_status = child.try_wait().map_err(ChildProcessError::Wait)?;
+        }
+        let elapsed: Duration = started.elapsed();
+        if exit_status.is_none()
+            && let (Some(interval), Some(next_elapsed)) = (progress_interval, next_progress_elapsed)
+            && elapsed >= next_elapsed
+        {
+            emit_progress_heartbeat(
+                err,
+                elapsed,
+                last_output_at.elapsed(),
+                stdout_bytes,
+                stderr_bytes,
+                &mut stderr_needs_separator,
+                &mut forwarding_errors,
+            );
+            next_progress_elapsed = elapsed.checked_add(interval);
         }
         if exit_status.is_none()
             && !timed_out
@@ -231,6 +267,54 @@ pub(crate) fn run_child(
         timed_out,
         forwarding_errors,
     })
+}
+
+fn observe_stream_event(
+    event: &StreamEvent,
+    last_output_at: &mut Instant,
+    stdout_bytes: &mut u64,
+    stderr_bytes: &mut u64,
+    stderr_needs_separator: &mut bool,
+) {
+    let StreamEvent::Bytes(kind, bytes) = event else {
+        return;
+    };
+    *last_output_at = Instant::now();
+    let byte_count: u64 = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    match kind {
+        StreamKind::Stdout => *stdout_bytes = stdout_bytes.saturating_add(byte_count),
+        StreamKind::Stderr => {
+            *stderr_bytes = stderr_bytes.saturating_add(byte_count);
+            *stderr_needs_separator = bytes.last().is_some_and(|byte: &u8| *byte != b'\n');
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_progress_heartbeat(
+    err: &mut dyn Write,
+    elapsed: Duration,
+    output_idle: Duration,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+    stderr_needs_separator: &mut bool,
+    forwarding_errors: &mut Vec<String>,
+) {
+    let separator: &str = if *stderr_needs_separator { "\n" } else { "" };
+    let result: Result<(), std::io::Error> = writeln!(
+        err,
+        "{separator}subagent: progress child=running elapsed={}s output-idle={}s stdout-bytes={stdout_bytes} stderr-bytes={stderr_bytes}",
+        elapsed.as_secs(),
+        output_idle.as_secs()
+    )
+    .and_then(|()| err.flush());
+    if let Err(error) = result {
+        push_forwarding_error(
+            forwarding_errors,
+            format!("progress heartbeat write failed: {error}"),
+        );
+    }
+    *stderr_needs_separator = false;
 }
 
 fn terminate_child(child: &mut Child, child_pid: u32, errors: &mut Vec<String>) {
@@ -435,6 +519,7 @@ mod tests {
             forward_stdout: true,
             forward_signals: false,
             timeout: None,
+            progress_interval: None,
         }
     }
 
@@ -491,6 +576,38 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn emits_provider_neutral_progress_without_changing_child_stdout() {
+        let mut request: ChildRunRequest<'_> =
+            shell_request("sleep 0.08; printf 'done'", Vec::new());
+        request.progress_interval = Some(Duration::from_millis(20));
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let outcome: ChildOutcome = run_child(request, &mut out, &mut err).unwrap();
+        let diagnostics: String = String::from_utf8(err).unwrap();
+        assert_eq!(out, b"done");
+        assert_eq!(outcome.stdout_capture, b"done");
+        assert!(diagnostics.contains("subagent: progress child=running"));
+        assert!(diagnostics.contains("stdout-bytes=0 stderr-bytes=0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progress_counts_child_io_and_separates_it_from_the_heartbeat() {
+        let mut request: ChildRunRequest<'_> =
+            shell_request("printf 'err' >&2; sleep 0.06", Vec::new());
+        request.progress_interval = Some(Duration::from_millis(20));
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let outcome: ChildOutcome = run_child(request, &mut out, &mut err).unwrap();
+        let diagnostics: String = String::from_utf8(err).unwrap();
+        assert!(out.is_empty());
+        assert!(outcome.stdout_capture.is_empty());
+        assert!(diagnostics.starts_with("err\nsubagent: progress child=running"));
+        assert!(diagnostics.contains("stdout-bytes=0 stderr-bytes=3"));
+    }
+
     #[test]
     fn reports_spawn_failure_without_panicking() {
         let args: Vec<OsString> = Vec::new();
@@ -505,6 +622,7 @@ mod tests {
             forward_stdout: true,
             forward_signals: false,
             timeout: None,
+            progress_interval: None,
         };
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();

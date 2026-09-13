@@ -26,6 +26,10 @@ metadata:
 - Before command-dependent headless work, choose authority deliberately. Keep
   the default `--authority inherit`; use `--authority full` only with explicit
   user authorization in an appropriately isolated environment.
+- For any task likely to outlast a short polling window, use managed
+  `subagent` and keep its default progress heartbeat visible. Do not terminate
+  or narrate solely because final stdout is silent while liveness heartbeats
+  advance; read [efficient delegation](references/efficient-delegation.md).
 - Parallel work on independent Git changes: use a separate Git worktree per
   writer; read [worktree coordination](references/worktrees.md).
 - Asking about this skill itself: explain, review, or edit it directly. Do not

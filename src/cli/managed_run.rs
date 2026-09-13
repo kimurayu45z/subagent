@@ -6,7 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
@@ -66,6 +66,7 @@ pub(crate) struct ManagedRunRequest<'a> {
     pub native_continuity: NativeContinuity,
     pub no_record: bool,
     pub quiet: bool,
+    pub progress_interval: Option<Duration>,
     pub forward_signals: bool,
 }
 
@@ -493,6 +494,7 @@ pub(crate) fn execute(
             forward_stdout: !observed_transport || caller_requested_transport_json,
             forward_signals: request.forward_signals,
             timeout: None,
+            progress_interval: request.progress_interval,
         },
         out,
         err,
@@ -1147,6 +1149,7 @@ fn execute_unrecorded(
             forward_stdout: !(managed_antigravity || managed_cursor) || caller_requested_raw,
             forward_signals: request.forward_signals,
             timeout: None,
+            progress_interval: request.progress_interval,
         },
         out,
         err,

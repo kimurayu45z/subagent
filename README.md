@@ -57,6 +57,26 @@ subagent --id big-pickle-reviewer -- opencode run "Review the current diff" --mo
 subagent --id gemini-flash-reviewer -- agy -p "Review the current diff" --model gemini-3.8-flash-high
 ```
 
+Managed runs emit a provider-neutral liveness heartbeat to stderr every 60
+seconds while the child is still running:
+
+```text
+subagent: progress child=running elapsed=120s output-idle=37s stdout-bytes=842 stderr-bytes=19
+```
+
+This reports process and byte-I/O facts only; it does not claim that the model
+is making useful semantic progress. A supervising agent should wait on the
+same invocation in roughly one-minute intervals, remain silent for
+heartbeat-only results when the host permits, and not terminate a child solely
+because no final response has appeared. If the host requires a periodic user
+update, emit one minimal liveness line without inventing progress. It should
+not repeatedly inspect process lists, file
+counts, Git status, or an in-progress child-owned worktree. Use
+`--progress-interval SECONDS` to change the interval (5 through 3600),
+`--progress-interval 0` to disable it, or `--quiet` to suppress wrapper
+diagnostics. Apply an explicit task-appropriate hard deadline separately when
+one is required.
+
 The same `--id`, canonical working directory, and supervisor conversation reuse
 one role-level pair history. The ID is useful for audit and lookup, but does not
 automatically make a new task a continuation. `CODEX_THREAD_ID` or
